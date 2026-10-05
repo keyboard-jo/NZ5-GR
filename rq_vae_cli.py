@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import argparse
 import h5py
 import numpy as np
@@ -229,7 +230,8 @@ def main():
     parser.add_argument('--output_path', type=str, default='tencent_gr_parquet/train/index_rqvae.json', help='Path to output JSON mapping')
     parser.add_argument('--model_path', type=str, default='rqvae_model.pth', help='Path to save the trained PyTorch model')
     parser.add_argument('--device', type=str, default='cpu', help='Device to use (cpu, cuda:0, etc.)')
-    parser.add_argument('--epochs', type=int, default=1, help='Number of epochs')
+    parser.add_argument('--epochs', type=int, default=5, help='Number of epochs (overridden if max_steps reached)')
+    parser.add_argument('--max_steps', type=int, default=None, help='Target maximum training steps (overrides epoch count when reached)')
     parser.add_argument('--batch_size', type=int, default=256, help='Batch size')
     parser.add_argument('--max_samples', type=int, default=10000, help='Limit number of samples for local CPU testing (None for all)')
     parser.add_argument('--input_dim', type=int, default=1024, help='Input embedding dimension')
@@ -237,9 +239,12 @@ def main():
     parser.add_argument('--codebook_size', type=int, default=256, help='Size of each codebook')
     parser.add_argument('--num_codebooks', type=int, default=3, help='Number of residual codebooks')
     parser.add_argument('--beta', type=float, default=0.25, help='Commitment loss beta coefficient')
-    parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate')
-    parser.add_argument('--log_dir', type=str, default=None, help='TensorBoard log directory (defaults to runs/rqvae_YYYYMMDD_HHMMSS if not specified)')
-    parser.add_argument('--checkpoint_dir', type=str, default=None, help='Directory to save checkpoints (defaults to checkpoints/rqvae_YYYYMMDD_HHMMSS)')
+    parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw', 'adagrad'], help='Optimizer selection')
+    parser.add_argument('--lr', type=float, default=5e-4, help='Learning rate')
+    parser.add_argument('--scheduler', type=str, default='cosine', choices=['cosine', 'none'], help='Learning rate scheduler type')
+    parser.add_argument('--warmup_steps', type=int, default=1000, help='Linear warmup steps for scheduler')
+    parser.add_argument('--log_dir', type=str, default=None, help='TensorBoard log directory')
+    parser.add_argument('--checkpoint_dir', type=str, default=None, help='Directory to save checkpoints')
     parser.add_argument('--add_unique_id', action='store_true', help='Append a unique collision-solver suffix ID to semantic IDs')
     parser.add_argument('--unique_id_bound', type=int, default=None, help='Upper bound for unique collision solver IDs (defaults to codebook_size if None)')
 
@@ -288,15 +293,41 @@ def main():
         for i, centroids in enumerate(centroids_list):
             model.codebooks[i].copy_(centroids.to(DEVICE))
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    # Optimizer setup
+    if args.optimizer == 'adagrad':
+        optimizer = torch.optim.Adagrad(model.parameters(), lr=args.lr)
+    elif args.optimizer == 'adamw':
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    # Learning rate scheduler setup
+    if args.scheduler == 'cosine':
+        def lr_lambda(current_step: int):
+            if current_step < args.warmup_steps:
+                return float(current_step) / float(max(1, args.warmup_steps))
+            
+            target_max_steps = args.max_steps if args.max_steps is not None else 100000
+            total_decay_steps = max(1, target_max_steps - args.warmup_steps)
+            progress = float(current_step - args.warmup_steps) / float(total_decay_steps)
+            progress = min(1.0, max(0.0, progress))
+            return max(0.01, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    else:
+        scheduler = None
+
     reservoir_fixer = ReservoirDeadCodeFixer(buffer_size=50000, hidden_dim=args.hidden_dim)
-    
     scaler = torch.amp.GradScaler('cuda', enabled=(DEVICE.type == 'cuda'))
 
     print("Starting RQ-VAE Training Pipeline...")
     current_step = 0
-    
+    reached_max_steps = False
+
     for epoch in range(args.epochs):
+        if reached_max_steps:
+            break
+            
         print(f'--- Epoch #{epoch} Started ---')
         for batch in train_dataloader:
             model.train()
@@ -320,6 +351,9 @@ def main():
 
             scaler.step(optimizer)
             scaler.update()
+
+            if scheduler is not None:
+                scheduler.step()
             
             current_step += 1
 
@@ -329,21 +363,27 @@ def main():
                     revived = reservoir_fixer.fix_dead_codes(cb_param, counts)
                     total_revived += revived
                     active_codes = (counts > 0).sum().item()
-                    writer.add_scalar(f"Codebook_{i}/Active_Codes", active_codes, current_step)
+                    writer.add_scalar(f"Codebook_{i}/Batch_Active_Codes", active_codes, current_step)
 
                 writer.add_scalar("Loss/Total", loss.item(), current_step)
                 writer.add_scalar("Loss/Reconstruction", model_output['metrics']['recon_loss'], current_step)
                 writer.add_scalar("Loss/RQ-VAE", model_output['metrics']['rqvae_loss'], current_step)
+                writer.add_scalar("Training/Learning_Rate", optimizer.param_groups[0]['lr'], current_step)
+                
                 if total_revived > 0:
                     writer.add_scalar("Training/Dead_Codes_Revived", total_revived, current_step)
                 
-                print(f"Step {current_step} | Loss: {loss.item():.4f} | Recon Loss: {model_output['metrics']['recon_loss']:.4f}")
+                print(f"Step {current_step} | Loss: {loss.item():.4f} | Recon Loss: {model_output['metrics']['recon_loss']:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}")
+
+            if args.max_steps is not None and current_step >= args.max_steps:
+                print(f"Target max_steps reached ({args.max_steps}). Terminating training loop.")
+                reached_max_steps = True
+                break
 
         checkpoint_path = os.path.join(checkpoint_dir, f"rqvae_epoch_{epoch}.pth")
         save_checkpoint(model, optimizer, scaler, epoch, current_step, checkpoint_path)
 
     print("Training Complete!")
-    writer.close()
 
     os.makedirs(os.path.dirname(os.path.abspath(args.model_path)) or '.', exist_ok=True)
     torch.save(model.state_dict(), args.model_path)
@@ -374,6 +414,27 @@ def main():
                 raw_semantic_mapping[item_id] = semantic_ids
                 if args.add_unique_id:
                     sem_2_ids[tuple(semantic_ids)].append(item_id)
+
+    # Calculate and log full-corpus codebook utilization
+    print("\n" + "=" * 50)
+    print("      CORPUS CODEBOOK UTILIZATION REPORT      ")
+    print("=" * 50)
+    all_assigned_codes = np.array(list(raw_semantic_mapping.values()))
+    
+    per_cb_utilization = []
+    for cb_idx in range(args.num_codebooks):
+        cb_assignments = all_assigned_codes[:, cb_idx]
+        num_unique = len(np.unique(cb_assignments))
+        utilization_pct = (num_unique / args.codebook_size) * 100.0
+        per_cb_utilization.append(utilization_pct)
+        
+        print(f"  - Codebook #{cb_idx}: {num_unique} / {args.codebook_size} entries active ({utilization_pct:.2f}%)")
+        writer.add_scalar(f"Corpus_Utilization/Codebook_{cb_idx}", utilization_pct, current_step)
+
+    mean_utilization = np.mean(per_cb_utilization)
+    print(f"  - Average Codebook Utilization: {mean_utilization:.2f}%")
+    writer.add_scalar("Corpus_Utilization/Average", mean_utilization, current_step)
+    print("=" * 50 + "\n")
 
     semantic_mapping = {}
 
@@ -418,6 +479,7 @@ def main():
     with open(args.output_path, 'w') as f:
         json.dump(semantic_mapping, f)
 
+    writer.close()
     print(f"Successfully saved semantic index mapping to {args.output_path}")
 
 if __name__ == '__main__':
