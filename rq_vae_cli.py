@@ -5,10 +5,11 @@ import h5py
 import numpy as np
 import torch
 import torch.nn as nn
+from datetime import datetime
 from torch.utils.data import IterableDataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.cluster import KMeans
-from collections import deque
+from collections import deque, defaultdict
 
 # Enable TensorFloat-32 for faster matrix multiplications on modern GPUs
 torch.set_float32_matmul_precision('high')
@@ -55,7 +56,6 @@ class HDF5EmbeddingStreamDataset(IterableDataset):
                             'embedding': torch.from_numpy(emb).float()
                         }
                         
-                        # FIX: If shuffle_buffer is 0 (e.g., during inference), yield immediately
                         if self.shuffle_buffer <= 0:
                             yield item_data
                             continue
@@ -212,7 +212,6 @@ class ReservoirDeadCodeFixer:
         
         return len(dead_indices)
 
-# STEP 2: Fault-Tolerant Checkpointing Function
 def save_checkpoint(model, optimizer, scaler, epoch, step, filepath):
     checkpoint = {
         'epoch': epoch,
@@ -239,6 +238,10 @@ def main():
     parser.add_argument('--num_codebooks', type=int, default=3, help='Number of residual codebooks')
     parser.add_argument('--beta', type=float, default=0.25, help='Commitment loss beta coefficient')
     parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate')
+    parser.add_argument('--log_dir', type=str, default=None, help='TensorBoard log directory (defaults to runs/rqvae_YYYYMMDD_HHMMSS if not specified)')
+    parser.add_argument('--checkpoint_dir', type=str, default=None, help='Directory to save checkpoints (defaults to checkpoints/rqvae_YYYYMMDD_HHMMSS)')
+    parser.add_argument('--add_unique_id', action='store_true', help='Append a unique collision-solver suffix ID to semantic IDs')
+    parser.add_argument('--unique_id_bound', type=int, default=None, help='Upper bound for unique collision solver IDs (defaults to codebook_size if None)')
 
     args = parser.parse_args()
 
@@ -247,10 +250,23 @@ def main():
     DEVICE = torch.device(args.device)
     print(f"Using device: {DEVICE}")
 
-    # STEP 1: Initialize TensorBoard Writer
-    writer = SummaryWriter(log_dir="runs/rqvae_experiment_1")
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-    # Instantiate dataset & dataloader with max_samples support for fast testing
+    if args.log_dir is None:
+        log_dir = os.path.join('runs', f'rqvae_{timestamp}')
+    else:
+        log_dir = args.log_dir
+
+    if args.checkpoint_dir is None:
+        checkpoint_dir = os.path.join("checkpoints", f"rqvae_{timestamp}")
+    else:
+        checkpoint_dir = args.checkpoint_dir
+
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    writer = SummaryWriter(log_dir=log_dir)
+    print(f"Logging TensorBoard runs to: {log_dir}")
+
     dataset = HDF5EmbeddingStreamDataset(
         args.h5_path, 
         chunk_size=4096, 
@@ -259,7 +275,6 @@ def main():
     )
     train_dataloader = DataLoader(dataset=dataset, batch_size=args.batch_size, collate_fn=batch_processor)
 
-    # Initialize Model
     model = RQVAE(
         input_dim=args.input_dim,
         hidden_dim=args.hidden_dim,
@@ -267,7 +282,6 @@ def main():
         codebook_sizes=[args.codebook_size] * args.num_codebooks
     ).to(DEVICE)
 
-    # Initialize Codebooks using KMeans clustering on encoded latent vectors
     sample_init_size = min(100000, args.max_samples if args.max_samples else 100000)
     centroids_list = init_codebooks_batched(model, args.h5_path, [args.codebook_size] * args.num_codebooks, device=DEVICE, sample_size=sample_init_size)
     with torch.no_grad():
@@ -277,12 +291,10 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     reservoir_fixer = ReservoirDeadCodeFixer(buffer_size=50000, hidden_dim=args.hidden_dim)
     
-    # STEP 3: Initialize Automatic Mixed Precision (AMP) Scaler
     scaler = torch.amp.GradScaler('cuda', enabled=(DEVICE.type == 'cuda'))
 
     print("Starting RQ-VAE Training Pipeline...")
     current_step = 0
-    os.makedirs("checkpoints", exist_ok=True)
     
     for epoch in range(args.epochs):
         print(f'--- Epoch #{epoch} Started ---')
@@ -296,33 +308,26 @@ def main():
 
             optimizer.zero_grad()
             
-            # STEP 3: AMP Autocast context manager
             with torch.autocast(device_type=DEVICE.type, dtype=torch.float16, enabled=(DEVICE.type == 'cuda')):
                 model_output = model({'embedding': batch_embs})
                 loss = model_output['loss']
 
-            # STEP 3: Scaled backward pass
             scaler.scale(loss).backward()
-            
-            # STEP 3: Unscale before clipping gradients
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.encoder.parameters(), 1.0)
             nn.utils.clip_grad_norm_(model.codebooks, 1.0)
             nn.utils.clip_grad_norm_(model.decoder.parameters(), 1.0)
 
-            # STEP 3: Optimizer step and scaler update
             scaler.step(optimizer)
             scaler.update()
             
             current_step += 1
 
-            # STEP 1: Log metrics to TensorBoard
             if current_step % 100 == 0 or current_step == 1:
                 total_revived = 0
                 for i, (cb_param, counts) in enumerate(zip(model.codebooks, model_output['clusters_counts'])):
                     revived = reservoir_fixer.fix_dead_codes(cb_param, counts)
                     total_revived += revived
-                    # Log codebook utilization
                     active_codes = (counts > 0).sum().item()
                     writer.add_scalar(f"Codebook_{i}/Active_Codes", active_codes, current_step)
 
@@ -334,14 +339,12 @@ def main():
                 
                 print(f"Step {current_step} | Loss: {loss.item():.4f} | Recon Loss: {model_output['metrics']['recon_loss']:.4f}")
 
-        # STEP 2: Save Checkpoint at the end of each epoch
-        checkpoint_path = f"checkpoints/rqvae_epoch_{epoch}.pth"
+        checkpoint_path = os.path.join(checkpoint_dir, f"rqvae_epoch_{epoch}.pth")
         save_checkpoint(model, optimizer, scaler, epoch, current_step, checkpoint_path)
 
     print("Training Complete!")
     writer.close()
 
-    # Save final model weights
     os.makedirs(os.path.dirname(os.path.abspath(args.model_path)) or '.', exist_ok=True)
     torch.save(model.state_dict(), args.model_path)
     print(f"Final model weights saved to {args.model_path}")
@@ -356,19 +359,60 @@ def main():
     )
     inference_loader = DataLoader(dataset=inference_dataset, batch_size=512, collate_fn=batch_processor)
 
-    semantic_mapping = {}
+    raw_semantic_mapping = {}
+    sem_2_ids = defaultdict(list)
     model.eval()
 
     with torch.inference_mode():
         for batch in inference_loader:
             batch['embedding'] = batch['embedding'].to(DEVICE)
             
-            # Use AMP for inference as well if on GPU
             with torch.autocast(device_type=DEVICE.type, dtype=torch.float16, enabled=(DEVICE.type == 'cuda')):
                 model_output = model(batch)
                 
             for item_id, semantic_ids in zip(batch['item_id'], model_output['clusters'].cpu().tolist()):
-                semantic_mapping[item_id] = semantic_ids
+                raw_semantic_mapping[item_id] = semantic_ids
+                if args.add_unique_id:
+                    sem_2_ids[tuple(semantic_ids)].append(item_id)
+
+    semantic_mapping = {}
+
+    if args.add_unique_id:
+        unique_bound = args.unique_id_bound if args.unique_id_bound is not None else args.codebook_size
+        print(f"Resolving collisions with unique ID suffix (bound = {unique_bound})...")
+        
+        overflow_count = 0
+        max_collision_len = 0
+        total_collisions = 0
+
+        for semantics, item_ids in sem_2_ids.items():
+            num_items = len(item_ids)
+            if num_items > 1:
+                total_collisions += 1
+                if num_items > max_collision_len:
+                    max_collision_len = num_items
+
+            if num_items > unique_bound:
+                overflow_count += 1
+                print(
+                    f"[WARNING / INCONSISTENCY DETECTED] Semantic tuple {list(semantics)} is shared by {num_items} items, "
+                    f"which exceeds the unique ID bound of {unique_bound}. "
+                    f"Unique IDs will be sampled with replacement to prevent pipeline crash."
+                )
+                collision_solvers = np.random.choice(unique_bound, size=num_items, replace=True).tolist()
+            else:
+                collision_solvers = np.random.permutation(unique_bound)[:num_items].tolist()
+
+            for item_id, solver in zip(item_ids, collision_solvers):
+                semantic_mapping[item_id] = list(semantics) + [int(solver)]
+
+        print(f"Collision Resolution Summary:")
+        print(f"  - Total unique semantic tuples: {len(sem_2_ids)}")
+        print(f"  - Tuples with collisions (>1 item): {total_collisions}")
+        print(f"  - Max items sharing a single tuple: {max_collision_len}")
+        print(f"  - Groups exceeding unique ID bound ({unique_bound}): {overflow_count}")
+    else:
+        semantic_mapping = raw_semantic_mapping
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
     with open(args.output_path, 'w') as f:
