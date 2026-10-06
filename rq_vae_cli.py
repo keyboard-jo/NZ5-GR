@@ -369,3 +369,205 @@ def main():
     if args.scheduler == 'cosine':
         def lr_lambda(current_step: int):
             if current_step < args.warmup_steps:
+                return float(current_step) / float(max(1, args.warmup_steps))
+            
+            target_max_steps = args.max_steps if args.max_steps is not None else 100000
+            total_decay_steps = max(1, target_max_steps - args.warmup_steps)
+            progress = float(current_step - args.warmup_steps) / float(total_decay_steps)
+            progress = min(1.0, max(0.0, progress))
+            return max(0.01, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    else:
+        scheduler = None
+
+    reservoir_fixer = ReservoirDeadCodeFixer(buffer_size=50000, hidden_dim=args.hidden_dim)
+    scaler = torch.amp.GradScaler(enabled=(DEVICE.type == 'cuda' and args.dtype == 'fp16'))
+
+    # 3. STAGE: TRAINING LOOP
+    print_section("STAGE 2: MODEL TRAINING LOOP")
+    print_table_header()
+
+    current_step = 0
+    reached_max_steps = False
+
+    for epoch in range(args.epochs):
+        if reached_max_steps:
+            break
+            
+        for batch in train_dataloader:
+            model.train()
+            batch_embs = batch['embedding'].to(DEVICE)
+            
+            with torch.no_grad():
+                latent_vectors = model.encoder(batch_embs)
+                reservoir_fixer.update_buffer(latent_vectors)
+
+            optimizer.zero_grad()
+            
+            with torch.autocast(device_type=DEVICE.type, dtype=AMP_DTYPE, enabled=USE_AMP):
+                model_output = model({'embedding': batch_embs})
+                loss = model_output['loss']
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.encoder.parameters(), 1.0)
+            nn.utils.clip_grad_norm_(model.codebooks, 1.0)
+            nn.utils.clip_grad_norm_(model.decoder.parameters(), 1.0)
+
+            scaler.step(optimizer)
+            scaler.update()
+
+            if scheduler is not None:
+                scheduler.step()
+            
+            current_step += 1
+
+            if current_step % 100 == 0 or current_step == 1:
+                total_revived = 0
+                for i, (cb_param, counts) in enumerate(zip(model.codebooks, model_output['clusters_counts'])):
+                    revived = reservoir_fixer.fix_dead_codes(cb_param, counts)
+                    total_revived += revived
+                    active_codes = (counts > 0).sum().item()
+                    writer.add_scalar(f"Codebook_{i}/Batch_Active_Codes", active_codes, current_step)
+
+                writer.add_scalar("Loss/Total", loss.item(), current_step)
+                writer.add_scalar("Loss/Reconstruction", model_output['metrics']['recon_loss'], current_step)
+                writer.add_scalar("Loss/RQ-VAE", model_output['metrics']['rqvae_loss'], current_step)
+                writer.add_scalar("Training/Learning_Rate", optimizer.param_groups[0]['lr'], current_step)
+                
+                if total_revived > 0:
+                    writer.add_scalar("Training/Dead_Codes_Revived", total_revived, current_step)
+                
+                print_table_row(
+                    epoch=epoch,
+                    step=current_step,
+                    loss=loss.item(),
+                    recon_loss=model_output['metrics']['recon_loss'],
+                    rq_loss=model_output['metrics']['rqvae_loss'],
+                    lr=optimizer.param_groups[0]['lr']
+                )
+
+            if args.max_steps is not None and current_step >= args.max_steps:
+                print_table_footer()
+                print(f"  ► Target max_steps reached ({args.max_steps}). Terminating training loop.")
+                reached_max_steps = True
+                break
+
+        if not reached_max_steps:
+            checkpoint_path = os.path.join(checkpoint_dir, f"rqvae_epoch_{epoch}.pth")
+            save_checkpoint(model, optimizer, scaler, epoch, current_step, checkpoint_path)
+
+    if not reached_max_steps:
+        print_table_footer()
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.model_path)) or '.', exist_ok=True)
+    torch.save(model.state_dict(), args.model_path)
+    print(f"  ✔ Saved model checkpoint to {args.model_path}")
+
+    # 4. STAGE: SEMANTIC ID GENERATION
+    print_section("STAGE 3: INFERENCE & SEMANTIC ID GENERATION")
+    print("  ► Streaming dataset through RQ-VAE encoder...")
+
+    inference_dataset = HDF5EmbeddingStreamDataset(
+        args.h5_path, 
+        chunk_size=4096, 
+        shuffle_buffer=0, 
+        max_samples=args.max_samples
+    )
+    inference_loader = DataLoader(dataset=inference_dataset, batch_size=512, collate_fn=batch_processor)
+
+    raw_semantic_mapping = {}
+    sem_2_ids = defaultdict(list)
+    model.eval()
+
+    with torch.inference_mode():
+        for batch in inference_loader:
+            batch['embedding'] = batch['embedding'].to(DEVICE)
+            
+            with torch.autocast(device_type=DEVICE.type, dtype=AMP_DTYPE, enabled=USE_AMP):
+                model_output = model(batch)
+                
+            for item_id, semantic_ids in zip(batch['item_id'], model_output['clusters'].cpu().tolist()):
+                raw_semantic_mapping[item_id] = semantic_ids
+                if args.add_unique_id:
+                    sem_2_ids[tuple(semantic_ids)].append(item_id)
+
+    # 5. STAGE: CODEBOOK UTILIZATION REPORT
+    print_section("STAGE 4: CODEBOOK UTILIZATION REPORT")
+    all_assigned_codes = np.array(list(raw_semantic_mapping.values()))
+    
+    cb_metrics = {}
+    per_cb_utilization = []
+    for cb_idx in range(args.num_codebooks):
+        cb_assignments = all_assigned_codes[:, cb_idx]
+        num_unique = len(np.unique(cb_assignments))
+        utilization_pct = (num_unique / args.codebook_size) * 100.0
+        per_cb_utilization.append(utilization_pct)
+        cb_metrics[f"Codebook #{cb_idx}"] = f"{num_unique} / {args.codebook_size} active ({utilization_pct:.2f}%)"
+        writer.add_scalar(f"Corpus_Utilization/Codebook_{cb_idx}", utilization_pct, current_step)
+
+    mean_utilization = np.mean(per_cb_utilization)
+    cb_metrics["Average Utilization"] = f"{mean_utilization:.2f}%"
+    writer.add_scalar("Corpus_Utilization/Average", mean_utilization, current_step)
+    
+    print_card("Corpus Codebook Utilization", cb_metrics)
+
+    # 6. STAGE: COLLISION RESOLUTION & SUMMARY
+    print_section("STAGE 5: COLLISION RESOLUTION & INDEX SAVING")
+
+    semantic_mapping = {}
+
+    if args.add_unique_id:
+        unique_bound = args.unique_id_bound if args.unique_id_bound is not None else args.codebook_size
+        print(f"  ► Resolving collisions with unique ID suffix (bound = {unique_bound})...")
+        
+        overflow_count = 0
+        max_collision_len = 0
+        total_collisions = 0
+
+        for semantics, item_ids in sem_2_ids.items():
+            num_items = len(item_ids)
+            if num_items > 1:
+                total_collisions += 1
+                if num_items > max_collision_len:
+                    max_collision_len = num_items
+
+            if num_items > unique_bound:
+                overflow_count += 1
+                collision_solvers = np.random.choice(unique_bound, size=num_items, replace=True).tolist()
+            else:
+                collision_solvers = np.random.permutation(unique_bound)[:num_items].tolist()
+
+            for item_id, solver in zip(item_ids, collision_solvers):
+                semantic_mapping[item_id] = list(semantics) + [int(solver)]
+
+        collision_summary = {
+            "Total Unique Semantic Tuples": f"{len(sem_2_ids):,}",
+            "Tuples with Collisions (>1 item)": f"{total_collisions:,}",
+            "Max Items Sharing One Tuple": max_collision_len,
+            "Groups Exceeding Bound": overflow_count,
+        }
+        print_card("Collision Resolution Summary", collision_summary)
+    else:
+        semantic_mapping = raw_semantic_mapping
+        print("  ► Collision resolution skipped (--add_unique_id not set).")
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
+    with open(args.output_path, 'w') as f:
+        json.dump(semantic_mapping, f)
+
+    writer.close()
+
+    elapsed = time.time() - start_time
+    final_summary = {
+        "Total Processing Time": f"{elapsed:.2f}s",
+        "Total Items Indexed": f"{len(semantic_mapping):,}",
+        "Index Output File": args.output_path,
+        "Status": "COMPLETED SUCCESSFULLY"
+    }
+    print_card("Pipeline Execution Summary", final_summary)
+    print_banner("PIPELINE FINISHED")
+
+if __name__ == '__main__':
+    main()
