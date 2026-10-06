@@ -12,7 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 from sklearn.cluster import KMeans
 from collections import deque, defaultdict
 
-# Enable TensorFloat-32 for faster matrix multiplications on modern GPUs
+# Enable TensorFloat-32 for faster matrix multiplications on modern GPUs (Ampere/Hopper)
 torch.set_float32_matmul_precision('high')
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -230,6 +230,7 @@ def main():
     parser.add_argument('--output_path', type=str, default='tencent_gr_parquet/train/index_rqvae.json', help='Path to output JSON mapping')
     parser.add_argument('--model_path', type=str, default='rqvae_model.pth', help='Path to save the trained PyTorch model')
     parser.add_argument('--device', type=str, default='cpu', help='Device to use (cpu, cuda:0, etc.)')
+    parser.add_argument('--dtype', type=str, default='fp32', choices=['fp32', 'fp16', 'bf16'], help='Precision dtype for GPU training (defaults to fp32)')
     parser.add_argument('--epochs', type=int, default=5, help='Number of epochs (overridden if max_steps reached)')
     parser.add_argument('--max_steps', type=int, default=None, help='Target maximum training steps (overrides epoch count when reached)')
     parser.add_argument('--batch_size', type=int, default=256, help='Batch size')
@@ -253,7 +254,17 @@ def main():
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
     DEVICE = torch.device(args.device)
-    print(f"Using device: {DEVICE}")
+
+    # Resolve Precision / Dtype Configuration
+    dtype_map = {
+        'fp32': torch.float32,
+        'fp16': torch.float16,
+        'bf16': torch.bfloat16
+    }
+    AMP_DTYPE = dtype_map[args.dtype]
+    USE_AMP = (DEVICE.type == 'cuda') and (args.dtype != 'fp32')
+
+    print(f"Using device: {DEVICE} | Precision: {args.dtype} (AMP Enabled: {USE_AMP})")
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
@@ -318,7 +329,9 @@ def main():
         scheduler = None
 
     reservoir_fixer = ReservoirDeadCodeFixer(buffer_size=50000, hidden_dim=args.hidden_dim)
-    scaler = torch.amp.GradScaler('cuda', enabled=(DEVICE.type == 'cuda'))
+    
+    # GradScaler is only needed when running FP16 mixed precision on CUDA
+    scaler = torch.amp.GradScaler('cuda', enabled=(DEVICE.type == 'cuda' and args.dtype == 'fp16'))
 
     print("Starting RQ-VAE Training Pipeline...")
     current_step = 0
@@ -339,7 +352,7 @@ def main():
 
             optimizer.zero_grad()
             
-            with torch.autocast(device_type=DEVICE.type, dtype=torch.float16, enabled=(DEVICE.type == 'cuda')):
+            with torch.autocast(device_type=DEVICE.type, dtype=AMP_DTYPE, enabled=USE_AMP):
                 model_output = model({'embedding': batch_embs})
                 loss = model_output['loss']
 
@@ -407,7 +420,7 @@ def main():
         for batch in inference_loader:
             batch['embedding'] = batch['embedding'].to(DEVICE)
             
-            with torch.autocast(device_type=DEVICE.type, dtype=torch.float16, enabled=(DEVICE.type == 'cuda')):
+            with torch.autocast(device_type=DEVICE.type, dtype=AMP_DTYPE, enabled=USE_AMP):
                 model_output = model(batch)
                 
             for item_id, semantic_ids in zip(batch['item_id'], model_output['clusters'].cpu().tolist()):
