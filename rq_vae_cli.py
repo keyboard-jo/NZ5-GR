@@ -2,6 +2,7 @@ import os
 import json
 import math
 import argparse
+import time
 import h5py
 import numpy as np
 import torch
@@ -68,7 +69,7 @@ class HDF5EmbeddingStreamDataset(IterableDataset):
                             yield buffer[idx_to_yield]
                             buffer[idx_to_yield] = item_data
                 except Exception as e:
-                    print(f"Warning: Failed to read chunk at index {idx}. Skipping. Error: {e}")
+                    print(f"  [!] Warning: Failed to read chunk at index {idx}. Skipping. Error: {e}")
                     continue
                         
             if self.shuffle_buffer > 0 and len(buffer) > 0:
@@ -152,7 +153,6 @@ class RQVAE(nn.Module):
         }
 
 def init_codebooks_batched(model, h5_path, codebook_sizes, device, sample_size=100000):
-    print("Initializing codebooks via batched random sampling...")
     with h5py.File(h5_path, 'r') as f:
         emb_ds = f['embedding']
         total_len = len(emb_ds)
@@ -222,9 +222,43 @@ def save_checkpoint(model, optimizer, scaler, epoch, step, filepath):
         'scaler_state_dict': scaler.state_dict() if scaler is not None else None
     }
     torch.save(checkpoint, filepath)
-    print(f"Checkpoint saved to {filepath}")
+
+# --- VISUAL FORMATTING LOGGING HELPERS ---
+
+def print_banner(title: str):
+    width = 72
+    print("\n" + "=" * width)
+    print(f"{title.center(width)}")
+    print("=" * width)
+
+def print_section(section_name: str):
+    width = 72
+    print(f"\n┌── [ {section_name} ] " + "─" * (width - len(section_name) - 7))
+
+def print_card(title: str, items: dict, width: int = 72):
+    print("┌" + "─" * (width - 2) + "┐")
+    print(f"│ {title.upper():<{width - 4}} │")
+    print("├" + "─" * (width - 2) + "┤")
+    for key, val in items.items():
+        k_str = f"  • {key}:"
+        v_str = str(val)
+        padding = width - len(k_str) - len(v_str) - 5
+        print(f"│{k_str} {' ' * max(0, padding)}{v_str}  │")
+    print("└" + "─" * (width - 2) + "┘")
+
+def print_table_header():
+    print(f"┌──────────┬──────────┬─────────────┬─────────────┬─────────────┬───────────────┐")
+    print(f"│ Epoch    │ Step     │ Total Loss  │ Recon Loss  │ RQ-VAE Loss │ Learning Rate │")
+    print(f"├──────────┼──────────┼─────────────┼─────────────┼─────────────┼───────────────┤")
+
+def print_table_row(epoch: int, step: int, loss: float, recon_loss: float, rq_loss: float, lr: float):
+    print(f"│ {epoch:<8d} │ {step:<8d} │ {loss:<11.4f} │ {recon_loss:<11.4f} │ {rq_loss:<11.4f} │ {lr:<13.6e} │")
+
+def print_table_footer():
+    print(f"└──────────┴──────────┴─────────────┴─────────────┴─────────────┴───────────────┘")
 
 def main():
+    start_time = time.time()
     parser = argparse.ArgumentParser(description="RQ-VAE Training and Inference CLI Pipeline")
     parser.add_argument('--h5_path', type=str, default='tencent_gr_parquet/train/mm_emb_82.h5', help='Path to input HDF5 file')
     parser.add_argument('--output_path', type=str, default='tencent_gr_parquet/train/index_rqvae.json', help='Path to output JSON mapping')
@@ -264,8 +298,6 @@ def main():
     AMP_DTYPE = dtype_map[args.dtype]
     USE_AMP = (DEVICE.type == 'cuda') and (args.dtype != 'fp32')
 
-    print(f"Using device: {DEVICE} | Precision: {args.dtype} (AMP Enabled: {USE_AMP})")
-
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
     if args.log_dir is None:
@@ -279,10 +311,32 @@ def main():
         checkpoint_dir = args.checkpoint_dir
 
     os.makedirs(checkpoint_dir, exist_ok=True)
-
     writer = SummaryWriter(log_dir=log_dir)
-    print(f"Logging TensorBoard runs to: {log_dir}")
 
+    print_banner("RQ-VAE SEMANTIC ID QUANTIZATION PIPELINE")
+
+    # 1. PARAMETER LISTING BLOCK
+    param_summary = {
+        "Device": str(DEVICE),
+        "Precision / AMP": f"{args.dtype} (AMP: {USE_AMP})",
+        "Input Dim → Hidden Dim": f"{args.input_dim} → {args.hidden_dim}",
+        "Codebooks Architecture": f"{args.num_codebooks} x {args.codebook_size} entries",
+        "Commitment Beta": args.beta,
+        "Optimizer & LR": f"{args.optimizer.upper()} (lr={args.lr}, warmup={args.warmup_steps})",
+        "Epochs / Max Steps": f"{args.epochs} epochs / {args.max_steps if args.max_steps else 'N/A'} max steps",
+        "Batch Size": args.batch_size,
+        "Dataset Source": args.h5_path,
+        "Output Index Path": args.output_path,
+        "TensorBoard Logs": log_dir,
+        "Checkpoint Dir": checkpoint_dir,
+    }
+    print_card("Runtime Parameters & System Config", param_summary)
+
+    # 2. STAGE: CODEBOOK INITIALIZATION
+    print_section("STAGE 1: CODEBOOK INITIALIZATION")
+    sample_init_size = min(100000, args.max_samples if args.max_samples else 100000)
+    print(f"  ► Sampling max {sample_init_size:,} embeddings for K-Means initialization...")
+    
     dataset = HDF5EmbeddingStreamDataset(
         args.h5_path, 
         chunk_size=4096, 
@@ -298,11 +352,11 @@ def main():
         codebook_sizes=[args.codebook_size] * args.num_codebooks
     ).to(DEVICE)
 
-    sample_init_size = min(100000, args.max_samples if args.max_samples else 100000)
     centroids_list = init_codebooks_batched(model, args.h5_path, [args.codebook_size] * args.num_codebooks, device=DEVICE, sample_size=sample_init_size)
     with torch.no_grad():
         for i, centroids in enumerate(centroids_list):
             model.codebooks[i].copy_(centroids.to(DEVICE))
+    print(f"  ✔ Initialized {args.num_codebooks} codebooks successfully via batched K-Means.")
 
     # Optimizer setup
     if args.optimizer == 'adagrad':
@@ -312,188 +366,6 @@ def main():
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    # Learning rate scheduler setup
     if args.scheduler == 'cosine':
         def lr_lambda(current_step: int):
             if current_step < args.warmup_steps:
-                return float(current_step) / float(max(1, args.warmup_steps))
-            
-            target_max_steps = args.max_steps if args.max_steps is not None else 100000
-            total_decay_steps = max(1, target_max_steps - args.warmup_steps)
-            progress = float(current_step - args.warmup_steps) / float(total_decay_steps)
-            progress = min(1.0, max(0.0, progress))
-            return max(0.01, 0.5 * (1.0 + math.cos(math.pi * progress)))
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    else:
-        scheduler = None
-
-    reservoir_fixer = ReservoirDeadCodeFixer(buffer_size=50000, hidden_dim=args.hidden_dim)
-    
-    # GradScaler is only needed when running FP16 mixed precision on CUDA
-    scaler = torch.amp.GradScaler('cuda', enabled=(DEVICE.type == 'cuda' and args.dtype == 'fp16'))
-
-    print("Starting RQ-VAE Training Pipeline...")
-    current_step = 0
-    reached_max_steps = False
-
-    for epoch in range(args.epochs):
-        if reached_max_steps:
-            break
-            
-        print(f'--- Epoch #{epoch} Started ---')
-        for batch in train_dataloader:
-            model.train()
-            batch_embs = batch['embedding'].to(DEVICE)
-            
-            with torch.no_grad():
-                latent_vectors = model.encoder(batch_embs)
-                reservoir_fixer.update_buffer(latent_vectors)
-
-            optimizer.zero_grad()
-            
-            with torch.autocast(device_type=DEVICE.type, dtype=AMP_DTYPE, enabled=USE_AMP):
-                model_output = model({'embedding': batch_embs})
-                loss = model_output['loss']
-
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.encoder.parameters(), 1.0)
-            nn.utils.clip_grad_norm_(model.codebooks, 1.0)
-            nn.utils.clip_grad_norm_(model.decoder.parameters(), 1.0)
-
-            scaler.step(optimizer)
-            scaler.update()
-
-            if scheduler is not None:
-                scheduler.step()
-            
-            current_step += 1
-
-            if current_step % 100 == 0 or current_step == 1:
-                total_revived = 0
-                for i, (cb_param, counts) in enumerate(zip(model.codebooks, model_output['clusters_counts'])):
-                    revived = reservoir_fixer.fix_dead_codes(cb_param, counts)
-                    total_revived += revived
-                    active_codes = (counts > 0).sum().item()
-                    writer.add_scalar(f"Codebook_{i}/Batch_Active_Codes", active_codes, current_step)
-
-                writer.add_scalar("Loss/Total", loss.item(), current_step)
-                writer.add_scalar("Loss/Reconstruction", model_output['metrics']['recon_loss'], current_step)
-                writer.add_scalar("Loss/RQ-VAE", model_output['metrics']['rqvae_loss'], current_step)
-                writer.add_scalar("Training/Learning_Rate", optimizer.param_groups[0]['lr'], current_step)
-                
-                if total_revived > 0:
-                    writer.add_scalar("Training/Dead_Codes_Revived", total_revived, current_step)
-                
-                print(f"Step {current_step} | Loss: {loss.item():.4f} | Recon Loss: {model_output['metrics']['recon_loss']:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}")
-
-            if args.max_steps is not None and current_step >= args.max_steps:
-                print(f"Target max_steps reached ({args.max_steps}). Terminating training loop.")
-                reached_max_steps = True
-                break
-
-        checkpoint_path = os.path.join(checkpoint_dir, f"rqvae_epoch_{epoch}.pth")
-        save_checkpoint(model, optimizer, scaler, epoch, current_step, checkpoint_path)
-
-    print("Training Complete!")
-
-    os.makedirs(os.path.dirname(os.path.abspath(args.model_path)) or '.', exist_ok=True)
-    torch.save(model.state_dict(), args.model_path)
-    print(f"Final model weights saved to {args.model_path}")
-
-    # Streaming inference
-    print("Generating semantic IDs for items...")
-    inference_dataset = HDF5EmbeddingStreamDataset(
-        args.h5_path, 
-        chunk_size=4096, 
-        shuffle_buffer=0, 
-        max_samples=args.max_samples
-    )
-    inference_loader = DataLoader(dataset=inference_dataset, batch_size=512, collate_fn=batch_processor)
-
-    raw_semantic_mapping = {}
-    sem_2_ids = defaultdict(list)
-    model.eval()
-
-    with torch.inference_mode():
-        for batch in inference_loader:
-            batch['embedding'] = batch['embedding'].to(DEVICE)
-            
-            with torch.autocast(device_type=DEVICE.type, dtype=AMP_DTYPE, enabled=USE_AMP):
-                model_output = model(batch)
-                
-            for item_id, semantic_ids in zip(batch['item_id'], model_output['clusters'].cpu().tolist()):
-                raw_semantic_mapping[item_id] = semantic_ids
-                if args.add_unique_id:
-                    sem_2_ids[tuple(semantic_ids)].append(item_id)
-
-    # Calculate and log full-corpus codebook utilization
-    print("\n" + "=" * 50)
-    print("      CORPUS CODEBOOK UTILIZATION REPORT      ")
-    print("=" * 50)
-    all_assigned_codes = np.array(list(raw_semantic_mapping.values()))
-    
-    per_cb_utilization = []
-    for cb_idx in range(args.num_codebooks):
-        cb_assignments = all_assigned_codes[:, cb_idx]
-        num_unique = len(np.unique(cb_assignments))
-        utilization_pct = (num_unique / args.codebook_size) * 100.0
-        per_cb_utilization.append(utilization_pct)
-        
-        print(f"  - Codebook #{cb_idx}: {num_unique} / {args.codebook_size} entries active ({utilization_pct:.2f}%)")
-        writer.add_scalar(f"Corpus_Utilization/Codebook_{cb_idx}", utilization_pct, current_step)
-
-    mean_utilization = np.mean(per_cb_utilization)
-    print(f"  - Average Codebook Utilization: {mean_utilization:.2f}%")
-    writer.add_scalar("Corpus_Utilization/Average", mean_utilization, current_step)
-    print("=" * 50 + "\n")
-
-    semantic_mapping = {}
-
-    if args.add_unique_id:
-        unique_bound = args.unique_id_bound if args.unique_id_bound is not None else args.codebook_size
-        print(f"Resolving collisions with unique ID suffix (bound = {unique_bound})...")
-        
-        overflow_count = 0
-        max_collision_len = 0
-        total_collisions = 0
-
-        for semantics, item_ids in sem_2_ids.items():
-            num_items = len(item_ids)
-            if num_items > 1:
-                total_collisions += 1
-                if num_items > max_collision_len:
-                    max_collision_len = num_items
-
-            if num_items > unique_bound:
-                overflow_count += 1
-                print(
-                    f"[WARNING / INCONSISTENCY DETECTED] Semantic tuple {list(semantics)} is shared by {num_items} items, "
-                    f"which exceeds the unique ID bound of {unique_bound}. "
-                    f"Unique IDs will be sampled with replacement to prevent pipeline crash."
-                )
-                collision_solvers = np.random.choice(unique_bound, size=num_items, replace=True).tolist()
-            else:
-                collision_solvers = np.random.permutation(unique_bound)[:num_items].tolist()
-
-            for item_id, solver in zip(item_ids, collision_solvers):
-                semantic_mapping[item_id] = list(semantics) + [int(solver)]
-
-        print(f"Collision Resolution Summary:")
-        print(f"  - Total unique semantic tuples: {len(sem_2_ids)}")
-        print(f"  - Tuples with collisions (>1 item): {total_collisions}")
-        print(f"  - Max items sharing a single tuple: {max_collision_len}")
-        print(f"  - Groups exceeding unique ID bound ({unique_bound}): {overflow_count}")
-    else:
-        semantic_mapping = raw_semantic_mapping
-
-    os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
-    with open(args.output_path, 'w') as f:
-        json.dump(semantic_mapping, f)
-
-    writer.close()
-    print(f"Successfully saved semantic index mapping to {args.output_path}")
-
-if __name__ == '__main__':
-    main()
