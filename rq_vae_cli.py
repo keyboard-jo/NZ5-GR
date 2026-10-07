@@ -255,13 +255,14 @@ class ReservoirDeadCodeFixer:
         
         return len(dead_indices)
 
-def save_checkpoint(model, optimizer, scaler, epoch, step, filepath):
+def save_checkpoint(model, optimizer, scaler, scheduler, epoch, step, filepath):
     checkpoint = {
         'epoch': epoch,
         'step': step,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'scaler_state_dict': scaler.state_dict() if scaler is not None else None
+        'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
+        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None
     }
     torch.save(checkpoint, filepath)
 
@@ -305,6 +306,7 @@ def main():
     parser.add_argument('--h5_path', type=str, default=DEFAULT_H5_PATH, help='Path to input HDF5 file')
     parser.add_argument('--output_path', type=str, default=DEFAULT_OUTPUT_PATH, help='Path to output JSON mapping')
     parser.add_argument('--model_path', type=str, default=DEFAULT_MODEL_PATH, help='Path to save the trained PyTorch model')
+    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint file (.pth) to resume training from')
     parser.add_argument('--device', type=str, default='cpu', help='Device to use (cpu, cuda:0, etc.)')
     parser.add_argument('--dtype', type=str, default='fp32', choices=['fp32', 'fp16', 'bf16'], help='Precision dtype for GPU training (defaults to fp32)')
     parser.add_argument('--epochs', type=int, default=DEFAULT_EPOCHS, help='Number of epochs (overridden if max_steps reached)')
@@ -368,6 +370,7 @@ def main():
         "Commitment Beta": args.beta,
         "Optimizer & LR": f"{args.optimizer.upper()} (lr={args.lr}, warmup={args.warmup_steps})",
         "Epochs / Max Steps": f"{args.epochs} epochs / {args.max_steps if args.max_steps else 'N/A'} max steps",
+        "Resume Checkpoint": args.resume if args.resume else "None (Fresh Start)",
         "Log Intervals": f"Log every {args.log_interval} steps",
         "Dead Code Intervals": f"Dead Code Fix every {args.dead_code_fix_interval} steps",
         "Batch Size": args.batch_size,
@@ -378,19 +381,7 @@ def main():
     }
     print_card("Runtime Parameters & System Config", param_summary)
 
-    # 2. STAGE: CODEBOOK INITIALIZATION
-    print_section("STAGE 1: CODEBOOK INITIALIZATION")
-    sample_init_size = min(INIT_SAMPLE_SIZE, args.max_samples if args.max_samples else INIT_SAMPLE_SIZE)
-    print(f"  ► Sampling max {sample_init_size:,} embeddings for K-Means initialization...")
-    
-    dataset = HDF5EmbeddingStreamDataset(
-        args.h5_path, 
-        chunk_size=CHUNK_SIZE, 
-        shuffle_buffer=min(MAX_INITIAL_SHUFFLE_BUFFER, args.max_samples if args.max_samples else MAX_INITIAL_SHUFFLE_BUFFER), 
-        max_samples=args.max_samples
-    )
-    train_dataloader = DataLoader(dataset=dataset, batch_size=args.batch_size, collate_fn=batch_processor)
-
+    # Initialize Core Model
     model = RQVAE(
         input_dim=args.input_dim,
         hidden_dim=args.hidden_dim,
@@ -398,13 +389,7 @@ def main():
         codebook_sizes=[args.codebook_size] * args.num_codebooks
     ).to(DEVICE)
 
-    centroids_list = init_codebooks_batched(model, args.h5_path, [args.codebook_size] * args.num_codebooks, device=DEVICE, sample_size=sample_init_size)
-    with torch.no_grad():
-        for i, centroids in enumerate(centroids_list):
-            model.codebooks[i].copy_(centroids.to(DEVICE))
-    print(f"  ✔ Initialized {args.num_codebooks} codebooks successfully via batched K-Means.")
-
-    # Optimizer setup
+    # Initialize Optimizer
     if args.optimizer == 'adagrad':
         optimizer = torch.optim.Adagrad(model.parameters(), lr=args.lr)
     elif args.optimizer == 'adamw':
@@ -412,6 +397,7 @@ def main():
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
+    # Initialize Scheduler
     if args.scheduler == 'cosine':
         def lr_lambda(current_step: int):
             if current_step < args.warmup_steps:
@@ -427,17 +413,74 @@ def main():
     else:
         scheduler = None
 
-    reservoir_fixer = ReservoirDeadCodeFixer(buffer_size=SHUFFLE_BUFFER_SIZE, hidden_dim=args.hidden_dim)
     scaler = torch.amp.GradScaler(enabled=(DEVICE.type == 'cuda' and args.dtype == 'fp16'))
+    reservoir_fixer = ReservoirDeadCodeFixer(buffer_size=SHUFFLE_BUFFER_SIZE, hidden_dim=args.hidden_dim)
+
+    start_epoch = 0
+    current_step = 0
+
+    # 2. STAGE: RESUME OR INITIALIZE CODEBOOKS
+    if args.resume and os.path.isfile(args.resume):
+        print_section("STAGE 1: RESUMING FROM CHECKPOINT")
+        print(f"  ► Loading checkpoint state from: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=DEVICE)
+
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            
+            if 'optimizer_state_dict' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                
+            if scaler is not None and checkpoint.get('scaler_state_dict') is not None:
+                scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
+            start_epoch = checkpoint.get('epoch', 0) + 1
+            current_step = checkpoint.get('step', 0)
+
+            if scheduler is not None:
+                if checkpoint.get('scheduler_state_dict') is not None:
+                    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                else:
+                    scheduler.last_epoch = current_step
+                    print(f"  [!] Legacy checkpoint detected. Fast-forwarded LR scheduler to Step {current_step}.")
+        else:
+            model.load_state_dict(checkpoint)
+            print("  [!] Loaded raw model weights. Optimizer and scheduler states reset.")
+
+        print(f"  ✔ Successfully loaded model state. Resuming from Epoch {start_epoch}, Step {current_step}.")
+    else:
+        print_section("STAGE 1: CODEBOOK INITIALIZATION")
+        sample_init_size = min(INIT_SAMPLE_SIZE, args.max_samples if args.max_samples else INIT_SAMPLE_SIZE)
+        print(f"  ► Sampling max {sample_init_size:,} embeddings for K-Means initialization...")
+        
+        centroids_list = init_codebooks_batched(
+            model, 
+            args.h5_path, 
+            [args.codebook_size] * args.num_codebooks, 
+            device=DEVICE, 
+            sample_size=sample_init_size
+        )
+        with torch.no_grad():
+            for i, centroids in enumerate(centroids_list):
+                model.codebooks[i].copy_(centroids.to(DEVICE))
+        print(f"  ✔ Initialized {args.num_codebooks} codebooks successfully via batched K-Means.")
+
+    # Dataset loader setup
+    dataset = HDF5EmbeddingStreamDataset(
+        args.h5_path, 
+        chunk_size=CHUNK_SIZE, 
+        shuffle_buffer=min(MAX_INITIAL_SHUFFLE_BUFFER, args.max_samples if args.max_samples else MAX_INITIAL_SHUFFLE_BUFFER), 
+        max_samples=args.max_samples
+    )
+    train_dataloader = DataLoader(dataset=dataset, batch_size=args.batch_size, collate_fn=batch_processor)
 
     # 3. STAGE: TRAINING LOOP
     print_section("STAGE 2: MODEL TRAINING LOOP")
     print_table_header()
 
-    current_step = 0
     reached_max_steps = False
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         if reached_max_steps:
             break
             
@@ -508,14 +551,14 @@ def main():
 
         if not reached_max_steps:
             checkpoint_path = os.path.join(checkpoint_dir, f"rqvae_epoch_{epoch}.pth")
-            save_checkpoint(model, optimizer, scaler, epoch, current_step, checkpoint_path)
+            save_checkpoint(model, optimizer, scaler, scheduler, epoch, current_step, checkpoint_path)
 
     if not reached_max_steps:
         print_table_footer()
 
     os.makedirs(os.path.dirname(os.path.abspath(args.model_path)) or '.', exist_ok=True)
     torch.save(model.state_dict(), args.model_path)
-    print(f"  ✔ Saved model checkpoint to {args.model_path}")
+    print(f"  ✔ Saved final model checkpoint to {args.model_path}")
 
     # 4. STAGE: SEMANTIC ID GENERATION
     print_section("STAGE 3: INFERENCE & SEMANTIC ID GENERATION")
