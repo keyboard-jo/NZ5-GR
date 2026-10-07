@@ -25,7 +25,7 @@ DEFAULT_OUTPUT_PATH = 'tencent_gr_parquet/train/index_rqvae.json'
 DEFAULT_MODEL_PATH = 'rqvae_model.pth'
 DEFAULT_EPOCHS = 5
 DEFAULT_BATCH_SIZE = 256
-DEFAULT_MAX_SAMPLES = 10000
+DEFAULT_MAX_SAMPLES = None
 DEFAULT_INPUT_DIM = 1024
 DEFAULT_HIDDEN_DIM = 32
 DEFAULT_CODEBOOK_SIZE = 256
@@ -310,7 +310,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=DEFAULT_EPOCHS, help='Number of epochs (overridden if max_steps reached)')
     parser.add_argument('--max_steps', type=int, default=None, help='Target maximum training steps (overrides epoch count when reached)')
     parser.add_argument('--batch_size', type=int, default=DEFAULT_BATCH_SIZE, help='Batch size')
-    parser.add_argument('--max_samples', type=int, default=DEFAULT_MAX_SAMPLES, help='Limit number of samples for local CPU testing (None for all)')
+    parser.add_argument('--max_samples', type=lambda x: None if x.lower() == 'none' else int(x), default=DEFAULT_MAX_SAMPLES, help='Limit number of samples (None for all)')
     parser.add_argument('--input_dim', type=int, default=DEFAULT_INPUT_DIM, help='Input embedding dimension')
     parser.add_argument('--hidden_dim', type=int, default=DEFAULT_HIDDEN_DIM, help='Hidden codebook dimension')
     parser.add_argument('--codebook_size', type=int, default=DEFAULT_CODEBOOK_SIZE, help='Size of each codebook')
