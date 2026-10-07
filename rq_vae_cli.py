@@ -18,8 +18,50 @@ torch.set_float32_matmul_precision('high')
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
+# --- GLOBAL CONSTANTS & HYPERPARAMETERS ---
+RANDOM_SEED = 42
+DEFAULT_H5_PATH = 'tencent_gr_parquet/train/mm_emb_82.h5'
+DEFAULT_OUTPUT_PATH = 'tencent_gr_parquet/train/index_rqvae.json'
+DEFAULT_MODEL_PATH = 'rqvae_model.pth'
+DEFAULT_EPOCHS = 5
+DEFAULT_BATCH_SIZE = 256
+DEFAULT_MAX_SAMPLES = 10000
+DEFAULT_INPUT_DIM = 1024
+DEFAULT_HIDDEN_DIM = 32
+DEFAULT_CODEBOOK_SIZE = 256
+DEFAULT_NUM_CODEBOOKS = 3
+DEFAULT_BETA = 0.25
+DEFAULT_LR = 5e-4
+DEFAULT_WARMUP_STEPS = 1000
+DEFAULT_LOG_INTERVAL = 100
+DEFAULT_DEAD_CODE_FIX_INTERVAL = 100
+
+# Model initialization constants
+TRUNC_NORMAL_STD = 0.02
+
+# Dataset & Loader constants
+CHUNK_SIZE = 4096
+SHUFFLE_BUFFER_SIZE = 50000
+MAX_INITIAL_SHUFFLE_BUFFER = 20000
+INIT_SAMPLE_SIZE = 100000
+INIT_BATCH_SIZE = 4096
+INFERENCE_BATCH_SIZE = 512
+
+# K-Means constants
+KMEANS_N_INIT = 3
+KMEANS_RANDOM_STATE = 42
+
+# Training & Optimization constants
+GRAD_CLIP_MAX_NORM = 1.0
+WEIGHT_DECAY = 1e-4
+MIN_LR_RATIO = 0.01
+DEAD_CODE_FIXER_MIN_BUFFER = 100
+
+# UI/Logging constants
+BANNER_WIDTH = 72
+
 class HDF5EmbeddingStreamDataset(IterableDataset):
-    def __init__(self, h5_path: str, chunk_size: int = 4096, shuffle_buffer: int = 50000, max_samples: int = None):
+    def __init__(self, h5_path: str, chunk_size: int = CHUNK_SIZE, shuffle_buffer: int = SHUFFLE_BUFFER_SIZE, max_samples: int = None):
         super().__init__()
         self.h5_path = h5_path
         self.chunk_size = chunk_size
@@ -95,7 +137,7 @@ class RQVAE(nn.Module):
         for codebook_size in codebook_sizes:
             cb = torch.FloatTensor(codebook_size, hidden_dim)
             with torch.no_grad():
-                torch.nn.init.trunc_normal_(cb, std=0.02, a=-2 * 0.02, b=2 * 0.02)
+                torch.nn.init.trunc_normal_(cb, std=TRUNC_NORMAL_STD, a=-2 * TRUNC_NORMAL_STD, b=2 * TRUNC_NORMAL_STD)
             self.codebooks.append(cb)
 
     @staticmethod
@@ -152,7 +194,7 @@ class RQVAE(nn.Module):
             ),
         }
 
-def init_codebooks_batched(model, h5_path, codebook_sizes, device, sample_size=100000):
+def init_codebooks_batched(model, h5_path, codebook_sizes, device, sample_size=INIT_SAMPLE_SIZE):
     with h5py.File(h5_path, 'r') as f:
         emb_ds = f['embedding']
         total_len = len(emb_ds)
@@ -163,7 +205,7 @@ def init_codebooks_batched(model, h5_path, codebook_sizes, device, sample_size=1
 
     model.eval()
     encoded_list = []
-    batch_sz = 4096
+    batch_sz = INIT_BATCH_SIZE
     with torch.no_grad():
         for i in range(0, len(sampled_data), batch_sz):
             batch_data = torch.tensor(sampled_data[i:i+batch_sz], dtype=torch.float32).to(device)
@@ -173,7 +215,7 @@ def init_codebooks_batched(model, h5_path, codebook_sizes, device, sample_size=1
     
     codebooks = []
     for cb_size in codebook_sizes:
-        kmeans = KMeans(n_clusters=cb_size, n_init=3, random_state=42)
+        kmeans = KMeans(n_clusters=cb_size, n_init=KMEANS_N_INIT, random_state=KMEANS_RANDOM_STATE)
         kmeans.fit(current_residuals)
         centroids = torch.tensor(kmeans.cluster_centers_, dtype=torch.float32)
         codebooks.append(centroids)
@@ -185,7 +227,7 @@ def init_codebooks_batched(model, h5_path, codebook_sizes, device, sample_size=1
     return codebooks
 
 class ReservoirDeadCodeFixer:
-    def __init__(self, buffer_size=50000, hidden_dim=32):
+    def __init__(self, buffer_size=SHUFFLE_BUFFER_SIZE, hidden_dim=DEFAULT_HIDDEN_DIM):
         self.buffer_size = buffer_size
         self.hidden_dim = hidden_dim
         self.buffer = deque(maxlen=buffer_size)
@@ -196,7 +238,7 @@ class ReservoirDeadCodeFixer:
                 self.buffer.append(vec)
 
     def fix_dead_codes(self, codebook: torch.nn.Parameter, cluster_counts: torch.Tensor):
-        if len(self.buffer) < 100:
+        if len(self.buffer) < DEAD_CODE_FIXER_MIN_BUFFER:
             return 0
 
         dead_indices = (cluster_counts == 0).nonzero(as_tuple=True)[0]
@@ -226,16 +268,16 @@ def save_checkpoint(model, optimizer, scaler, epoch, step, filepath):
 # --- VISUAL FORMATTING LOGGING HELPERS ---
 
 def print_banner(title: str):
-    width = 72
+    width = BANNER_WIDTH
     print("\n" + "=" * width)
     print(f"{title.center(width)}")
     print("=" * width)
 
 def print_section(section_name: str):
-    width = 72
+    width = BANNER_WIDTH
     print(f"\n┌── [ {section_name} ] " + "─" * (width - len(section_name) - 7))
 
-def print_card(title: str, items: dict, width: int = 72):
+def print_card(title: str, items: dict, width: int = BANNER_WIDTH):
     print("┌" + "─" * (width - 2) + "┐")
     print(f"│ {title.upper():<{width - 4}} │")
     print("├" + "─" * (width - 2) + "┤")
@@ -260,35 +302,35 @@ def print_table_footer():
 def main():
     start_time = time.time()
     parser = argparse.ArgumentParser(description="RQ-VAE Training and Inference CLI Pipeline")
-    parser.add_argument('--h5_path', type=str, default='tencent_gr_parquet/train/mm_emb_82.h5', help='Path to input HDF5 file')
-    parser.add_argument('--output_path', type=str, default='tencent_gr_parquet/train/index_rqvae.json', help='Path to output JSON mapping')
-    parser.add_argument('--model_path', type=str, default='rqvae_model.pth', help='Path to save the trained PyTorch model')
+    parser.add_argument('--h5_path', type=str, default=DEFAULT_H5_PATH, help='Path to input HDF5 file')
+    parser.add_argument('--output_path', type=str, default=DEFAULT_OUTPUT_PATH, help='Path to output JSON mapping')
+    parser.add_argument('--model_path', type=str, default=DEFAULT_MODEL_PATH, help='Path to save the trained PyTorch model')
     parser.add_argument('--device', type=str, default='cpu', help='Device to use (cpu, cuda:0, etc.)')
     parser.add_argument('--dtype', type=str, default='fp32', choices=['fp32', 'fp16', 'bf16'], help='Precision dtype for GPU training (defaults to fp32)')
-    parser.add_argument('--epochs', type=int, default=5, help='Number of epochs (overridden if max_steps reached)')
+    parser.add_argument('--epochs', type=int, default=DEFAULT_EPOCHS, help='Number of epochs (overridden if max_steps reached)')
     parser.add_argument('--max_steps', type=int, default=None, help='Target maximum training steps (overrides epoch count when reached)')
-    parser.add_argument('--batch_size', type=int, default=256, help='Batch size')
-    parser.add_argument('--max_samples', type=int, default=10000, help='Limit number of samples for local CPU testing (None for all)')
-    parser.add_argument('--input_dim', type=int, default=1024, help='Input embedding dimension')
-    parser.add_argument('--hidden_dim', type=int, default=32, help='Hidden codebook dimension')
-    parser.add_argument('--codebook_size', type=int, default=256, help='Size of each codebook')
-    parser.add_argument('--num_codebooks', type=int, default=3, help='Number of residual codebooks')
-    parser.add_argument('--beta', type=float, default=0.25, help='Commitment loss beta coefficient')
+    parser.add_argument('--batch_size', type=int, default=DEFAULT_BATCH_SIZE, help='Batch size')
+    parser.add_argument('--max_samples', type=int, default=DEFAULT_MAX_SAMPLES, help='Limit number of samples for local CPU testing (None for all)')
+    parser.add_argument('--input_dim', type=int, default=DEFAULT_INPUT_DIM, help='Input embedding dimension')
+    parser.add_argument('--hidden_dim', type=int, default=DEFAULT_HIDDEN_DIM, help='Hidden codebook dimension')
+    parser.add_argument('--codebook_size', type=int, default=DEFAULT_CODEBOOK_SIZE, help='Size of each codebook')
+    parser.add_argument('--num_codebooks', type=int, default=DEFAULT_NUM_CODEBOOKS, help='Number of residual codebooks')
+    parser.add_argument('--beta', type=float, default=DEFAULT_BETA, help='Commitment loss beta coefficient')
     parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw', 'adagrad'], help='Optimizer selection')
-    parser.add_argument('--lr', type=float, default=5e-4, help='Learning rate')
+    parser.add_argument('--lr', type=float, default=DEFAULT_LR, help='Learning rate')
     parser.add_argument('--scheduler', type=str, default='cosine', choices=['cosine', 'none'], help='Learning rate scheduler type')
-    parser.add_argument('--warmup_steps', type=int, default=1000, help='Linear warmup steps for scheduler')
+    parser.add_argument('--warmup_steps', type=int, default=DEFAULT_WARMUP_STEPS, help='Linear warmup steps for scheduler')
     parser.add_argument('--log_dir', type=str, default=None, help='TensorBoard log directory')
     parser.add_argument('--checkpoint_dir', type=str, default=None, help='Directory to save checkpoints')
     parser.add_argument('--add_unique_id', action='store_true', help='Append a unique collision-solver suffix ID to semantic IDs')
     parser.add_argument('--unique_id_bound', type=int, default=None, help='Upper bound for unique collision solver IDs (defaults to codebook_size if None)')
-    parser.add_argument('--log_interval', type=int, default=100, help='Frequency (in steps) to log metrics to console and TensorBoard')
-    parser.add_argument('--dead_code_fix_interval', type=int, default=100, help='Frequency (in steps) to check for and revive dead codebook entries')
+    parser.add_argument('--log_interval', type=int, default=DEFAULT_LOG_INTERVAL, help='Frequency (in steps) to log metrics to console and TensorBoard')
+    parser.add_argument('--dead_code_fix_interval', type=int, default=DEFAULT_DEAD_CODE_FIX_INTERVAL, help='Frequency (in steps) to check for and revive dead codebook entries')
 
     args = parser.parse_args()
 
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
+    torch.manual_seed(RANDOM_SEED)
+    torch.cuda.manual_seed(RANDOM_SEED)
     DEVICE = torch.device(args.device)
 
     # Resolve Precision / Dtype Configuration
@@ -338,13 +380,13 @@ def main():
 
     # 2. STAGE: CODEBOOK INITIALIZATION
     print_section("STAGE 1: CODEBOOK INITIALIZATION")
-    sample_init_size = min(100000, args.max_samples if args.max_samples else 100000)
+    sample_init_size = min(INIT_SAMPLE_SIZE, args.max_samples if args.max_samples else INIT_SAMPLE_SIZE)
     print(f"  ► Sampling max {sample_init_size:,} embeddings for K-Means initialization...")
     
     dataset = HDF5EmbeddingStreamDataset(
         args.h5_path, 
-        chunk_size=4096, 
-        shuffle_buffer=min(20000, args.max_samples if args.max_samples else 20000), 
+        chunk_size=CHUNK_SIZE, 
+        shuffle_buffer=min(MAX_INITIAL_SHUFFLE_BUFFER, args.max_samples if args.max_samples else MAX_INITIAL_SHUFFLE_BUFFER), 
         max_samples=args.max_samples
     )
     train_dataloader = DataLoader(dataset=dataset, batch_size=args.batch_size, collate_fn=batch_processor)
@@ -366,7 +408,7 @@ def main():
     if args.optimizer == 'adagrad':
         optimizer = torch.optim.Adagrad(model.parameters(), lr=args.lr)
     elif args.optimizer == 'adamw':
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
@@ -375,17 +417,17 @@ def main():
             if current_step < args.warmup_steps:
                 return float(current_step) / float(max(1, args.warmup_steps))
             
-            target_max_steps = args.max_steps if args.max_steps is not None else 100000
+            target_max_steps = args.max_steps if args.max_steps is not None else INIT_SAMPLE_SIZE
             total_decay_steps = max(1, target_max_steps - args.warmup_steps)
             progress = float(current_step - args.warmup_steps) / float(total_decay_steps)
             progress = min(1.0, max(0.0, progress))
-            return max(0.01, 0.5 * (1.0 + math.cos(math.pi * progress)))
+            return max(MIN_LR_RATIO, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     else:
         scheduler = None
 
-    reservoir_fixer = ReservoirDeadCodeFixer(buffer_size=50000, hidden_dim=args.hidden_dim)
+    reservoir_fixer = ReservoirDeadCodeFixer(buffer_size=SHUFFLE_BUFFER_SIZE, hidden_dim=args.hidden_dim)
     scaler = torch.amp.GradScaler(enabled=(DEVICE.type == 'cuda' and args.dtype == 'fp16'))
 
     # 3. STAGE: TRAINING LOOP
@@ -415,9 +457,9 @@ def main():
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.encoder.parameters(), 1.0)
-            nn.utils.clip_grad_norm_(model.codebooks, 1.0)
-            nn.utils.clip_grad_norm_(model.decoder.parameters(), 1.0)
+            nn.utils.clip_grad_norm_(model.encoder.parameters(), GRAD_CLIP_MAX_NORM)
+            nn.utils.clip_grad_norm_(model.codebooks, GRAD_CLIP_MAX_NORM)
+            nn.utils.clip_grad_norm_(model.decoder.parameters(), GRAD_CLIP_MAX_NORM)
 
             scaler.step(optimizer)
             scaler.update()
@@ -481,11 +523,11 @@ def main():
 
     inference_dataset = HDF5EmbeddingStreamDataset(
         args.h5_path, 
-        chunk_size=4096, 
+        chunk_size=CHUNK_SIZE, 
         shuffle_buffer=0, 
         max_samples=args.max_samples
     )
-    inference_loader = DataLoader(dataset=inference_dataset, batch_size=512, collate_fn=batch_processor)
+    inference_loader = DataLoader(dataset=inference_dataset, batch_size=INFERENCE_BATCH_SIZE, collate_fn=batch_processor)
 
     raw_semantic_mapping = {}
     sem_2_ids = defaultdict(list)
