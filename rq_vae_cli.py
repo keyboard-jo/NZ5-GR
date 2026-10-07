@@ -282,6 +282,8 @@ def main():
     parser.add_argument('--checkpoint_dir', type=str, default=None, help='Directory to save checkpoints')
     parser.add_argument('--add_unique_id', action='store_true', help='Append a unique collision-solver suffix ID to semantic IDs')
     parser.add_argument('--unique_id_bound', type=int, default=None, help='Upper bound for unique collision solver IDs (defaults to codebook_size if None)')
+    parser.add_argument('--log_interval', type=int, default=100, help='Frequency (in steps) to log metrics to console and TensorBoard')
+    parser.add_argument('--dead_code_fix_interval', type=int, default=100, help='Frequency (in steps) to check for and revive dead codebook entries')
 
     args = parser.parse_args()
 
@@ -324,6 +326,8 @@ def main():
         "Commitment Beta": args.beta,
         "Optimizer & LR": f"{args.optimizer.upper()} (lr={args.lr}, warmup={args.warmup_steps})",
         "Epochs / Max Steps": f"{args.epochs} epochs / {args.max_steps if args.max_steps else 'N/A'} max steps",
+        "Log Intervals": f"Log every {args.log_interval} steps",
+        "Dead Code Intervals": f"Dead Code Fix every {args.dead_code_fix_interval} steps",
         "Batch Size": args.batch_size,
         "Dataset Source": args.h5_path,
         "Output Index Path": args.output_path,
@@ -423,22 +427,28 @@ def main():
             
             current_step += 1
 
-            if current_step % 100 == 0 or current_step == 1:
+            if current_step % args.dead_code_fix_interval == 0:
                 total_revived = 0
-                for i, (cb_param, counts) in enumerate(zip(model.codebooks, model_output['clusters_counts'])):
+                for cb_param, counts in zip(model.codebooks, model_output['clusters_counts']):
                     revived = reservoir_fixer.fix_dead_codes(cb_param, counts)
                     total_revived += revived
+                
+                if total_revived > 0:
+                    writer.add_scalar("Training/Dead_Codes_Revived", total_revived, current_step)
+
+            if current_step % args.log_interval == 0 or current_step == 1:
+                # Log active codes count per codebook
+                for i, counts in enumerate(model_output['clusters_counts']):
                     active_codes = (counts > 0).sum().item()
                     writer.add_scalar(f"Codebook_{i}/Batch_Active_Codes", active_codes, current_step)
 
+                # Log loss terms & learning rate
                 writer.add_scalar("Loss/Total", loss.item(), current_step)
                 writer.add_scalar("Loss/Reconstruction", model_output['metrics']['recon_loss'], current_step)
                 writer.add_scalar("Loss/RQ-VAE", model_output['metrics']['rqvae_loss'], current_step)
                 writer.add_scalar("Training/Learning_Rate", optimizer.param_groups[0]['lr'], current_step)
-                
-                if total_revived > 0:
-                    writer.add_scalar("Training/Dead_Codes_Revived", total_revived, current_step)
-                
+
+                # Format terminal output
                 print_table_row(
                     epoch=epoch,
                     step=current_step,
