@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from datetime import datetime
-from torch.utils.data import IterableDataset, DataLoader
+from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.cluster import KMeans
 from collections import deque, defaultdict
@@ -35,14 +35,12 @@ DEFAULT_LR = 5e-4
 DEFAULT_WARMUP_STEPS = 1000
 DEFAULT_LOG_INTERVAL = 100
 DEFAULT_DEAD_CODE_FIX_INTERVAL = 100
+DEFAULT_SAVE_INTERVAL = 1
 
 # Model initialization constants
 TRUNC_NORMAL_STD = 0.02
 
 # Dataset & Loader constants
-CHUNK_SIZE = 4096
-SHUFFLE_BUFFER_SIZE = 50000
-MAX_INITIAL_SHUFFLE_BUFFER = 20000
 INIT_SAMPLE_SIZE = 100000
 INIT_BATCH_SIZE = 4096
 INFERENCE_BATCH_SIZE = 512
@@ -56,21 +54,19 @@ GRAD_CLIP_MAX_NORM = 1.0
 WEIGHT_DECAY = 1e-4
 MIN_LR_RATIO = 0.01
 DEAD_CODE_FIXER_MIN_BUFFER = 100
+SHUFFLE_BUFFER_SIZE = 50000 # Kept only for reservoir fixer buffer size
 
 # UI/Logging constants
 BANNER_WIDTH = 72
 
-class HDF5EmbeddingStreamDataset(IterableDataset):
-    def __init__(self, h5_path: str, chunk_size: int = CHUNK_SIZE, shuffle_buffer: int = SHUFFLE_BUFFER_SIZE, max_samples: int = None):
+class HDF5EmbeddingDataset(Dataset):
+    def __init__(self, h5_path: str, max_samples: int = None):
         super().__init__()
         self.h5_path = h5_path
-        self.chunk_size = chunk_size
-        self.shuffle_buffer = shuffle_buffer
         self.max_samples = max_samples
 
-    def __iter__(self):
-        worker_info = torch.utils.data.get_worker_info()
-        with h5py.File(self.h5_path, 'r', swmr=True) as f:
+        print(f"  ► Loading entire dataset into memory from {h5_path}...")
+        with h5py.File(self.h5_path, 'r') as f:
             oid_ds = f['anonymous_cid']
             emb_ds = f['embedding']
             
@@ -78,46 +74,22 @@ class HDF5EmbeddingStreamDataset(IterableDataset):
             if self.max_samples is not None:
                 total_len = min(total_len, self.max_samples)
             
-            if worker_info is not None:
-                per_worker = int(np.ceil(total_len / worker_info.num_workers))
-                start_idx = worker_info.id * per_worker
-                end_idx = min(start_idx + per_worker, total_len)
-            else:
-                start_idx, end_idx = 0, total_len
+            # Load arrays fully into memory
+            oids = oid_ds[:total_len]
+            embs = emb_ds[:total_len]
 
-            buffer = []
-            for idx in range(start_idx, end_idx, self.chunk_size):
-                try:
-                    chunk_end = min(idx + self.chunk_size, end_idx)
-                    batch_oids = oid_ds[idx:chunk_end]
-                    batch_embs = emb_ds[idx:chunk_end]
-                    
-                    for oid, emb in zip(batch_oids, batch_embs):
-                        if isinstance(oid, bytes):
-                            oid = oid.decode('utf-8')
-                        item_data = {
-                            'item_id': str(oid),
-                            'embedding': torch.from_numpy(emb).float()
-                        }
-                        
-                        if self.shuffle_buffer <= 0:
-                            yield item_data
-                            continue
+        self.item_ids = [oid.decode('utf-8') if isinstance(oid, bytes) else str(oid) for oid in oids]
+        self.embeddings = torch.from_numpy(embs).float()
+        print(f"  ✔ Successfully loaded {len(self.item_ids):,} samples into memory.")
 
-                        if len(buffer) < self.shuffle_buffer:
-                            buffer.append(item_data)
-                        else:
-                            idx_to_yield = np.random.randint(0, len(buffer))
-                            yield buffer[idx_to_yield]
-                            buffer[idx_to_yield] = item_data
-                except Exception as e:
-                    print(f"  [!] Warning: Failed to read chunk at index {idx}. Skipping. Error: {e}")
-                    continue
-                        
-            if self.shuffle_buffer > 0 and len(buffer) > 0:
-                np.random.shuffle(buffer)
-                for item in buffer:
-                    yield item
+    def __len__(self):
+        return len(self.item_ids)
+
+    def __getitem__(self, idx):
+        return {
+            'item_id': self.item_ids[idx],
+            'embedding': self.embeddings[idx]
+        }
 
 def batch_processor(batch):
     item_ids = [item['item_id'] for item in batch]
@@ -125,30 +97,39 @@ def batch_processor(batch):
     return {'item_id': item_ids, 'embedding': embeddings}
 
 class RQVAE(nn.Module):
-    def __init__(self, input_dim, hidden_dim, beta, codebook_sizes):
+    def __init__(self, input_dim=1024, hidden_dim=32, beta=0.25, codebook_sizes=[256, 256, 256]):
         super().__init__()
         self.register_buffer('beta', torch.tensor(beta))
 
-        self.encoder = self.make_encoding_tower(input_dim, hidden_dim)
-        self.decoder = self.make_encoding_tower(hidden_dim, input_dim)
+        # Encoder: 1024 -> 512 -> 256 -> 128 -> hidden_dim (32, 64)
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, hidden_dim)
+        )
+
+        # Decoder: hidden_dim (32, 64) -> 128 -> 256 -> 512 -> 1024
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.Linear(256, 512),
+            nn.ReLU(),
+            nn.Linear(512, input_dim)
+        )
 
         self.codebook_sizes = codebook_sizes
         self.codebooks = torch.nn.ParameterList()
         for codebook_size in codebook_sizes:
             cb = torch.FloatTensor(codebook_size, hidden_dim)
             with torch.no_grad():
-                torch.nn.init.trunc_normal_(cb, std=TRUNC_NORMAL_STD, a=-2 * TRUNC_NORMAL_STD, b=2 * TRUNC_NORMAL_STD)
+                torch.nn.init.trunc_normal_(cb, std=0.02, a=-0.04, b=0.04)
             self.codebooks.append(cb)
-
-    @staticmethod
-    def make_encoding_tower(d1, d2, bias=False):
-        return torch.nn.Sequential(
-            torch.nn.Linear(d1, d1),
-            torch.nn.ReLU(),
-            torch.nn.Linear(d1, d2),
-            torch.nn.ReLU(),
-            torch.nn.Linear(d2, d2, bias=bias)
-        )
 
     @staticmethod
     def get_codebook_indices(remainder, codebook):
@@ -194,21 +175,17 @@ class RQVAE(nn.Module):
             ),
         }
 
-def init_codebooks_batched(model, h5_path, codebook_sizes, device, sample_size=INIT_SAMPLE_SIZE):
-    with h5py.File(h5_path, 'r') as f:
-        emb_ds = f['embedding']
-        total_len = len(emb_ds)
-        
-        sample_indices = np.random.choice(total_len, size=min(sample_size, total_len), replace=False)
-        sample_indices.sort()
-        sampled_data = emb_ds[sample_indices]
+def init_codebooks_batched(model, dataset_embeddings, codebook_sizes, device, sample_size=INIT_SAMPLE_SIZE):
+    total_len = len(dataset_embeddings)
+    sample_indices = np.random.choice(total_len, size=min(sample_size, total_len), replace=False)
+    sampled_data = dataset_embeddings[sample_indices]
 
     model.eval()
     encoded_list = []
     batch_sz = INIT_BATCH_SIZE
     with torch.no_grad():
         for i in range(0, len(sampled_data), batch_sz):
-            batch_data = torch.tensor(sampled_data[i:i+batch_sz], dtype=torch.float32).to(device)
+            batch_data = sampled_data[i:i+batch_sz].to(device)
             encoded_list.append(model.encoder(batch_data).cpu().numpy())
     
     current_residuals = np.concatenate(encoded_list, axis=0)
@@ -314,7 +291,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=DEFAULT_BATCH_SIZE, help='Batch size')
     parser.add_argument('--max_samples', type=lambda x: None if x.lower() == 'none' else int(x), default=DEFAULT_MAX_SAMPLES, help='Limit number of samples (None for all)')
     parser.add_argument('--input_dim', type=int, default=DEFAULT_INPUT_DIM, help='Input embedding dimension')
-    parser.add_argument('--hidden_dim', type=int, default=DEFAULT_HIDDEN_DIM, help='Hidden codebook dimension')
+    parser.add_argument('--hidden_dim', type=int, default=DEFAULT_HIDDEN_DIM, choices=[32, 64], help='Hidden codebook dimension (must be 32 or 64)')
     parser.add_argument('--codebook_size', type=int, default=DEFAULT_CODEBOOK_SIZE, help='Size of each codebook')
     parser.add_argument('--num_codebooks', type=int, default=DEFAULT_NUM_CODEBOOKS, help='Number of residual codebooks')
     parser.add_argument('--beta', type=float, default=DEFAULT_BETA, help='Commitment loss beta coefficient')
@@ -328,6 +305,7 @@ def main():
     parser.add_argument('--unique_id_bound', type=int, default=None, help='Upper bound for unique collision solver IDs (defaults to codebook_size if None)')
     parser.add_argument('--log_interval', type=int, default=DEFAULT_LOG_INTERVAL, help='Frequency (in steps) to log metrics to console and TensorBoard')
     parser.add_argument('--dead_code_fix_interval', type=int, default=DEFAULT_DEAD_CODE_FIX_INTERVAL, help='Frequency (in steps) to check for and revive dead codebook entries')
+    parser.add_argument('--save_interval', type=int, default=DEFAULT_SAVE_INTERVAL, help='Frequency (in epochs) to save model checkpoints')
 
     args = parser.parse_args()
 
@@ -373,6 +351,7 @@ def main():
         "Resume Checkpoint": args.resume if args.resume else "None (Fresh Start)",
         "Log Intervals": f"Log every {args.log_interval} steps",
         "Dead Code Intervals": f"Dead Code Fix every {args.dead_code_fix_interval} steps",
+        "Skip Intervals": f"Save every {args.save_interval} epochs",
         "Batch Size": args.batch_size,
         "Dataset Source": args.h5_path,
         "Output Index Path": args.output_path,
@@ -416,6 +395,10 @@ def main():
     scaler = torch.amp.GradScaler(enabled=(DEVICE.type == 'cuda' and args.dtype == 'fp16'))
     reservoir_fixer = ReservoirDeadCodeFixer(buffer_size=SHUFFLE_BUFFER_SIZE, hidden_dim=args.hidden_dim)
 
+    # Dataset loader setup - Fully loaded into memory
+    dataset = HDF5EmbeddingDataset(args.h5_path, max_samples=args.max_samples)
+    train_dataloader = DataLoader(dataset=dataset, batch_size=args.batch_size, shuffle=True, collate_fn=batch_processor)
+
     start_epoch = 0
     current_step = 0
 
@@ -451,12 +434,12 @@ def main():
     else:
         print_section("STAGE 1: CODEBOOK INITIALIZATION")
         sample_init_size = min(INIT_SAMPLE_SIZE, args.max_samples if args.max_samples else INIT_SAMPLE_SIZE)
-        print(f"  ► Sampling max {sample_init_size:,} embeddings for K-Means initialization...")
+        print(f"  ► Sampling max {sample_init_size:,} embeddings for K-Means initialization from memory...")
         
         centroids_list = init_codebooks_batched(
-            model, 
-            args.h5_path, 
-            [args.codebook_size] * args.num_codebooks, 
+            model=model, 
+            dataset_embeddings=dataset.embeddings, 
+            codebook_sizes=[args.codebook_size] * args.num_codebooks, 
             device=DEVICE, 
             sample_size=sample_init_size
         )
@@ -464,15 +447,6 @@ def main():
             for i, centroids in enumerate(centroids_list):
                 model.codebooks[i].copy_(centroids.to(DEVICE))
         print(f"  ✔ Initialized {args.num_codebooks} codebooks successfully via batched K-Means.")
-
-    # Dataset loader setup
-    dataset = HDF5EmbeddingStreamDataset(
-        args.h5_path, 
-        chunk_size=CHUNK_SIZE, 
-        shuffle_buffer=min(MAX_INITIAL_SHUFFLE_BUFFER, args.max_samples if args.max_samples else MAX_INITIAL_SHUFFLE_BUFFER), 
-        max_samples=args.max_samples
-    )
-    train_dataloader = DataLoader(dataset=dataset, batch_size=args.batch_size, collate_fn=batch_processor)
 
     # 3. STAGE: TRAINING LOOP
     print_section("STAGE 2: MODEL TRAINING LOOP")
@@ -550,8 +524,9 @@ def main():
                 break
 
         if not reached_max_steps:
-            checkpoint_path = os.path.join(checkpoint_dir, f"rqvae_epoch_{epoch}.pth")
-            save_checkpoint(model, optimizer, scaler, scheduler, epoch, current_step, checkpoint_path)
+            if ((epoch + 1) % args.save_interval == 0) or ((epoch + 1) == args.epochs):
+                checkpoint_path = os.path.join(checkpoint_dir, f"rqvae_epoch_{epoch}.pth")
+                save_checkpoint(model, optimizer, scaler, scheduler, epoch, current_step, checkpoint_path)
 
     if not reached_max_steps:
         print_table_footer()
@@ -562,15 +537,9 @@ def main():
 
     # 4. STAGE: SEMANTIC ID GENERATION
     print_section("STAGE 3: INFERENCE & SEMANTIC ID GENERATION")
-    print("  ► Streaming dataset through RQ-VAE encoder...")
+    print("  ► Running loaded dataset through RQ-VAE encoder...")
 
-    inference_dataset = HDF5EmbeddingStreamDataset(
-        args.h5_path, 
-        chunk_size=CHUNK_SIZE, 
-        shuffle_buffer=0, 
-        max_samples=args.max_samples
-    )
-    inference_loader = DataLoader(dataset=inference_dataset, batch_size=INFERENCE_BATCH_SIZE, collate_fn=batch_processor)
+    inference_loader = DataLoader(dataset=dataset, batch_size=INFERENCE_BATCH_SIZE, shuffle=False, collate_fn=batch_processor)
 
     raw_semantic_mapping = {}
     sem_2_ids = defaultdict(list)
