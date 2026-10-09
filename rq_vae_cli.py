@@ -33,6 +33,7 @@ DEFAULT_HIDDEN_DIM = 64
 DEFAULT_CODEBOOK_SIZE = 256
 DEFAULT_NUM_CODEBOOKS = 4
 DEFAULT_BETA = 0.25
+DEFAULT_ENTROPY_WEIGHT = 0.05
 DEFAULT_LR = 5e-4
 DEFAULT_WARMUP_STEPS = 2000
 DEFAULT_LOG_INTERVAL = 200
@@ -90,11 +91,12 @@ class HDF5EmbeddingDataset(Dataset):
 
 
 class RQVAE(nn.Module):
-    def __init__(self, input_dim=1024, hidden_dim=64, beta=0.25, codebook_sizes=[256, 256, 256, 256]):
+    def __init__(self, input_dim=1024, hidden_dim=64, beta=0.25, codebook_sizes=[256, 256, 256, 256], temperature=1.0):
         super().__init__()
         self.beta = beta
         self.codebook_sizes = codebook_sizes
         self.hidden_dim = hidden_dim
+        self.temperature = temperature
 
         # Encoder: input_dim -> 512 -> 256 -> 128 -> hidden_dim
         self.encoder = nn.Sequential(
@@ -107,7 +109,7 @@ class RQVAE(nn.Module):
             nn.Linear(128, hidden_dim)
         )
 
-        # Bottleneck Normalization: Prevents latent representation drift & norm explosion
+        # Bottleneck Normalization: Stabilizes latent space representation
         self.bottleneck_norm = nn.LayerNorm(hidden_dim)
 
         # Decoder: hidden_dim -> 128 -> 256 -> 512 -> input_dim
@@ -121,6 +123,7 @@ class RQVAE(nn.Module):
             nn.Linear(512, input_dim)
         )
 
+        # Codebooks: Unconstrained in magnitude to allow multi-scale residual decay
         self.codebooks = nn.ParameterList()
         for codebook_size in codebook_sizes:
             cb = nn.Parameter(torch.FloatTensor(codebook_size, hidden_dim))
@@ -129,39 +132,60 @@ class RQVAE(nn.Module):
             self.codebooks.append(cb)
 
     def forward(self, batch_embs):
-        # 1. Encode & Normalize Bottleneck Latent Space
+        # 1. Continuous Latent Space
         latent_vector = self.encoder(batch_embs)
         z_norm = self.bottleneck_norm(latent_vector)
 
+        # Add slight Gaussian jitter during training to spread dense clusters
+        if self.training:
+            jitter = torch.randn_like(z_norm) * 0.05
+            remainder = z_norm + jitter
+        else:
+            remainder = z_norm
+
         quantized_sum = torch.zeros_like(z_norm)
-        remainder = z_norm
         rqvae_loss = 0.0
+        entropy_loss = 0.0
         clusters = []
         residuals_per_stage = []
+
+        max_entropy = math.log(self.codebook_sizes[0])
 
         # 2. Sequential Residual Vector Quantization Cascade
         for codebook in self.codebooks:
             residuals_per_stage.append(remainder.detach())
 
-            # Distance computation: ||remainder - codebook||^2
-            dist = torch.cdist(remainder, codebook)
-            codebook_indices = dist.argmin(dim=-1)
+            # Tensor Core GEMM formulation: S = 2 * (r . e^T) - ||e||^2
+            # Mathematically equivalent to -||r - e||^2 up to constant ||r||^2
+            e_sq = torch.sum(codebook ** 2, dim=-1, keepdim=True).t()    # (1, K)
+            dot = torch.matmul(remainder, codebook.t())                    # (B, K)
+            logits = 2.0 * dot - e_sq                                      # (B, K)
+
+            # Discrete Voronoi assignment (argmax affinity == argmin Euclidean distance)
+            codebook_indices = logits.argmax(dim=-1)
             clusters.append(codebook_indices)
+            quantized = codebook[codebook_indices]                         # (B, D)
 
-            quantized = codebook[codebook_indices]
-
-            # Codebook Loss (updates codebook) + Commitment Loss (updates encoder)
-            loss_d = F.mse_loss(remainder.detach(), quantized) + \
+            # Commitment + Codebook Loss (unscaled MSE preserving true energy hierarchy)
+            loss_d = F.mse_loss(quantized, remainder.detach()) + \
                      self.beta * F.mse_loss(remainder, quantized.detach())
-            rqvae_loss += loss_d
+            rqvae_loss = rqvae_loss + loss_d
 
-            # Accumulate quantization for decoder
+            # Differentiable Euclidean Softmax Entropy Loss
+            probs = F.softmax(logits / self.temperature, dim=-1)
+            avg_probs = probs.mean(dim=0)                                  # (K,)
+            stage_entropy = -torch.sum(avg_probs * torch.log(avg_probs + 1e-8))
+            stage_entropy_loss = (max_entropy - stage_entropy) / max_entropy
+            entropy_loss = entropy_loss + stage_entropy_loss
+
+            # Update residual: subtracts full-scale learned quantized vectors
             quantized_sum = quantized_sum + quantized
-
-            # Subtract detached quantized vector so commitment doesn't backprop into earlier codebooks
             remainder = remainder - quantized.detach()
 
+        entropy_loss = entropy_loss / len(self.codebooks)
+
         # 3. Straight-Through Estimator across entire cascade
+        # Note: z_norm (clean) is used for the skip connection to protect base reconstruction
         latent_restored = z_norm + (quantized_sum - z_norm).detach()
 
         # 4. Decode & Reconstruct
@@ -176,27 +200,32 @@ class RQVAE(nn.Module):
 
         return {
             'loss': loss,
+            'entropy_loss': entropy_loss,
             'clusters_counts': clusters_counts,
-            'clusters': torch.stack(clusters, dim=-1),  # (batch_size, num_codebooks)
+            'clusters': torch.stack(clusters, dim=-1),
             'residuals_per_stage': residuals_per_stage,
             'metrics': dict(
                 loss=loss.detach().item(),
                 recon_loss=recon_loss.detach().item(),
-                rqvae_loss=rqvae_loss.detach().item()
+                rqvae_loss=rqvae_loss.detach().item(),
+                entropy_loss=entropy_loss.detach().item()
             ),
         }
 
     @torch.inference_mode()
     def encode_indices(self, batch_embs):
-        """High-throughput inference: skips decoder and loss computations entirely."""
+        """High-throughput inference matching the exact Euclidean Voronoi regions."""
         z = self.bottleneck_norm(self.encoder(batch_embs))
         remainder = z
         all_indices = []
 
         for codebook in self.codebooks:
-            dist = torch.cdist(remainder, codebook)
-            idx = dist.argmin(dim=-1)
+            e_sq = torch.sum(codebook ** 2, dim=-1, keepdim=True).t()
+            dot = torch.matmul(remainder, codebook.t())
+            logits = 2.0 * dot - e_sq
+            idx = logits.argmax(dim=-1)
             all_indices.append(idx)
+
             quantized = codebook[idx]
             remainder = remainder - quantized
 
@@ -224,14 +253,30 @@ def init_codebooks_batched(model, dataset_embeddings, codebook_sizes, device, sa
     for cb_size in codebook_sizes:
         kmeans = KMeans(n_clusters=cb_size, n_init=KMEANS_N_INIT, random_state=KMEANS_RANDOM_STATE)
         kmeans.fit(current_residuals)
+        
+        # PRESERVE TRUE SCALE: Do NOT normalize centroids
         centroids = torch.tensor(kmeans.cluster_centers_, dtype=torch.float32)
         codebooks.append(centroids)
         
+        # True residual subtraction for next stage's K-Means
         labels = kmeans.labels_
-        quantized = centroids[labels].numpy()
+        quantized = kmeans.cluster_centers_[labels]
         current_residuals = current_residuals - quantized
 
     return codebooks
+
+
+def compute_entropy_loss(clusters_counts, codebook_size, eps=1e-8):
+    entropy_loss = 0.0
+    for counts in clusters_counts:
+        probs = counts.float() / (counts.sum() + eps)
+        probs = probs[probs > 0]
+        # Maximize entropy H(p) <=> minimize -H(p) = sum(p * log(p))
+        entropy = -torch.sum(probs * torch.log(probs + eps))
+        max_entropy = math.log(codebook_size)
+        # Normalized deficit from uniform distribution
+        entropy_loss += (max_entropy - entropy) / max_entropy
+    return entropy_loss / len(clusters_counts)
 
 
 class GPURadialResidualFixer:
@@ -271,7 +316,8 @@ class GPURadialResidualFixer:
                 else:
                     self.usage[d].mul_(decay).add_(counts, alpha=1.0 - decay)
 
-    def fix_dead_codes_ema(self, model, optimizer=None, threshold: float = 1.0):
+    def fix_dead_codes_ema(self, model, optimizer=None, threshold: float = 0.1):
+        """Revives dead codes using buffered residuals, using a lower threshold and dynamic scale reset."""
         total_revived = 0
         with torch.no_grad():
             for d, (cb_param, cb_usage) in enumerate(zip(model.codebooks, self.usage)):
@@ -282,6 +328,7 @@ class GPURadialResidualFixer:
                 if valid_capacity == 0:
                     continue
 
+                # Lowered threshold to protect long-tail/rarely-used codes
                 dead_indices = (cb_usage < threshold).nonzero(as_tuple=True)[0]
                 num_dead = len(dead_indices)
 
@@ -289,7 +336,11 @@ class GPURadialResidualFixer:
                     # Randomly sample from only the populated slice of the buffer
                     rand_idx = torch.randint(0, valid_capacity, (num_dead,), device=self.device)
                     cb_param.data[dead_indices] = self.buffers[d][rand_idx]
-                    self.usage[d][dead_indices] = threshold * 2.0  # Warm reset EMA counter
+                    
+                    # Dynamically compute expected batch mean usage to scale the warm reset correctly 
+                    # (matches bincount EMA scale instead of using buffer capacity)
+                    expected_mean_usage = self.usage[d].sum().item() / cb_param.shape[0]
+                    self.usage[d][dead_indices] = max(1.0, expected_mean_usage)
 
                     # Reset Adam / AdamW momentum and second moments to prevent centroid kick-out
                     if optimizer is not None and cb_param in optimizer.state:
@@ -373,6 +424,8 @@ def main():
     parser.add_argument('--codebook_size', type=int, default=DEFAULT_CODEBOOK_SIZE, help='Size of each codebook')
     parser.add_argument('--num_codebooks', type=int, default=DEFAULT_NUM_CODEBOOKS, help='Number of residual codebooks')
     parser.add_argument('--beta', type=float, default=DEFAULT_BETA, help='Commitment loss beta coefficient')
+    parser.add_argument('--entropy_weight', type=float, default=DEFAULT_ENTROPY_WEIGHT, help='Weight for codebook entropy / diversity loss') # <-- Add this line
+    parser.add_argument('--temperature', type=float, default=1.0, help='Softmax temperature for Euclidean entropy loss')
     parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw', 'adagrad'], help='Optimizer')
     parser.add_argument('--lr', type=float, default=DEFAULT_LR, help='Learning rate')
     parser.add_argument('--scheduler', type=str, default='cosine', choices=['cosine', 'none'], help='Scheduler type')
@@ -382,6 +435,7 @@ def main():
     parser.add_argument('--checkpoint_dir', type=str, default=None, help='Directory to save checkpoints')
     parser.add_argument('--add_unique_id', action='store_true', help='Append unique collision-solver suffix ID')
     parser.add_argument('--unique_id_bound', type=int, default=None, help='Upper bound for unique collision solver IDs')
+    parser.add_argument('--clip-suffix',action=argparse.BooleanOptionalAction, default=True, help='Clip suffix IDs to unique_id_bound (default: True). ''Use --no-clip-suffix to allow suffix IDs to grow.')
     parser.add_argument('--log_interval', type=int, default=DEFAULT_LOG_INTERVAL, help='Frequency to log metrics')
     parser.add_argument('--dead_code_fix_interval', type=int, default=DEFAULT_DEAD_CODE_FIX_INTERVAL, help='Frequency to revive dead codes')
     parser.add_argument('--save_interval', type=int, default=DEFAULT_SAVE_INTERVAL, help='Epoch frequency to save checkpoints')
@@ -411,6 +465,8 @@ def main():
         "Input Dim → Hidden Dim": f"{args.input_dim} → {args.hidden_dim}",
         "Codebooks Architecture": f"{args.num_codebooks} x {args.codebook_size} entries",
         "Commitment Beta": args.beta,
+        "Entropy Weight": args.entropy_weight,
+        "Unique ID Collision Suffix": f"Bound: {args.unique_id_bound} | Clip: {args.clip_suffix}" if args.add_unique_id else "Disabled",
         "Optimizer & LR": f"{args.optimizer.upper()} (lr={args.lr}, warmup={args.warmup_steps})",
         "Epochs / Max Steps": f"{args.epochs} epochs / {args.max_steps if args.max_steps else 'N/A'} max steps",
         "AE Warmup Epochs": args.warmup_ae_epochs,
@@ -429,7 +485,8 @@ def main():
         input_dim=args.input_dim,
         hidden_dim=args.hidden_dim,
         beta=args.beta,
-        codebook_sizes=[args.codebook_size] * args.num_codebooks
+        codebook_sizes=[args.codebook_size] * args.num_codebooks,
+        temperature=args.temperature
     ).to(DEVICE)
 
     # 2. Exclude Codebooks from Weight Decay to Prevent Centroid Shrinkage
@@ -579,7 +636,9 @@ def main():
             
             with torch.autocast(device_type=DEVICE.type, dtype=AMP_DTYPE, enabled=USE_AMP):
                 model_output = train_model(batch_embs)
-                loss = model_output['loss']
+
+                entropy_loss = model_output['entropy_loss']
+                loss = model_output['loss'] + args.entropy_weight * entropy_loss
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -616,6 +675,7 @@ def main():
                 writer.add_scalar("Loss/Total", loss.item(), current_step)
                 writer.add_scalar("Loss/Reconstruction", model_output['metrics']['recon_loss'], current_step)
                 writer.add_scalar("Loss/RQ-VAE", model_output['metrics']['rqvae_loss'], current_step)
+                writer.add_scalar("Loss/Entropy", entropy_loss.item(), current_step)
                 writer.add_scalar("Training/Learning_Rate", optimizer.param_groups[0]['lr'], current_step)
 
                 print_table_row(
@@ -710,10 +770,13 @@ def main():
             if num_items > unique_bound:
                 overflow_count += 1
 
-            # Deterministic, rank-based sequential indexing:
-            # Non-colliding items always get suffix 0, preserving token frequency concentration
+            
             for rank_idx, item_id in enumerate(item_ids):
-                suffix_id = min(rank_idx, unique_bound - 1)
+                if args.clip_suffix and rank_idx >= unique_bound:
+                    suffix_id = unique_bound - 1
+                else:
+                    suffix_id = rank_idx
+
                 semantic_mapping[item_id] = list(semantics) + [int(suffix_id)]
 
         collision_summary = {
