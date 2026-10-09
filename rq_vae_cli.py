@@ -39,9 +39,14 @@ DEFAULT_WARMUP_STEPS = 2000
 DEFAULT_LOG_INTERVAL = 200
 DEFAULT_DEAD_CODE_FIX_INTERVAL = 500
 DEFAULT_SAVE_INTERVAL = 5
+DEFAULT_JITTER = 0.05
+DEFAULT_USAGE_DECAY = 0.99
+DEFAULT_DEAD_CODE_THRESHOLD = 0.1
 
 # Model initialization constants
 TRUNC_NORMAL_STD = 0.02
+TRUNC_NORMAL_BOUND = 0.04
+EPSILON = 1e-8
 
 # Dataset & Loader constants
 INIT_SAMPLE_SIZE = 100000
@@ -62,6 +67,9 @@ BANNER_WIDTH = 72
 
 
 class HDF5EmbeddingDataset(Dataset):
+    """
+    Dataset class for loading embeddings from an HDF5 file.
+    """
     def __init__(self, h5_path: str, max_samples: int = None):
         super().__init__()
         self.h5_path = h5_path
@@ -91,12 +99,24 @@ class HDF5EmbeddingDataset(Dataset):
 
 
 class RQVAE(nn.Module):
-    def __init__(self, input_dim=1024, hidden_dim=64, beta=0.25, codebook_sizes=[256, 256, 256, 256], temperature=1.0):
+    """
+    Residual Quantized Variational AutoEncoder (RQ-VAE) model.
+    """
+    def __init__(
+        self, 
+        input_dim=1024, 
+        hidden_dim=64, 
+        beta=0.25, 
+        codebook_sizes=[256, 256, 256, 256], 
+        temperature=1.0, 
+        jitter=0.05
+    ):
         super().__init__()
         self.beta = beta
         self.codebook_sizes = codebook_sizes
         self.hidden_dim = hidden_dim
         self.temperature = temperature
+        self.jitter = jitter
 
         # Encoder: input_dim -> 512 -> 256 -> 128 -> hidden_dim
         self.encoder = nn.Sequential(
@@ -128,7 +148,12 @@ class RQVAE(nn.Module):
         for codebook_size in codebook_sizes:
             cb = nn.Parameter(torch.FloatTensor(codebook_size, hidden_dim))
             with torch.no_grad():
-                nn.init.trunc_normal_(cb, std=TRUNC_NORMAL_STD, a=-0.04, b=0.04)
+                nn.init.trunc_normal_(
+                    cb, 
+                    std=TRUNC_NORMAL_STD, 
+                    a=-TRUNC_NORMAL_BOUND, 
+                    b=TRUNC_NORMAL_BOUND
+                )
             self.codebooks.append(cb)
 
     def forward(self, batch_embs):
@@ -137,9 +162,9 @@ class RQVAE(nn.Module):
         z_norm = self.bottleneck_norm(latent_vector)
 
         # Add slight Gaussian jitter during training to spread dense clusters
-        if self.training:
-            jitter = torch.randn_like(z_norm) * 0.05
-            remainder = z_norm + jitter
+        if self.training and self.jitter > 0:
+            noise = torch.randn_like(z_norm) * self.jitter
+            remainder = z_norm + noise
         else:
             remainder = z_norm
 
@@ -174,7 +199,7 @@ class RQVAE(nn.Module):
             # Differentiable Euclidean Softmax Entropy Loss
             probs = F.softmax(logits / self.temperature, dim=-1)
             avg_probs = probs.mean(dim=0)                                  # (K,)
-            stage_entropy = -torch.sum(avg_probs * torch.log(avg_probs + 1e-8))
+            stage_entropy = -torch.sum(avg_probs * torch.log(avg_probs + EPSILON))
             stage_entropy_loss = (max_entropy - stage_entropy) / max_entropy
             entropy_loss = entropy_loss + stage_entropy_loss
 
@@ -214,7 +239,9 @@ class RQVAE(nn.Module):
 
     @torch.inference_mode()
     def encode_indices(self, batch_embs):
-        """High-throughput inference matching the exact Euclidean Voronoi regions."""
+        """
+        High-throughput inference matching the exact Euclidean Voronoi regions.
+        """
         z = self.bottleneck_norm(self.encoder(batch_embs))
         remainder = z
         all_indices = []
@@ -233,6 +260,9 @@ class RQVAE(nn.Module):
 
 
 def init_codebooks_batched(model, dataset_embeddings, codebook_sizes, device, sample_size=INIT_SAMPLE_SIZE):
+    """
+    Initialize codebooks using K-Means on a sampled subset of embeddings.
+    """
     total_len = len(dataset_embeddings)
     sample_indices = np.random.choice(total_len, size=min(sample_size, total_len), replace=False)
     sampled_data = dataset_embeddings[sample_indices]
@@ -266,7 +296,10 @@ def init_codebooks_batched(model, dataset_embeddings, codebook_sizes, device, sa
     return codebooks
 
 
-def compute_entropy_loss(clusters_counts, codebook_size, eps=1e-8):
+def compute_entropy_loss(clusters_counts, codebook_size, eps=EPSILON):
+    """
+    Compute the entropy loss for codebook utilization.
+    """
     entropy_loss = 0.0
     for counts in clusters_counts:
         probs = counts.float() / (counts.sum() + eps)
@@ -280,7 +313,10 @@ def compute_entropy_loss(clusters_counts, codebook_size, eps=1e-8):
 
 
 class GPURadialResidualFixer:
-    """Zero-overhead GPU circular buffer with per-step EMA usage tracking and optimizer-state-resetting revival."""
+    """
+    Zero-overhead GPU circular buffer with per-step EMA usage tracking 
+    and optimizer-state-resetting revival.
+    """
     def __init__(self, num_codebooks: int, hidden_dim: int, buffer_size: int = BUFFER_CAPACITY_PER_STAGE, device='cuda'):
         self.num_codebooks = num_codebooks
         self.buffer_size = buffer_size
@@ -291,6 +327,9 @@ class GPURadialResidualFixer:
         self.usage = [None] * num_codebooks
 
     def update_buffers(self, residuals_per_stage: list):
+        """
+        Update the circular buffers with new residuals from each stage.
+        """
         with torch.no_grad():
             for d, res in enumerate(residuals_per_stage):
                 n = min(res.shape[0], self.buffer_size)
@@ -307,8 +346,10 @@ class GPURadialResidualFixer:
                     self.ptrs[d] = n - first_part
                     self.has_wrapped[d] = True
 
-    def update_usage(self, clusters_counts: list, decay: float = 0.99):
-        """Invoked on every training step to reliably track code usage over time."""
+    def update_usage(self, clusters_counts: list, decay: float = DEFAULT_USAGE_DECAY):
+        """
+        Invoked on every training step to reliably track code usage over time.
+        """
         with torch.no_grad():
             for d, counts in enumerate(clusters_counts):
                 if self.usage[d] is None:
@@ -316,8 +357,10 @@ class GPURadialResidualFixer:
                 else:
                     self.usage[d].mul_(decay).add_(counts, alpha=1.0 - decay)
 
-    def fix_dead_codes_ema(self, model, optimizer=None, threshold: float = 0.1):
-        """Revives dead codes using buffered residuals, using a lower threshold and dynamic scale reset."""
+    def fix_dead_codes_ema(self, model, optimizer=None, threshold: float = DEFAULT_DEAD_CODE_THRESHOLD):
+        """
+        Revives dead codes using buffered residuals, using a lower threshold and dynamic scale reset.
+        """
         total_revived = 0
         with torch.no_grad():
             for d, (cb_param, cb_usage) in enumerate(zip(model.codebooks, self.usage)):
@@ -356,6 +399,9 @@ class GPURadialResidualFixer:
 
 
 def save_checkpoint(model, optimizer, scaler, scheduler, epoch, step, filepath):
+    """
+    Save training checkpoint.
+    """
     raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
     checkpoint = {
         'epoch': epoch,
@@ -424,8 +470,11 @@ def main():
     parser.add_argument('--codebook_size', type=int, default=DEFAULT_CODEBOOK_SIZE, help='Size of each codebook')
     parser.add_argument('--num_codebooks', type=int, default=DEFAULT_NUM_CODEBOOKS, help='Number of residual codebooks')
     parser.add_argument('--beta', type=float, default=DEFAULT_BETA, help='Commitment loss beta coefficient')
-    parser.add_argument('--entropy_weight', type=float, default=DEFAULT_ENTROPY_WEIGHT, help='Weight for codebook entropy / diversity loss') # <-- Add this line
+    parser.add_argument('--entropy_weight', type=float, default=DEFAULT_ENTROPY_WEIGHT, help='Weight for codebook entropy / diversity loss')
     parser.add_argument('--temperature', type=float, default=1.0, help='Softmax temperature for Euclidean entropy loss')
+    parser.add_argument('--jitter', type=float, default=DEFAULT_JITTER, help='Scale of Gaussian jitter added to latents during training')
+    parser.add_argument('--usage_decay', type=float, default=DEFAULT_USAGE_DECAY, help='EMA decay for tracking codebook usage')
+    parser.add_argument('--dead_code_threshold', type=float, default=DEFAULT_DEAD_CODE_THRESHOLD, help='Threshold for reviving dead codes')
     parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw', 'adagrad'], help='Optimizer')
     parser.add_argument('--lr', type=float, default=DEFAULT_LR, help='Learning rate')
     parser.add_argument('--scheduler', type=str, default='cosine', choices=['cosine', 'none'], help='Scheduler type')
@@ -435,7 +484,7 @@ def main():
     parser.add_argument('--checkpoint_dir', type=str, default=None, help='Directory to save checkpoints')
     parser.add_argument('--add_unique_id', action='store_true', help='Append unique collision-solver suffix ID')
     parser.add_argument('--unique_id_bound', type=int, default=None, help='Upper bound for unique collision solver IDs')
-    parser.add_argument('--clip-suffix',action=argparse.BooleanOptionalAction, default=True, help='Clip suffix IDs to unique_id_bound (default: True). ''Use --no-clip-suffix to allow suffix IDs to grow.')
+    parser.add_argument('--clip-suffix', action=argparse.BooleanOptionalAction, default=True, help='Clip suffix IDs to unique_id_bound (default: True). Use --no-clip-suffix to allow suffix IDs to grow.')
     parser.add_argument('--log_interval', type=int, default=DEFAULT_LOG_INTERVAL, help='Frequency to log metrics')
     parser.add_argument('--dead_code_fix_interval', type=int, default=DEFAULT_DEAD_CODE_FIX_INTERVAL, help='Frequency to revive dead codes')
     parser.add_argument('--save_interval', type=int, default=DEFAULT_SAVE_INTERVAL, help='Epoch frequency to save checkpoints')
@@ -466,13 +515,14 @@ def main():
         "Codebooks Architecture": f"{args.num_codebooks} x {args.codebook_size} entries",
         "Commitment Beta": args.beta,
         "Entropy Weight": args.entropy_weight,
+        "Jitter Scale": args.jitter,
         "Unique ID Collision Suffix": f"Bound: {args.unique_id_bound} | Clip: {args.clip_suffix}" if args.add_unique_id else "Disabled",
         "Optimizer & LR": f"{args.optimizer.upper()} (lr={args.lr}, warmup={args.warmup_steps})",
         "Epochs / Max Steps": f"{args.epochs} epochs / {args.max_steps if args.max_steps else 'N/A'} max steps",
         "AE Warmup Epochs": args.warmup_ae_epochs,
         "Resume Checkpoint": args.resume if args.resume else "None (Fresh Start)",
         "Log Intervals": f"Log every {args.log_interval} steps",
-        "Dead Code Intervals": f"Dead Code Fix every {args.dead_code_fix_interval} steps",
+        "Dead Code Intervals": f"Dead Code Fix every {args.dead_code_fix_interval} steps (threshold={args.dead_code_threshold})",
         "Batch Size (Train/Infer)": f"{args.batch_size} / {args.inference_batch_size}",
         "Compiled Model": args.compile,
         "Dataset Source": args.h5_path,
@@ -486,7 +536,8 @@ def main():
         hidden_dim=args.hidden_dim,
         beta=args.beta,
         codebook_sizes=[args.codebook_size] * args.num_codebooks,
-        temperature=args.temperature
+        temperature=args.temperature,
+        jitter=args.jitter
     ).to(DEVICE)
 
     # 2. Exclude Codebooks from Weight Decay to Prevent Centroid Shrinkage
@@ -659,11 +710,15 @@ def main():
 
             # Update GPU buffers and update EMA tracking EVERY step
             gpu_fixer.update_buffers(model_output['residuals_per_stage'])
-            gpu_fixer.update_usage(model_output['clusters_counts'])
+            gpu_fixer.update_usage(model_output['clusters_counts'], decay=args.usage_decay)
 
             # Periodically revive dead codes using zeroed optimizer states
             if current_step % args.dead_code_fix_interval == 0:
-                total_revived = gpu_fixer.fix_dead_codes_ema(raw_model, optimizer=optimizer)
+                total_revived = gpu_fixer.fix_dead_codes_ema(
+                    raw_model, 
+                    optimizer=optimizer, 
+                    threshold=args.dead_code_threshold
+                )
                 if total_revived > 0:
                     writer.add_scalar("Training/Dead_Codes_Revived", total_revived, current_step)
 
