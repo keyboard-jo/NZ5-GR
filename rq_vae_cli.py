@@ -4,6 +4,7 @@ import math
 import argparse
 import time
 import h5py
+import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
@@ -14,6 +15,7 @@ from torch.utils.tensorboard import SummaryWriter
 from sklearn.cluster import KMeans
 from collections import defaultdict
 
+
 # Enable TensorFloat-32 for faster matrix multiplications on modern GPUs (Ampere/Hopper/Blackwell)
 torch.set_float32_matmul_precision('high')
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -21,7 +23,7 @@ torch.backends.cudnn.allow_tf32 = True
 
 # --- GLOBAL CONSTANTS & HYPERPARAMETERS ---
 RANDOM_SEED = 42
-DEFAULT_H5_PATH = 'tencent_gr_parquet/train/mm_emb_82.h5'
+DEFAULT_INPUT_PATH = 'tencent_gr_parquet/train/mm_emb_82.h5'
 DEFAULT_OUTPUT_PATH = 'tencent_gr_parquet/train/index_rqvae.json'
 DEFAULT_MODEL_PATH = 'rqvae_model.pth'
 DEFAULT_EPOCHS = 50
@@ -33,13 +35,14 @@ DEFAULT_HIDDEN_DIM = 64
 DEFAULT_CODEBOOK_SIZE = 256
 DEFAULT_NUM_CODEBOOKS = 4
 DEFAULT_BETA = 0.25
-DEFAULT_ENTROPY_WEIGHT = 0.05
 DEFAULT_LR = 5e-4
-DEFAULT_WARMUP_STEPS = 2000
+DEFAULT_WARMUP_STEPS = 2_000
 DEFAULT_LOG_INTERVAL = 200
 DEFAULT_DEAD_CODE_FIX_INTERVAL = 500
 DEFAULT_SAVE_INTERVAL = 5
 DEFAULT_JITTER = 0.05
+DEFAULT_ENTROPY_LOSS_WEIGHT = 0.05
+DEFAULT_STAGE_WEIGHTS = [3.0, 1.5, 1.0, 1.0]
 DEFAULT_USAGE_DECAY = 0.99
 DEFAULT_DEAD_CODE_THRESHOLD = 0.1
 
@@ -49,9 +52,12 @@ TRUNC_NORMAL_BOUND = 0.04
 EPSILON = 1e-8
 
 # Dataset & Loader constants
-INIT_SAMPLE_SIZE = 100000
+INIT_SAMPLE_SIZE = 1_000_000
 INIT_BATCH_SIZE = 4096
-BUFFER_CAPACITY_PER_STAGE = 20000
+BUFFER_CAPACITY_PER_STAGE = 20_000
+DEFAULT_ITEM_ID_COL = "item_id"
+DEFAULT_EMBEDDING_COL = "embedding"
+
 
 # K-Means constants
 KMEANS_N_INIT = 3
@@ -66,29 +72,47 @@ MIN_LR_RATIO = 0.01
 BANNER_WIDTH = 72
 
 
-class HDF5EmbeddingDataset(Dataset):
+
+class EmbeddingDataset(Dataset):
     """
-    Dataset class for loading embeddings from an HDF5 file.
+    Dataset class for loading embeddings from an HDF5 or Parquet file.
     """
-    def __init__(self, h5_path: str, max_samples: int = None):
+    def __init__(self, input_file_path: str, max_samples: int = None):
         super().__init__()
-        self.h5_path = h5_path
+        self.input_file_path = input_file_path
         self.max_samples = max_samples
 
-        print(f"  ► Loading dataset into memory from {h5_path}...")
-        with h5py.File(self.h5_path, 'r') as f:
-            oid_ds = f['anonymous_cid']
-            emb_ds = f['embedding']
+        print(f"  ► Loading dataset into memory from {input_file_path}...")
+        
+        if self.input_file_path.endswith('.parquet') or self.input_file_path.endswith('.pq'):
+            import pyarrow.parquet as pq
             
-            total_len = len(oid_ds)
+            # Read columns directly using PyArrow for maximum throughput
+            table = pq.read_table(self.input_file_path, columns=[DEFAULT_ITEM_ID_COL, DEFAULT_EMBEDDING_COL])
+            
             if self.max_samples is not None:
-                total_len = min(total_len, self.max_samples)
+                table = table.slice(0, self.max_samples)
             
-            oids = oid_ds[:total_len]
-            embs = emb_ds[:total_len]
+            oids = table[DEFAULT_ITEM_ID_COL].to_pandas().values
+            embs = np.stack(table[DEFAULT_EMBEDDING_COL].to_numpy())  # Converts FixedSizeListArray directly to 2D numpy matrix
+            
+            self.item_ids = [str(oid) for oid in oids]
+            self.embeddings = torch.from_numpy(embs).float()
+        else:
+            with h5py.File(self.input_file_path, 'r') as f:
+                oid_ds = f[DEFAULT_ITEM_ID_COL]
+                emb_ds = f[DEFAULT_EMBEDDING_COL]
+                
+                total_len = len(oid_ds)
+                if self.max_samples is not None:
+                    total_len = min(total_len, self.max_samples)
+                
+                oids = oid_ds[:total_len]
+                embs = emb_ds[:total_len]
 
-        self.item_ids = [oid.decode('utf-8') if isinstance(oid, bytes) else str(oid) for oid in oids]
-        self.embeddings = torch.from_numpy(embs).float()
+            self.item_ids = [oid.decode('utf-8') if isinstance(oid, bytes) else str(oid) for oid in oids]
+            self.embeddings = torch.from_numpy(embs).float()
+            
         print(f"  ✔ Successfully loaded {len(self.item_ids):,} samples into memory.")
 
     def __len__(self):
@@ -109,7 +133,9 @@ class RQVAE(nn.Module):
         beta=0.25, 
         codebook_sizes=[256, 256, 256, 256], 
         temperature=1.0, 
-        jitter=0.05
+        jitter=0.05,
+        entropy_loss_weight=0.05,
+        stage_weights=None
     ):
         super().__init__()
         self.beta = beta
@@ -117,31 +143,40 @@ class RQVAE(nn.Module):
         self.hidden_dim = hidden_dim
         self.temperature = temperature
         self.jitter = jitter
-
-        # Encoder: input_dim -> 512 -> 256 -> 128 -> hidden_dim
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 512),
-            nn.ReLU(),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, hidden_dim)
+        self.entropy_loss_weight = entropy_loss_weight
+        self.stage_weights = (
+            stage_weights if stage_weights is not None
+            else DEFAULT_STAGE_WEIGHTS
         )
 
-        # Bottleneck Normalization: Stabilizes latent space representation
+        # Dynamically generate encoder dimensions by halving down to hidden_dim
+        enc_dims = [input_dim]
+        curr = input_dim
+        while curr > hidden_dim:
+            curr = max(curr // 2, hidden_dim)
+            enc_dims.append(curr)
+
+        # Decoder dimensions are just the reverse of encoder dimensions for symmetry
+        dec_dims = enc_dims[::-1]
+
+        # Build Encoder Tower
+        enc_layers = []
+        for i in range(len(enc_dims) - 1):
+            enc_layers.append(nn.Linear(enc_dims[i], enc_dims[i+1]))
+            if i < len(enc_dims) - 2:
+                enc_layers.append(nn.ReLU())
+        self.encoder = nn.Sequential(*enc_layers)
+
+        # Bottleneck Normalization
         self.bottleneck_norm = nn.LayerNorm(hidden_dim)
 
-        # Decoder: hidden_dim -> 128 -> 256 -> 512 -> input_dim
-        self.decoder = nn.Sequential(
-            nn.Linear(hidden_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 256),
-            nn.ReLU(),
-            nn.Linear(256, 512),
-            nn.ReLU(),
-            nn.Linear(512, input_dim)
-        )
+        # Build Decoder Tower
+        dec_layers = []
+        for i in range(len(dec_dims) - 1):
+            dec_layers.append(nn.Linear(dec_dims[i], dec_dims[i+1]))
+            if i < len(dec_dims) - 2:
+                dec_layers.append(nn.ReLU())
+        self.decoder = nn.Sequential(*dec_layers)
 
         # Codebooks: Unconstrained in magnitude to allow multi-scale residual decay
         self.codebooks = nn.ParameterList()
@@ -170,53 +205,83 @@ class RQVAE(nn.Module):
 
         quantized_sum = torch.zeros_like(z_norm)
         rqvae_loss = 0.0
-        entropy_loss = 0.0
+        weighted_entropy_loss = 0.0
+
+        stage_weights = self.stage_weights
+
+        if len(stage_weights) != len(self.codebooks):
+            raise ValueError(
+                f"Expected {len(self.codebooks)} stage weights, "
+                f"got {len(stage_weights)}"
+            )
+
         clusters = []
         residuals_per_stage = []
 
         max_entropy = math.log(self.codebook_sizes[0])
 
         # 2. Sequential Residual Vector Quantization Cascade
-        for codebook in self.codebooks:
+        for i, (codebook, weight) in enumerate(
+            zip(self.codebooks, stage_weights)
+        ):
             residuals_per_stage.append(remainder.detach())
 
-            # Tensor Core GEMM formulation: S = 2 * (r . e^T) - ||e||^2
-            # Mathematically equivalent to -||r - e||^2 up to constant ||r||^2
-            e_sq = torch.sum(codebook ** 2, dim=-1, keepdim=True).t()    # (1, K)
-            dot = torch.matmul(remainder, codebook.t())                    # (B, K)
-            logits = 2.0 * dot - e_sq                                      # (B, K)
+            # Compute affinity logits: S = 2 * (r @ e.T) - ||e||^2
+            e_sq = torch.sum(
+                codebook ** 2, dim=-1, keepdim=True
+            ).t()
+            dot = torch.matmul(remainder, codebook.t())
+            logits = 2.0 * dot - e_sq
 
-            # Discrete Voronoi assignment (argmax affinity == argmin Euclidean distance)
+            # Discrete nearest-codebook assignment
             codebook_indices = logits.argmax(dim=-1)
             clusters.append(codebook_indices)
-            quantized = codebook[codebook_indices]                         # (B, D)
+            quantized = codebook[codebook_indices]
 
-            # Commitment + Codebook Loss (unscaled MSE preserving true energy hierarchy)
-            loss_d = F.mse_loss(quantized, remainder.detach()) + \
-                     self.beta * F.mse_loss(remainder, quantized.detach())
+            # Commitment + Codebook Loss
+            loss_d = (
+                F.mse_loss(quantized, remainder.detach())
+                + self.beta * F.mse_loss(remainder, quantized.detach())
+            )
             rqvae_loss = rqvae_loss + loss_d
 
-            # Differentiable Euclidean Softmax Entropy Loss
+            # Differentiable Softmax Entropy Loss
             probs = F.softmax(logits / self.temperature, dim=-1)
-            avg_probs = probs.mean(dim=0)                                  # (K,)
-            stage_entropy = -torch.sum(avg_probs * torch.log(avg_probs + EPSILON))
-            stage_entropy_loss = (max_entropy - stage_entropy) / max_entropy
-            entropy_loss = entropy_loss + stage_entropy_loss
+            avg_probs = probs.mean(dim=0)
 
-            # Update residual: subtracts full-scale learned quantized vectors
+            stage_entropy = -torch.sum(
+                avg_probs * torch.log(avg_probs + EPSILON)
+            )
+
+            stage_entropy_loss = (
+                max_entropy - stage_entropy
+            ) / max_entropy
+
+            # Weighted entropy accumulation
+            weighted_entropy_loss = (
+                weighted_entropy_loss + weight * stage_entropy_loss
+            )
+
+            # Update residual
             quantized_sum = quantized_sum + quantized
             remainder = remainder - quantized.detach()
 
-        entropy_loss = entropy_loss / len(self.codebooks)
+        # Normalize by the sum of stage weights
+        entropy_loss = weighted_entropy_loss / sum(stage_weights)
 
-        # 3. Straight-Through Estimator across entire cascade
-        # Note: z_norm (clean) is used for the skip connection to protect base reconstruction
+        # 3. Straight-Through Estimator
         latent_restored = z_norm + (quantized_sum - z_norm).detach()
 
         # 4. Decode & Reconstruct
         embeddings_restored = self.decoder(latent_restored)
         recon_loss = F.mse_loss(embeddings_restored, batch_embs)
-        loss = recon_loss + rqvae_loss
+
+        # Total training objective
+        loss = (
+            recon_loss
+            + rqvae_loss
+            + self.entropy_loss_weight * entropy_loss
+        )
 
         clusters_counts = [
             torch.bincount(cluster, minlength=cb_size)
@@ -233,7 +298,7 @@ class RQVAE(nn.Module):
                 loss=loss.detach().item(),
                 recon_loss=recon_loss.detach().item(),
                 rqvae_loss=rqvae_loss.detach().item(),
-                entropy_loss=entropy_loss.detach().item()
+                entropy_loss=entropy_loss.detach().item(),
             ),
         }
 
@@ -452,7 +517,7 @@ def print_table_footer():
 def main():
     start_time = time.time()
     parser = argparse.ArgumentParser(description="Revised RQ-VAE Semantic ID Quantization CLI Pipeline")
-    parser.add_argument('--h5_path', type=str, default=DEFAULT_H5_PATH, help='Path to input HDF5 file')
+    parser.add_argument('--input_path', type=str, default=DEFAULT_INPUT_PATH, help='Path to input file (HD5/Parquet)')
     parser.add_argument('--output_path', type=str, default=DEFAULT_OUTPUT_PATH, help='Path to output JSON mapping')
     parser.add_argument('--model_path', type=str, default=DEFAULT_MODEL_PATH, help='Path to save the trained PyTorch model')
     parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint file (.pth) to resume training from')
@@ -470,9 +535,10 @@ def main():
     parser.add_argument('--codebook_size', type=int, default=DEFAULT_CODEBOOK_SIZE, help='Size of each codebook')
     parser.add_argument('--num_codebooks', type=int, default=DEFAULT_NUM_CODEBOOKS, help='Number of residual codebooks')
     parser.add_argument('--beta', type=float, default=DEFAULT_BETA, help='Commitment loss beta coefficient')
-    parser.add_argument('--entropy_weight', type=float, default=DEFAULT_ENTROPY_WEIGHT, help='Weight for codebook entropy / diversity loss')
     parser.add_argument('--temperature', type=float, default=1.0, help='Softmax temperature for Euclidean entropy loss')
     parser.add_argument('--jitter', type=float, default=DEFAULT_JITTER, help='Scale of Gaussian jitter added to latents during training')
+    parser.add_argument('--entropy_loss_weight', type=float, default=DEFAULT_ENTROPY_LOSS_WEIGHT, help='Weight of entropy regularization in the total training loss')
+    parser.add_argument('--stage_weights', type=float, nargs='+', default=DEFAULT_STAGE_WEIGHTS, help='Entropy-loss weights for each residual quantization stage')
     parser.add_argument('--usage_decay', type=float, default=DEFAULT_USAGE_DECAY, help='EMA decay for tracking codebook usage')
     parser.add_argument('--dead_code_threshold', type=float, default=DEFAULT_DEAD_CODE_THRESHOLD, help='Threshold for reviving dead codes')
     parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw', 'adagrad'], help='Optimizer')
@@ -514,7 +580,8 @@ def main():
         "Input Dim → Hidden Dim": f"{args.input_dim} → {args.hidden_dim}",
         "Codebooks Architecture": f"{args.num_codebooks} x {args.codebook_size} entries",
         "Commitment Beta": args.beta,
-        "Entropy Weight": args.entropy_weight,
+        "Entropy Weight": args.entropy_loss_weight,
+        "Stage Weight": ", ".join(map(str, args.stage_weights)),
         "Jitter Scale": args.jitter,
         "Unique ID Collision Suffix": f"Bound: {args.unique_id_bound} | Clip: {args.clip_suffix}" if args.add_unique_id else "Disabled",
         "Optimizer & LR": f"{args.optimizer.upper()} (lr={args.lr}, warmup={args.warmup_steps})",
@@ -525,7 +592,7 @@ def main():
         "Dead Code Intervals": f"Dead Code Fix every {args.dead_code_fix_interval} steps (threshold={args.dead_code_threshold})",
         "Batch Size (Train/Infer)": f"{args.batch_size} / {args.inference_batch_size}",
         "Compiled Model": args.compile,
-        "Dataset Source": args.h5_path,
+        "Dataset Source": args.input_path,
         "Output Index Path": args.output_path,
     }
     print_card("Runtime Parameters & System Config", param_summary)
@@ -537,7 +604,9 @@ def main():
         beta=args.beta,
         codebook_sizes=[args.codebook_size] * args.num_codebooks,
         temperature=args.temperature,
-        jitter=args.jitter
+        jitter=args.jitter,
+        entropy_loss_weight=args.entropy_loss_weight,
+        stage_weights=args.stage_weights
     ).to(DEVICE)
 
     # 2. Exclude Codebooks from Weight Decay to Prevent Centroid Shrinkage
@@ -555,7 +624,7 @@ def main():
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     # 3. Load Dataset into Memory
-    dataset = HDF5EmbeddingDataset(args.h5_path, max_samples=args.max_samples)
+    dataset = EmbeddingDataset(args.input_path, max_samples=args.max_samples)
     
     train_dataset = TensorDataset(dataset.embeddings)
     train_dataloader = DataLoader(
@@ -688,8 +757,7 @@ def main():
             with torch.autocast(device_type=DEVICE.type, dtype=AMP_DTYPE, enabled=USE_AMP):
                 model_output = train_model(batch_embs)
 
-                entropy_loss = model_output['entropy_loss']
-                loss = model_output['loss'] + args.entropy_weight * entropy_loss
+                loss = model_output['loss']
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -785,23 +853,51 @@ def main():
         if args.add_unique_id:
             sem_2_ids[tuple(codes_list)].append(item_id)
 
-    # 10. Codebook Utilization Report
-    print_section("STAGE 4: CODEBOOK UTILIZATION REPORT")
+    # 10. Codebook Utilization & Perplexity Report
+    print_section("STAGE 4: CODEBOOK UTILIZATION & PERPLEXITY REPORT")
     cb_metrics = {}
     per_cb_utilization = []
+    per_cb_perplexity = []
+
     for cb_idx in range(args.num_codebooks):
         cb_assignments = all_clusters_tensor[:, cb_idx]
+        
+        # 1. Active Utilization (%)
         num_unique = len(np.unique(cb_assignments))
         utilization_pct = (num_unique / args.codebook_size) * 100.0
         per_cb_utilization.append(utilization_pct)
-        cb_metrics[f"Codebook #{cb_idx}"] = f"{num_unique} / {args.codebook_size} active ({utilization_pct:.2f}%)"
+        
+        # 2. Perplexity Calculation
+        # Count frequencies of each codebook entry
+        counts = np.bincount(cb_assignments, minlength=args.codebook_size)
+        # Convert to probabilities
+        probs = counts / np.sum(counts)
+        # Remove zero probabilities to avoid log(0)
+        probs = probs[probs > 0]
+        # Shannon entropy
+        entropy = -np.sum(probs * np.log(probs))
+        # Perplexity = exp(entropy)
+        perplexity = np.exp(entropy)
+        per_cb_perplexity.append(perplexity)
+
+        # Logging metrics
+        cb_metrics[f"Codebook #{cb_idx}"] = (
+            f"Active: {num_unique}/{args.codebook_size} ({utilization_pct:.1f}%), "
+            f"Perplexity: {perplexity:.1f}"
+        )
         writer.add_scalar(f"Corpus_Utilization/Codebook_{cb_idx}", utilization_pct, current_step)
+        writer.add_scalar(f"Corpus_Perplexity/Codebook_{cb_idx}", perplexity, current_step)
 
     mean_utilization = np.mean(per_cb_utilization)
-    cb_metrics["Average Utilization"] = f"{mean_utilization:.2f}%"
-    writer.add_scalar("Corpus_Utilization/Average", mean_utilization, current_step)
+    mean_perplexity = np.mean(per_cb_perplexity)
     
-    print_card("Corpus Codebook Utilization", cb_metrics)
+    cb_metrics["Average Utilization"] = f"{mean_utilization:.2f}%"
+    cb_metrics["Average Perplexity"] = f"{mean_perplexity:.2f}"
+    
+    writer.add_scalar("Corpus_Utilization/Average", mean_utilization, current_step)
+    writer.add_scalar("Corpus_Perplexity/Average", mean_perplexity, current_step)
+    
+    print_card("Corpus Codebook Utilization & Perplexity", cb_metrics)
 
     # 11. Deterministic Collision Resolution & Index Saving
     print_section("STAGE 5: COLLISION RESOLUTION & INDEX SAVING")
