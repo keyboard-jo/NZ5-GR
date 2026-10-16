@@ -18,6 +18,13 @@ from torch.utils.data import Dataset, DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.cluster import KMeans
 
+try:
+    import faiss  # faiss-gpu supplies the GPU K-Means backend
+    FAISS_AVAILABLE = True
+except ImportError:
+    faiss = None
+    FAISS_AVAILABLE = False
+
 # Enable TensorFloat-32 for faster matrix multiplications on modern GPUs (Ampere/Hopper/Blackwell)
 torch.set_float32_matmul_precision('high')
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -59,15 +66,17 @@ TRUNC_NORMAL_BOUND = 0.04
 EPSILON = 1e-8
 
 # Dataset & Loader constants
-INIT_SAMPLE_SIZE = 1_000_000
+INIT_SAMPLE_SIZE = 500_000
 INIT_BATCH_SIZE = 4096
 BUFFER_CAPACITY_PER_STAGE = 20_000
 DEFAULT_ITEM_ID_COL = "item_id"
 DEFAULT_EMBEDDING_COL = "embedding"
 
 # K-Means constants
-KMEANS_N_INIT = 3
+KMEANS_N_INIT = 3          # FAISS `nredo` == sklearn `n_init` restarts
 KMEANS_RANDOM_STATE = 42
+KMEANS_N_ITER = 50         # FAISS Lloyd iterations per restart (GPU, so cheap)
+KMEANS_ASSIGN_CHUNK = 200_000  # rows per FAISS search batch during label assignment
 
 # Training & Optimization constants
 GRAD_CLIP_MAX_NORM = 1.0
@@ -130,18 +139,47 @@ def log_card(logger: logging.Logger, title: str, items: dict, width: int = BANNE
     logger.info("└" + "─" * (width - 2) + "┘")
 
 
+# Single source of truth for the stdio metrics table: (header, column width, value format).
+# Header, rows and footer are all derived from this list, so the header can never drift out of
+# sync with the row actually printed (it previously did: the header declared 7 columns while the
+# training loop emitted 11, which broke the whole table layout).
+LOG_TABLE_COLUMNS = [
+    ("Epoch", 5, "d"),
+    ("Step", 6, "d"),
+    ("Total Loss", 10, ".4f"),
+    ("Recon Loss", 10, ".4f"),
+    ("CB Loss", 9, ".4f"),
+    ("CM Loss", 9, ".4f"),
+    ("Perp #0", 9, ".1f"),
+    ("Perp #N", 9, ".1f"),
+    ("Res R0", 10, ".4f"),
+    ("Res RN", 10, ".4f"),
+    ("LR", 12, ".5e"),
+]
+
+
+def _table_rule(left: str, joint: str, right: str) -> str:
+    return left + joint.join("─" * (w + 2) for _, w, _ in LOG_TABLE_COLUMNS) + right
+
+
 def log_table_header(logger: logging.Logger):
-    logger.info(f"┌──────────┬──────────┬─────────────┬─────────────┬─────────────┬─────────────┬───────────────┐")
-    logger.info(f"│ Epoch    │ Step     │ Total Loss  │ Recon Loss  │ RQ Loss     │ Entropy     │ Learning Rate │")
-    logger.info(f"├──────────┼──────────┼─────────────┼─────────────┼─────────────┼─────────────┼───────────────┤")
+    logger.info(_table_rule("┌", "┬", "┐"))
+    logger.info("│" + "│".join(f" {title:<{w}} " for title, w, _ in LOG_TABLE_COLUMNS) + "│")
+    logger.info(_table_rule("├", "┼", "┤"))
 
 
-def log_table_row(logger: logging.Logger, epoch: int, step: int, loss: float, recon_loss: float, rq_loss: float, entropy_loss: float, lr: float):
-    logger.info(f"│ {epoch:<8d} │ {step:<8d} │ {loss:<11.4f} │ {recon_loss:<11.4f} │ {rq_loss:<11.4f} │ {entropy_loss:<11.4f} │ {lr:<13.6e} │")
+def log_table_row(logger: logging.Logger, epoch: int, step: int, loss: float, recon_loss: float,
+                  cb_loss: float, cm_loss: float, perp_first: float, perp_last: float,
+                  res_first: float, res_last: float, lr: float):
+    """Emits one metrics row formatted with the exact column spec used by the header."""
+    values = (epoch, step, loss, recon_loss, cb_loss, cm_loss,
+              perp_first, perp_last, res_first, res_last, lr)
+    cells = [f" {v:<{w}{spec}} " for (_, w, spec), v in zip(LOG_TABLE_COLUMNS, values)]
+    logger.info("│" + "│".join(cells) + "│")
 
 
 def log_table_footer(logger: logging.Logger):
-    logger.info(f"└──────────┴──────────┴─────────────┴─────────────┴─────────────┴─────────────┴───────────────┘")
+    logger.info(_table_rule("└", "┴", "┘"))
 
 
 # --- DATASET LOADER ---
@@ -456,10 +494,70 @@ class RQVAEDiagnostics:
         return stability
 
 
+# --- K-MEANS (GPU / FAISS) ---
+def _faiss_gpu_available() -> bool:
+    """True when FAISS is importable and exposes at least one usable CUDA device."""
+    if not FAISS_AVAILABLE:
+        return False
+    try:
+        return faiss.get_num_gpus() > 0
+    except Exception:
+        return False
+
+
+def _faiss_assign(x: np.ndarray, centroids: np.ndarray, use_gpu: bool) -> np.ndarray:
+    """Nearest-centroid labels via a FAISS flat-L2 index (chunked to bound host memory)."""
+    index = faiss.IndexFlatL2(centroids.shape[1])
+    index.add(np.ascontiguousarray(centroids, dtype=np.float32))
+    if use_gpu:
+        index = faiss.index_cpu_to_all_gpus(index)
+
+    labels = np.empty(x.shape[0], dtype=np.int64)
+    for start in range(0, x.shape[0], KMEANS_ASSIGN_CHUNK):
+        chunk = np.ascontiguousarray(x[start:start + KMEANS_ASSIGN_CHUNK], dtype=np.float32)
+        _, idx = index.search(chunk, 1)
+        labels[start:start + chunk.shape[0]] = idx.reshape(-1)
+    return labels
+
+
+def fit_kmeans(x: np.ndarray, n_clusters: int, logger: logging.Logger):
+    """
+    Fits K-Means on the GPU through FAISS and returns (centroids, labels).
+
+    FAISS mirrors the previous sklearn setup (nredo == n_init restarts, k-means++ seeding) but runs
+    the Lloyd iterations on the GPU. sklearn is only kept as a CPU fallback for environments without
+    a FAISS GPU build, so the pipeline still runs unchanged there.
+    """
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    n_clusters = int(min(n_clusters, x.shape[0]))
+
+    if _faiss_gpu_available():
+        try:
+            kmeans = faiss.Kmeans(
+                x.shape[1],
+                n_clusters,
+                niter=KMEANS_N_ITER,
+                nredo=KMEANS_N_INIT,
+                seed=KMEANS_RANDOM_STATE,
+                verbose=False,
+                gpu=True,
+                min_points_per_centroid=1,
+            )
+            kmeans.train(x)
+            centroids = np.ascontiguousarray(kmeans.centroids, dtype=np.float32)
+            return centroids, _faiss_assign(x, centroids, use_gpu=True)
+        except Exception as exc:
+            logger.warning(f"    ⚠ FAISS GPU K-Means failed ({exc}); falling back to sklearn CPU K-Means.")
+
+    kmeans = KMeans(n_clusters=n_clusters, n_init=KMEANS_N_INIT, random_state=KMEANS_RANDOM_STATE)
+    kmeans.fit(x)
+    return kmeans.cluster_centers_.astype(np.float32), kmeans.labels_.astype(np.int64)
+
+
 # --- CODEBOOK INITIALIZATION ---
 def init_codebooks_batched(model, dataset_embeddings, codebook_sizes, device, logger, sample_size=INIT_SAMPLE_SIZE):
     """
-    Initialize codebooks using K-Means on a sampled subset of training embeddings.
+    Initialize codebooks using (GPU/FAISS) K-Means on a sampled subset of training embeddings.
     Centroids preserve true magnitude (un-normalized).
     """
     total_len = len(dataset_embeddings)
@@ -490,16 +588,11 @@ def init_codebooks_batched(model, dataset_embeddings, codebook_sizes, device, lo
 
     for cb_idx, cb_size in enumerate(codebook_sizes):
         t0 = time.time()
-        kmeans = KMeans(n_clusters=cb_size, n_init=KMEANS_N_INIT, random_state=KMEANS_RANDOM_STATE)
-        kmeans.fit(current_residuals)
-
-        centroids = torch.tensor(kmeans.cluster_centers_, dtype=torch.float32)
-        codebooks.append(centroids)
+        centroids, labels = fit_kmeans(current_residuals, cb_size, logger)
+        codebooks.append(torch.from_numpy(centroids))
 
         # Residual update for next stage
-        labels = kmeans.labels_
-        quantized = kmeans.cluster_centers_[labels]
-        current_residuals = current_residuals - quantized
+        current_residuals = current_residuals - centroids[labels]
 
         logger.info(f"    ✔ Codebook #{cb_idx} (size {cb_size}) K-Means fitted in {time.time() - t0:.2f}s.")
 
@@ -951,8 +1044,6 @@ def main():
                 train_model.train()
                 batch_embs = batch_embs.to(DEVICE, non_blocking=True)
 
-                should_log = (current_step % args.log_interval == 0 or current_step == 1)
-
                 optimizer.zero_grad(set_to_none=True)
 
                 with torch.autocast(device_type=DEVICE.type, dtype=AMP_DTYPE, enabled=USE_AMP):
@@ -992,6 +1083,14 @@ def main():
                             logger.info(f"  [Step {current_step}] Revived {total_revived} dead centroid(s).")
 
                 # --- LOGGING STEP ---
+                # current_step was already incremented above, so it now equals the number of
+                # completed steps. The old check ran *before* the increment plus a `current_step == 1`
+                # special case, which printed two back-to-back rows (steps 0 and 1) per interval and
+                # never logged on clean multiples of log_interval.
+                should_log = (
+                    (args.log_interval > 0 and current_step % args.log_interval == 0)
+                    or (args.max_steps is not None and current_step == args.max_steps)
+                )
                 if should_log:
                     # Scalar loss transfers (grouped together)
                     step_loss = loss.item()
@@ -1029,12 +1128,20 @@ def main():
                         writer.add_scalar(f"Residual/R_{m}_Mean_L2", r_stat['mean_l2'], current_step)
                         writer.add_scalar(f"Residual/R_{m}_Median_L2", r_stat['median_l2'], current_step)
 
-                    # Lean Stdio Table Row
-                    logger.info(
-                        f"│ {epoch:<5d} │ {current_step:<6d} │ {step_loss:<10.4f} │ {recon_loss:<9.4f} │ "
-                        f"{cb_loss:<9.4f} │ {cm_loss:<9.4f} │ {stage_diags[0]['perplexity']:<9.1f} │ "
-                        f"{stage_diags[-1]['perplexity']:<9.1f} │ {res_diags[0]['expected_sq_norm']:<8.4f} │ "
-                        f"{res_diags[-1]['expected_sq_norm']:<8.4f} │ {curr_lr:<12.5e} │"
+                    # Lean Stdio Table Row (widths come from LOG_TABLE_COLUMNS, matching the header)
+                    log_table_row(
+                        logger,
+                        epoch=epoch,
+                        step=current_step,
+                        loss=step_loss,
+                        recon_loss=recon_loss,
+                        cb_loss=cb_loss,
+                        cm_loss=cm_loss,
+                        perp_first=stage_diags[0]['perplexity'],
+                        perp_last=stage_diags[-1]['perplexity'],
+                        res_first=res_diags[0]['expected_sq_norm'],
+                        res_last=res_diags[-1]['expected_sq_norm'],
+                        lr=curr_lr,
                     )
 
                 if args.max_steps is not None and current_step >= args.max_steps:
