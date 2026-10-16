@@ -43,15 +43,15 @@ DEFAULT_INPUT_DIM = 1024
 DEFAULT_HIDDEN_DIM = 64
 DEFAULT_CODEBOOK_SIZE = 256
 DEFAULT_NUM_CODEBOOKS = 4
-DEFAULT_BETA = 0.25
+DEFAULT_BETA = 0.1
 DEFAULT_LR = 5e-4
 DEFAULT_WARMUP_STEPS = 2_000
 DEFAULT_LOG_INTERVAL = 200
 DEFAULT_DEAD_CODE_FIX_INTERVAL = 500
 DEFAULT_SAVE_INTERVAL = 5
-DEFAULT_JITTER = 0.01
-DEFAULT_ENTROPY_LOSS_WEIGHT = 0.05
-DEFAULT_STAGE_WEIGHTS = [1.5, 1.2, 1.0, 1.0]
+DEFAULT_JITTER = 0.0
+DEFAULT_ENTROPY_LOSS_WEIGHT = 0.002
+DEFAULT_STAGE_WEIGHTS = [2.0, 1.5, 1.0, 1.0]
 DEFAULT_USAGE_DECAY = 0.99
 DEFAULT_DEAD_CODE_THRESHOLD = 0.1
 DEFAULT_RUN_BASELINE = False
@@ -82,6 +82,7 @@ KMEANS_ASSIGN_CHUNK = 200_000  # rows per FAISS search batch during label assign
 GRAD_CLIP_MAX_NORM = 1.0
 WEIGHT_DECAY = 1e-4
 MIN_LR_RATIO = 0.01
+CODEBOOK_LR_MULT = 2.0   # codebook param-group LR multiplier (Fix 3)
 
 # UI/Logging constants
 BANNER_WIDTH = 85
@@ -243,7 +244,10 @@ class RQVAE(nn.Module):
         beta=0.25,
         codebook_sizes=[256, 256, 256, 256],
         temperature=1.0,
-        jitter=0.01,
+        # Trap B: with unit-sphere latents (||z||^2 ~= 1.0) the stage-3 residual norm^2 is ~2.5e-4,
+        # so jitter std 0.01 would contribute E[||jitter||^2] = 64 * 1e-4 = 6.4e-3 (~25x the true
+        # residual): stages 2-3 would just be quantizing noise. Keep this at 0.0 to 0.001.
+        jitter=0.0,
         entropy_loss_weight=0.05,
         stage_weights=None,
         is_run_baseline: bool = False,
@@ -276,12 +280,18 @@ class RQVAE(nn.Module):
             nn.Linear(128, hidden_dim)
         )
 
-        # Bottleneck Normalization
+        # Bottleneck Normalization (Fix 1): parameter-free LayerNorm. With elementwise_affine=True
+        # the optimizer shrank the learnable gamma on the most informative axes to buy down the
+        # commitment loss, squashing z into a narrow tube (anisotropic collapse).
         self.bottleneck_norm = (
             None
             if is_run_baseline
-            else nn.LayerNorm(hidden_dim)
+            else nn.LayerNorm(hidden_dim, elementwise_affine=False)
         )
+        # LayerNorm output has E[||z||^2] == hidden_dim (64.0). Dividing by sqrt(hidden_dim) brings
+        # it to ~1.0, the same order as recon_loss (~1e-3), so commitment loss no longer dominates
+        # the encoder gradient in epoch 0, and residual norms stay comparable across stages.
+        self.latent_scale = math.sqrt(hidden_dim)
 
         # Decoder: 64 -> 128 -> 128 -> 256 -> 256 (Symmetrical)
         self.decoder = nn.Sequential(
@@ -302,12 +312,20 @@ class RQVAE(nn.Module):
                 nn.init.trunc_normal_(cb, std=TRUNC_NORMAL_STD, a=-TRUNC_NORMAL_BOUND, b=TRUNC_NORMAL_BOUND)
             self.codebooks.append(cb)
 
+    def _normalize_latent(self, z):
+        """Parameter-free LayerNorm + 1/sqrt(D) unit-sphere rescale (Fix 1).
+
+        Used by forward(), encode_indices() and the K-Means codebook init so all three see the
+        exact same latent distribution.
+        """
+        if self.bottleneck_norm is not None:
+            z = self.bottleneck_norm(z) / self.latent_scale
+        return z
 
     def forward(self, batch_embs, compute_diagnostics: bool = False):
         # 1. Continuous Latent Space
         z = self.encoder(batch_embs)
-        if self.bottleneck_norm is not None:
-            z = self.bottleneck_norm(z)
+        z = self._normalize_latent(z)
 
         remainder = z + (torch.randn_like(z) * self.jitter) if (self.training and self.jitter > 0) else z
 
@@ -319,9 +337,6 @@ class RQVAE(nn.Module):
 
         clusters = []
         residuals = [remainder.detach()] if compute_diagnostics else None
-
-        if not self.is_run_baseline:
-            max_entropy = math.log(self.codebook_sizes[0])
 
         # 2. Sequential Residual Vector Quantization Cascade
         for d, (codebook, weight) in enumerate(zip(self.codebooks, self.stage_weights)):
@@ -342,7 +357,28 @@ class RQVAE(nn.Module):
             total_commitment_loss = total_commitment_loss + cm_loss_d
 
             if not self.is_run_baseline:
-                probs = F.softmax(logits / self.temperature, dim=-1)
+                # Fix 2: softmax over TRUE squared distances, normalized per stage. `logits` alone
+                # (2*r.e - ||e||^2) omits the constant -||r||^2 term, so its spread scales with
+                # ||r||^2: ~+-100 at stage 0 but ~+-0.05 at stages 1-3. That made the softmax either
+                # hyper-peaked or perfectly flat (entropy_loss -> 0 while 223/256 codes were dead)
+                # and let the model 'cheat' the entropy loss by shrinking unused centroid norms.
+                # Normalizing by the stage's mean distance makes --temperature act identically at
+                # every stage (e.g. 0.1-0.2), so the regularizer tracks hard assignments.
+                #
+                # Trap A: the codebook is DETACHED here on purpose. entropy_loss_weight (0.05) is
+                # ~50x the ~1e-3 cb_loss, so if gradients flowed into the centroids the cheapest way
+                # to make probs uniform (entropy -> max, loss -> 0) is to collapse all centroids onto
+                # one point, or shove dead centroids into occupied cells - which fights K-Means and
+                # destroys the Voronoi tessellation. Detaching keeps this a pure encoder regularizer:
+                # it only tells `remainder` to spread across the existing cells.
+                cb_detached = codebook.detach()
+                e_sq_det = torch.sum(cb_detached ** 2, dim=-1, keepdim=True).t()
+                dot_det = torch.matmul(remainder, cb_detached.t())
+                r_sq = torch.sum(remainder ** 2, dim=-1, keepdim=True)
+                # clamp(min=0) kills the small negative rounding errors of the expanded ||r - e||^2
+                dist_sq = torch.clamp(r_sq - 2.0 * dot_det + e_sq_det, min=0.0)
+                scaled_logits = -dist_sq / (dist_sq.mean().detach() + EPSILON)
+                probs = F.softmax(scaled_logits / self.temperature, dim=-1)
                 avg_probs = probs.mean(dim=0)
                 stage_entropy = -torch.sum(avg_probs * torch.log(avg_probs + EPSILON))
                 max_entropy = math.log(self.codebook_sizes[d])
@@ -387,8 +423,7 @@ class RQVAE(nn.Module):
     def encode_indices(self, batch_embs):
         """High-throughput inference matching the exact Euclidean Voronoi regions."""
         z = self.encoder(batch_embs)
-        if self.bottleneck_norm is not None:
-            z = self.bottleneck_norm(z)
+        z = self._normalize_latent(z)
 
         remainder = z
         all_indices = []
@@ -575,11 +610,9 @@ def init_codebooks_batched(model, dataset_embeddings, codebook_sizes, device, lo
             batch_data = sampled_data[i:i + batch_sz].to(device, non_blocking=True)
             z_e = raw_model.encoder(batch_data)
             
-            # Conditionally apply LayerNorm if it exists (i.e., not running baseline)
-            if raw_model.bottleneck_norm is not None:
-                z_rep = raw_model.bottleneck_norm(z_e)
-            else:
-                z_rep = z_e
+            # Same normalization as the training forward pass (Fix 1), so K-Means sees the exact
+            # distribution the codebooks will be quantizing.
+            z_rep = raw_model._normalize_latent(z_e)
                 
             encoded_list.append(z_rep.cpu().float().numpy())
 
@@ -768,7 +801,7 @@ def main():
     parser.add_argument('--num_codebooks', type=int, default=DEFAULT_NUM_CODEBOOKS, help='Number of residual codebooks')
     parser.add_argument('--beta', type=float, default=DEFAULT_BETA, help='Commitment loss beta coefficient')
     parser.add_argument('--temperature', type=float, default=1.0, help='Softmax temperature for Euclidean entropy loss')
-    parser.add_argument('--jitter', type=float, default=DEFAULT_JITTER, help='Scale of Gaussian jitter added during training')
+    parser.add_argument('--jitter', type=float, default=DEFAULT_JITTER, help='Scale of Gaussian jitter added during training (keep <= 0.001 with unit-sphere latents)')
     parser.add_argument('--entropy_loss_weight', type=float, default=DEFAULT_ENTROPY_LOSS_WEIGHT, help='Weight of entropy regularization in total loss')
     parser.add_argument('--stage_weights', type=float, nargs='+', default=DEFAULT_STAGE_WEIGHTS, help='Entropy-loss weights for each residual stage')
     parser.add_argument('--usage_decay', type=float, default=DEFAULT_USAGE_DECAY, help='EMA decay for tracking codebook usage')
@@ -860,9 +893,12 @@ def main():
         if args.optimizer == 'adagrad':
             optimizer = torch.optim.Adagrad(model.parameters(), lr=args.lr)
         elif args.optimizer == 'adamw':
+            # Fix 3: each centroid only sees its own cluster's share of the batch gradient
+            # (~1/codebook_size) while the encoder gets a dense gradient from all stages at once,
+            # so the encoder outruns the codebooks. A higher codebook LR lets them keep up.
             optimizer = torch.optim.AdamW([
-                {'params': other_params, 'weight_decay': WEIGHT_DECAY},
-                {'params': codebook_params, 'weight_decay': 0.0}
+                {'params': other_params, 'weight_decay': WEIGHT_DECAY, 'lr': args.lr},
+                {'params': codebook_params, 'weight_decay': 0.0, 'lr': args.lr * CODEBOOK_LR_MULT}
             ], lr=args.lr)
         else:
             optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -914,34 +950,42 @@ def main():
                 drop_last=False
             )
 
-        # 4. Optional Autoencoder Warmup
+        # 4. Mixed-Precision GradScaler (built before the AE warmup so Stage 0 can run under AMP
+        #    too; with fp16 an unscaled backward pass would underflow the encoder/decoder grads).
+        scaler_enabled = (DEVICE.type == 'cuda' and args.dtype == 'fp16')
+        try:
+            scaler = torch.amp.GradScaler(device=DEVICE.type, enabled=scaler_enabled)
+        except TypeError:
+            scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
+
+        # 5. Optional Autoencoder Warmup
         if args.warmup_ae_epochs > 0 and not args.resume:
             log_section(logger, "STAGE 0: AUTOENCODER RECONSTRUCTION WARMUP")
             t_ae_start = time.time()
-            ae_params = list(model.encoder.parameters()) + list(model.decoder.parameters())
-            if model.bottleneck_norm is not None:
-                ae_params += list(model.bottleneck_norm.parameters())
-
-            ae_optimizer = torch.optim.Adam(ae_params, lr=args.lr)
+            # Fix 4: reuse the main optimizer so its Adam momentum/variance states carry over into
+            # Stage 2 instead of starting from zero (which caused a step-size spike on the first
+            # Stage 2 step). Codebooks are not part of this graph, so they get no gradient and are
+            # left untouched; the LR schedule below still starts from step 0 after warmup.
             for ae_ep in range(args.warmup_ae_epochs):
                 total_ae_loss = 0.0
                 model.train()
                 for (batch_embs,) in train_dataloader:
                     batch_embs = batch_embs.to(DEVICE, non_blocking=True)
-                    ae_optimizer.zero_grad(set_to_none=True)
-                    z = model.encoder(batch_embs)
-                    if model.bottleneck_norm is not None:
-                        z = model.bottleneck_norm(z)
-                    rec = model.decoder(z)
-                    loss_ae = F.mse_loss(rec, batch_embs)
-                    loss_ae.backward()
-                    ae_optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    with torch.autocast(device_type=DEVICE.type, dtype=AMP_DTYPE, enabled=USE_AMP):
+                        z = model.encoder(batch_embs)
+                        z = model._normalize_latent(z)
+                        rec = model.decoder(z)
+                        loss_ae = F.mse_loss(rec, batch_embs)
+                    scaler.scale(loss_ae).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
                     total_ae_loss += loss_ae.item()
                 avg_ae_loss = total_ae_loss / len(train_dataloader)
                 logger.info(f"  ► AE Warmup Epoch {ae_ep + 1}/{args.warmup_ae_epochs} - Reconstruction Loss: {avg_ae_loss:.6f}")
             logger.info(f"  ✔ Autoencoder latent space pre-warmed successfully in {time.time() - t_ae_start:.2f}s.")
 
-        # 5. Learning Rate Scheduler & Scaler
+        # 6. Learning Rate Scheduler
         steps_per_epoch = len(train_dataloader)
         total_training_steps = args.max_steps if args.max_steps is not None else (args.epochs * steps_per_epoch)
 
@@ -958,12 +1002,6 @@ def main():
         else:
             scheduler = None
 
-        scaler_enabled = (DEVICE.type == 'cuda' and args.dtype == 'fp16')
-        try:
-            scaler = torch.amp.GradScaler(device=DEVICE.type, enabled=scaler_enabled)
-        except TypeError:
-            scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
-
         gpu_fixer = GPURadialResidualFixer(
             num_codebooks=args.num_codebooks,
             hidden_dim=args.hidden_dim,
@@ -976,7 +1014,7 @@ def main():
         best_val_loss = float('inf')
         best_ckpt_path = os.path.join(checkpoint_dir, "best_rqvae_model.pth")
 
-        # 6. Resume or Initialize Codebooks via K-Means
+        # 7. Resume or Initialize Codebooks via K-Means
         if args.resume and os.path.isfile(args.resume):
             log_section(logger, "STAGE 1: RESUMING FROM CHECKPOINT")
             logger.info(f"  ► Loading checkpoint state from: {args.resume}")
@@ -1021,13 +1059,13 @@ def main():
                     model.codebooks[i].copy_(centroids.to(DEVICE))
             logger.info(f"  ✔ Initialized {args.num_codebooks} codebooks successfully via batched K-Means in {time.time() - t_km_start:.2f}s.")
 
-        # 7. Optional Graph Compilation
+        # 8. Optional Graph Compilation
         train_model = model
         if args.compile and hasattr(torch, 'compile') and DEVICE.type == 'cuda':
             logger.info("  ► Compiling model with torch.compile...")
             train_model = torch.compile(model)
 
-        # 8. Model Training Loop
+        # 9. Model Training Loop
         log_section(logger, "STAGE 2: MODEL TRAINING LOOP")
 
         log_table_header(logger)
@@ -1055,8 +1093,8 @@ def main():
 
                 raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
                 nn.utils.clip_grad_norm_(raw_model.encoder.parameters(), GRAD_CLIP_MAX_NORM)
-                if raw_model.bottleneck_norm is not None:
-                    nn.utils.clip_grad_norm_(raw_model.bottleneck_norm.parameters(), GRAD_CLIP_MAX_NORM)
+                # bottleneck_norm has elementwise_affine=False (Fix 1), i.e. no parameters, so
+                # clipping it was a no-op over an empty list - removed.
                 nn.utils.clip_grad_norm_(raw_model.codebooks.parameters(), GRAD_CLIP_MAX_NORM)
                 nn.utils.clip_grad_norm_(raw_model.decoder.parameters(), GRAD_CLIP_MAX_NORM)
 
@@ -1223,7 +1261,7 @@ def main():
         torch.save(raw_model.state_dict(), args.model_path)
         logger.info(f"  ✔ Saved final model weights to: {args.model_path}")
 
-        # 9. Corpus Inference (Encode Full Dataset)
+        # 10. Corpus Inference (Encode Full Dataset)
         log_section(logger, "STAGE 3: INFERENCE & SEMANTIC ID GENERATION")
         if args.save_best and os.path.isfile(best_ckpt_path):
             logger.info(f"  ► Loading best validation model ({best_ckpt_path}) for Stage 3 inference...")
@@ -1263,7 +1301,7 @@ def main():
             if args.add_unique_id:
                 sem_2_ids[tuple(codes_list)].append(item_id)
 
-        # 10. Codebook Utilization & Perplexity Report
+        # 11. Codebook Utilization & Perplexity Report
         log_section(logger, "STAGE 4: CODEBOOK UTILIZATION & PERPLEXITY REPORT")
         cb_metrics = {}
         per_cb_utilization = []
@@ -1303,7 +1341,7 @@ def main():
 
         log_card(logger, "Corpus Codebook Utilization & Perplexity", cb_metrics)
 
-        # 11. Collision Resolution & Index Saving
+        # 12. Collision Resolution & Index Saving
         log_section(logger, "STAGE 5: COLLISION RESOLUTION & INDEX SAVING")
 
         semantic_mapping = {}
