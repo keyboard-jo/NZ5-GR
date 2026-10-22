@@ -776,7 +776,7 @@ def _load_splits(args, meta: RunMeta, logger: logging.Logger
         if meta.max_seq_len and max_items > meta.max_seq_len:
             logger.warning(
                 f"  ! '{name}' has sequences of {max_items} items but the dataset was "
-                f"prepared with --max_seq_len={meta.max_seq_len} (stale digr_data?)"
+                f"prepared with --window={meta.max_seq_len} (stale digr_data?)"
             )
         logger.info(
             f"  + {name}: {human_int(len(split))} sequences, "
@@ -886,7 +886,7 @@ def run_train(args, logger: logging.Logger):
             "Vocab": human_int(meta.vocab.total_size),
             "Temperature": meta.temperature,
             "L2 normalise": meta.l2_normalize,
-            "Max history": f"{meta.max_seq_len} items",
+            "Max history": f"{meta.max_seq_len} events",
             "Batch / eval": f"{args.batch_size} / {args.eval_batch_size}",
             "LR (LoRA / embed)": f"{args.lr} / {args.lr * args.embed_lr_mult}",
             "Epochs / max steps": f"{args.epochs} / {args.max_steps}",

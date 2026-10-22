@@ -12,27 +12,62 @@ Inputs (defaults match the repo snapshots in `data_snapshot.md`)
   A) Nested (the shape of `data/seq.parquet`):
        user_id : int64
        seq     : list<struct<item_id, action_type, timestamp>>
-     If no target column exists we do leave-one-out: the last click
-     (action_type == --action_click_value) is the target, everything
-     chronologically before it is history.  Without a click the last
-     interaction is the target.
+     Every event is kept in the history: a click, an exposure or a null
+     `action_type` all count as one event.  Actions are never tokenised (only
+     the item's SID and the time gap are), so a non-click costs nothing but a
+     slot.  A null / unparseable `action_type` is mapped to ACTION_UNKNOWN, so
+     it can never become a target either.
 
-  B) Flat (`history_items` / `history_timestamps` / `target`):
+  B) Flat (`history_items` / `history_actions` / `history_timestamps` / `target`):
        user_id           : int64 (optional; without it every row gets UNK)
        history_items     : list<int>          RAW item ids
+       history_actions   : list<int>          (optional, aligned with items)
        history_timestamps: list<number>       (optional)
        target            : int64              RAW item id
        split             : str                (optional train/val filter)
+     `history_actions` is auto-detected (`history_actions` / `history_action_type`
+     / `actions` / `action_types`) and read exactly like the nested
+     `action_type`; nulls become UNKNOWN and can never be a target (`--clicks_only`
+     drops them from the history as well).
      NOTE: `SID Generation/preprocess_sequence_cli.py` also writes
      `history_items`/`target`, but with 1-BASED CATALOG INDICES and no
      `user_id`; remap those indices to raw item ids before using them here.
+
+Anchors -- how many rows one record produces
+---------------------------------------------
+  * an ANCHOR is an event whose item becomes the label `y`; only clicks
+    (`action_type == --action_click_value`) can be anchors;
+  * the history of a row is the up to `--window` (default 20) events directly
+    before its anchor, whatever their action type;
+  * anchors are taken from the right: a click is accepted only when it lies at
+    least `--anchor_gap` (default 5) events before the last accepted anchor, so
+    two rows of one record never share almost the same history; a skipped click
+    does not consume the quota;
+  * at most `--anchors_per_record` (default 3) rows per record: a record with a
+    single click still yields one row (provided it has `--min_history` events
+    before that click), a record without any click yields none;
+  * the val split keeps one anchor per record (its last click) so metrics stay
+    cheap and comparable; the infer split has no label and keeps the whole
+    windowed history;
+  * a record that carries an explicit `target` column yields exactly one row for
+    that target, whatever the mode.
+
+Rows are tagged with their history length, so `stats.json` reports how many
+records were limited by the window, by `--min_history`, by `--anchor_gap` and by
+`--anchors_per_record` (one binding limit per record explains every row loss).
 
 `--catalog_path` (parquet or json) is the item universe and its SID codes:
        item_id : int64 / string
        sids    : list<int> of length L   (or wide `sid_1 .. sid_L`)
   The RQ-VAE CLI dump `index_rqvae_prod.json` (`{"26": [76, 73, 51, 14, 0], ...}`)
-  is accepted directly.  Its 5th code is the `--add_unique_id` collision rank,
-  not a semantic level, so `--num_sid_levels` defaults to 4.
+  is accepted directly.  Its 5th code is the `--add_unique_id` collision rank
+  (the rank of the item inside its collision group), not a semantic level.  It
+  is kept in the output: `catalog_sid_codes.npy` stores every level and
+  `--num_sid_levels 0` (the default) tokenises all of them, so the collision
+  index is part of the SID and identical-semantic-SID items stay
+distinguishable.  Pass `--num_sid_levels 4` to drop it.  Collision statistics
+  (distinct semantic SIDs, duplicate items, largest group) are logged and
+  written to `preprocess_meta.json["catalog_collisions"]`.
 
 Timestamps may be epoch seconds / ms / us; the scale is detected from the
 median magnitude.  Rows whose target is not in the catalog are dropped, unknown
@@ -48,10 +83,19 @@ Outputs (`--output_dir`, default `digr_data/`)
   gap_edges.npy                  temporal bin edges
   train/ val/ [infer/]           tokens.npy, offsets.npy, targets.npy,
                                  users.npy, stats.json  (int32 CSR per row)
-  preprocess_meta.json           manifest: sizes, max_seq_len, sources, counts
+  preprocess_meta.json           manifest: sizes, max_seq_len (= --window),
+                                 window, anchors_per_record, anchor_gap,
+                                 sources, counts, catalog_collisions
+
+`stats.json` per split: rows_read / rows_kept / rows_proposed / rows_short /
+rows_window_truncated / rows_gap_limited / rows_capped_by_anchors /
+rows_with_single_anchor / rows_without_click / rows_missing_target /
+rows_non_monotonic / unknown_items / unknown_actions / non_click_actions /
+tokens / avg_items / anchors_per_record.
 
 Token layout written per row (one slot per interaction, as in the plan):
   [U, (T_1, S_1_1 .. S_1_L), (T_2, S_2_1 .. S_2_L), ...]   len = 1 + T*(1+L)
+  T <= --window: the events of history, newest last, anchor excluded.
   U   = offset_profile + dense user index (0 = UNK)
   T_i = offset_temporal + log-spaced gap bin (first interaction = bin 0)
   S_i = sid_offsets[l] + code_l
@@ -103,14 +147,27 @@ DEFAULT_SEQUENCE_PATH = "data/seq.parquet"
 DEFAULT_CATALOG_PATH = "data/index_rqvae_prod.json"
 DEFAULT_OUTPUT_DIR = "digr_data"
 
-DEFAULT_MAX_SEQ_LEN = 100          # history items, not tokens
-DEFAULT_MIN_HISTORY = 1
+DEFAULT_WINDOW = 20                 # events of history kept before an anchor
+DEFAULT_MIN_HISTORY = 5             # events of history a row must have
+DEFAULT_ANCHORS_PER_RECORD = 3      # upper bound on rows per record
+DEFAULT_ANCHOR_GAP = 5              # events between two anchors of one record
 DEFAULT_N_TEMPORAL_BINS = 64
 DEFAULT_MAX_GAP_SECONDS = 30 * 24 * 3600
 DEFAULT_MAX_PROFILE_TOKENS = 65536
 DEFAULT_READ_BATCH_SIZE = 8192
 DEFAULT_VAL_RATIO = 0.02
-DEFAULT_NUM_SID_LEVELS = 4         # index_rqvae_prod.json: 4 SIDs + 1 unique-id rank
+DEFAULT_NUM_SID_LEVELS = 0         # 0 = keep every catalog level, incl. the
+#                                    --add_unique_id collision rank
+
+# action_type is normalised into these three codes before any filtering.
+ACTION_CLICK = 1
+ACTION_OTHER = 0
+ACTION_UNKNOWN = -1                # null / unparseable action_type
+
+# What a row's target is.  See the "Anchors" section of the module docstring.
+MODE_TRAIN = "train"                # up to --anchors_per_record clicks per record
+MODE_VAL = "val"                    # the last click of each record
+MODE_INFER = "infer"                # no label, the whole windowed history
 
 BANNER_WIDTH = 88
 MANIFEST_NAME = "preprocess_meta.json"
@@ -723,6 +780,7 @@ class SequenceSchema:
     nested_col: Optional[str] = None
     history_col: Optional[str] = None
     history_ts_col: Optional[str] = None
+    history_actions_col: Optional[str] = None
     target_col: Optional[str] = None
     split_col: Optional[str] = None
     item_key: str = "item_id"
@@ -738,6 +796,10 @@ _HISTORY_NAMES = (
 _TS_NAMES = (
     "history_timestamps", "history_times", "timestamps", "times",
     "history_ts", "ts",
+)
+_ACTION_LIST_NAMES = (
+    "history_actions", "history_action_types", "history_action_type",
+    "actions", "action_types",
 )
 _TARGET_NAMES = (
     "target", "target_item_id", "label", "next_item_id", "y", "target_id",
@@ -808,16 +870,22 @@ def detect_sequence_schema(path: str, args) -> SequenceSchema:
     split_col = _none_if_auto(args.split_col) or _find_col(names, _SPLIT_NAMES)
 
     hist_ts_col = None
+    hist_act_col = None
     if nested_col is None:
         hist_ts_col = _none_if_auto(args.history_ts_col) or _find_col(names, _TS_NAMES)
         if hist_ts_col is not None and not _is_list_type(type_by_name[hist_ts_col]):
             hist_ts_col = None
+        hist_act_col = _none_if_auto(getattr(args, "history_actions_col", None)) \
+            or _find_col(names, _ACTION_LIST_NAMES)
+        if hist_act_col is not None and not _is_list_type(type_by_name[hist_act_col]):
+            hist_act_col = None
 
     return SequenceSchema(
         user_col=user_col,
         nested_col=nested_col,
         history_col=history_col,
         history_ts_col=hist_ts_col,
+        history_actions_col=hist_act_col,
         target_col=target_col,
         split_col=split_col,
         item_key=item_key,
@@ -829,8 +897,8 @@ def detect_sequence_schema(path: str, args) -> SequenceSchema:
 def describe_schema(schema: SequenceSchema) -> str:
     return (
         f"nested={schema.nested_col} hist={schema.history_col} "
-        f"ts={schema.history_ts_col} target={schema.target_col} "
-        f"user={schema.user_col} split={schema.split_col}"
+        f"ts={schema.history_ts_col} acts={schema.history_actions_col} "
+        f"target={schema.target_col} user={schema.user_col} split={schema.split_col}"
     )
 
 
@@ -851,6 +919,32 @@ def _get_key(d: Dict[str, Any], keys: Sequence[str], default=None):
         if k in d and d[k] is not None:
             return d[k]
     return default
+
+
+def _action_code(value: Any, click_value: float) -> int:
+    """Normalise one raw `action_type` into ACTION_CLICK / OTHER / UNKNOWN.
+
+    `null` is checked explicitly (None, NaN, empty string, unparseable) instead
+    of being compared against the click value, which would silently turn every
+    null into "not a click" without anyone being able to count it.
+    """
+    if value is None:
+        return ACTION_UNKNOWN
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("", "none", "null", "nan", "<na>"):
+            return ACTION_UNKNOWN
+        try:
+            value = float(text)
+        except ValueError:
+            return ACTION_UNKNOWN
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ACTION_UNKNOWN
+    if not np.isfinite(number):
+        return ACTION_UNKNOWN
+    return ACTION_CLICK if number == click_value else ACTION_OTHER
 
 
 def _row_slice(keep_rows: np.ndarray, start: int, n: int) -> np.ndarray:
@@ -896,13 +990,24 @@ def _iter_flat_chunks(
     schema: SequenceSchema,
     batch_size: int,
     wanted_split: Optional[str],
-    leave_one_out: bool,
     keep_rows: Optional[np.ndarray] = None,
-) -> Iterator[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    args=None,
+    counters: Optional[Dict[str, int]] = None,
+) -> Iterator[Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], np.ndarray,
+                    Optional[np.ndarray], np.ndarray]]:
+    """Yield (items, ts, actions, offsets, targets, users) per parquet batch.
+
+    Nothing is filtered here: `assemble_chunk` chooses the anchors from the full
+    event stream, because a history may contain exposures and null-action
+    events, and because one record can produce several rows.
+    """
     cols = [schema.history_col]
-    for c in (schema.history_ts_col, schema.target_col, schema.user_col, schema.split_col):
+    for c in (schema.history_ts_col, schema.history_actions_col,
+              schema.target_col, schema.user_col, schema.split_col):
         if c:
             cols.append(c)
+
+    click_value = float(getattr(args, "action_click_value", 1.0)) if args is not None else 1.0
 
     row_base = 0
     for batch in pf.iter_batches(batch_size=batch_size, columns=cols):
@@ -928,23 +1033,26 @@ def _iter_flat_chunks(
             ts = np.zeros(len(items), dtype=np.float64)
         ts = np.nan_to_num(_ts_to_seconds(ts), nan=0.0, posinf=0.0, neginf=0.0)
 
-        if schema.target_col:
-            target_raw = _col_to_numpy(batch.column(schema.target_col))
-        elif not leave_one_out:
-            target_raw = None
-        else:
-            # Leave-one-out: last item becomes the target.
-            last_pos = offsets[1:] - 1
-            has = lens > 0
-            target_raw = np.full(n, None, dtype=object)
-            target_raw[has] = items[last_pos[has]]
-            is_last = np.zeros(len(items), dtype=bool)
-            is_last[last_pos[has]] = True
-            keep = ~is_last
-            items = items[keep]
-            ts = ts[keep]
-            lens = np.where(has, lens - 1, 0)
-            offsets = np.concatenate([[0], np.cumsum(lens)]).astype(np.int64)
+        target_raw = _col_to_numpy(batch.column(schema.target_col)) if schema.target_col else None
+
+        act_codes: Optional[np.ndarray] = None
+        if schema.history_actions_col:
+            flat_acts: List[int] = []
+            for row_acts in batch.column(schema.history_actions_col).to_pylist():
+                if row_acts is None:
+                    continue
+                for a in row_acts:
+                    flat_acts.append(_action_code(a, click_value))
+            if len(flat_acts) != len(items):
+                raise ValueError(
+                    f"`{schema.history_actions_col}` holds {len(flat_acts)} actions but "
+                    f"`{schema.history_col}` holds {len(items)} items; the two list "
+                    "columns must be aligned"
+                )
+            act_codes = np.asarray(flat_acts, dtype=np.int64)
+            if counters is not None:
+                counters["unknown_actions"] += int((act_codes == ACTION_UNKNOWN).sum())
+                counters["non_click_actions"] += int((act_codes == ACTION_OTHER).sum())
 
         user_raw = (
             _col_to_numpy(batch.column(schema.user_col))
@@ -965,6 +1073,8 @@ def _iter_flat_chunks(
             keep_flat = mask[row_of] if len(row_of) else row_of
             items = items[keep_flat]
             ts = ts[keep_flat]
+            if act_codes is not None:
+                act_codes = act_codes[keep_flat]
             if target_raw is not None:
                 target_raw = target_raw[mask]
             user_raw = user_raw[mask]
@@ -972,7 +1082,7 @@ def _iter_flat_chunks(
             offsets = np.concatenate([[0], np.cumsum(lens)]).astype(np.int64)
 
         row_base += n
-        yield items, ts, offsets, target_raw, user_raw
+        yield items, ts, act_codes, offsets, target_raw, user_raw
 
 
 def _iter_nested_chunks(
@@ -981,15 +1091,21 @@ def _iter_nested_chunks(
     batch_size: int,
     wanted_split: Optional[str],
     args,
-    leave_one_out: bool,
     keep_rows: Optional[np.ndarray] = None,
-) -> Iterator[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    counters: Optional[Dict[str, int]] = None,
+) -> Iterator[Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], np.ndarray,
+                    Optional[np.ndarray], np.ndarray]]:
+    """Nested `list<struct<...>>` variant of `_iter_flat_chunks`.
+
+    Same contract: every event of every row is passed through, targets come from
+    `assemble_chunk`.
+    """
     cols = [schema.nested_col]
     for c in (schema.target_col, schema.user_col, schema.split_col):
         if c:
             cols.append(c)
 
-    click_value = int(args.action_click_value)
+    click_value = float(args.action_click_value)
 
     row_base = 0
     for batch in pf.iter_batches(batch_size=batch_size, columns=cols):
@@ -999,8 +1115,9 @@ def _iter_nested_chunks(
 
         items_flat: List[Any] = []
         ts_flat: List[float] = []
+        act_flat: List[int] = []
         lens: List[int] = []
-        targets: List[Any] = []
+        targets: Optional[List[Any]] = [] if schema.target_col else None
         users: List[Any] = []
 
         keep = _row_slice(keep_rows, row_base, len(rows)) if keep_rows is not None else None
@@ -1011,59 +1128,32 @@ def _iter_nested_chunks(
                 continue
 
             interactions = row.get(schema.nested_col) or []
-            item_seq: List[Any] = []
-            ts_seq: List[float] = []
-            actions: List[Any] = []
-
+            n_events = 0
             for it in interactions:
                 if not isinstance(it, dict):
-                    item_seq.append(it)
-                    ts_seq.append(0.0)
-                    actions.append(None)
+                    items_flat.append(it)
+                    ts_flat.append(0.0)
+                    act_flat.append(ACTION_UNKNOWN)
+                    n_events += 1
                     continue
                 iid = _get_key(it, (schema.item_key,) + _ITEM_KEYS)
                 if iid is None:
                     continue
                 raw_ts = _get_key(it, (schema.ts_key,) + _TS_KEYS)
                 raw_act = _get_key(it, (schema.action_key,) + _ACTION_KEYS)
-                item_seq.append(iid)
+                items_flat.append(iid)
                 try:
-                    ts_seq.append(float(raw_ts) if raw_ts is not None else 0.0)
+                    ts_flat.append(float(raw_ts) if raw_ts is not None else 0.0)
                 except (TypeError, ValueError):
-                    ts_seq.append(0.0)
-                actions.append(raw_act)
+                    ts_flat.append(0.0)
+                act_flat.append(_action_code(raw_act, click_value))
+                n_events += 1
 
-            if not item_seq:
+            if n_events == 0:
                 continue
-
-            explicit_target = row.get(schema.target_col) if schema.target_col else None
-            if explicit_target is not None:
-                target_raw = explicit_target
-                hist_end = len(item_seq)
-            elif not leave_one_out:
-                target_raw = None
-                hist_end = len(item_seq)
-            else:
-                target_pos = None
-                if args.target_from_last_click and any(a is not None for a in actions):
-                    for i, a in enumerate(actions):
-                        try:
-                            if int(float(a)) == click_value:
-                                target_pos = i
-                        except (TypeError, ValueError):
-                            continue
-                if target_pos is None:
-                    target_pos = len(item_seq) - 1
-                target_raw = item_seq[target_pos]
-                hist_end = target_pos
-
-            hist_items = item_seq[:hist_end]
-            hist_ts = ts_seq[:hist_end]
-
-            items_flat.extend(hist_items)
-            ts_flat.extend(hist_ts)
-            lens.append(len(hist_items))
-            targets.append(target_raw)
+            lens.append(n_events)
+            if targets is not None:
+                targets.append(row.get(schema.target_col))
             users.append(row.get(schema.user_col) if schema.user_col else None)
 
         row_base += len(rows)
@@ -1077,9 +1167,13 @@ def _iter_nested_chunks(
             _ts_to_seconds(np.asarray(ts_flat, dtype=np.float64)),
             nan=0.0, posinf=0.0, neginf=0.0,
         )
-        target_raw = np.asarray(targets, dtype=object)
+        act_codes = np.asarray(act_flat, dtype=np.int64)
+        if counters is not None:
+            counters["unknown_actions"] += int((act_codes == ACTION_UNKNOWN).sum())
+            counters["non_click_actions"] += int((act_codes == ACTION_OTHER).sum())
+        target_raw = np.asarray(targets, dtype=object) if targets is not None else None
         user_raw = np.asarray(users, dtype=object)
-        yield items, ts, offsets, target_raw, user_raw
+        yield items, ts, act_codes, offsets, target_raw, user_raw
 
 
 # ---------------------------------------------------------------------------
@@ -1102,31 +1196,152 @@ class TokenizedSplit:
         return len(self.targets)
 
 
+def _sort_by_time(
+    items: np.ndarray,
+    ts: np.ndarray,
+    act: Optional[np.ndarray],
+    offsets: np.ndarray,
+    stats: Dict[str, int],
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """Stable sort each record by timestamp.
+
+    "Right to left" and "the gap to the previous event" only mean something in
+    chronological order, so a record whose timestamps are out of order is sorted
+    instead of silently producing a wrong history.  `rows_non_monotonic` counts
+    the records that needed it.
+    """
+    n_rows = len(offsets) - 1
+    n_events = len(ts)
+    if n_rows <= 0 or n_events < 2:
+        return items, ts, act
+    delta = np.diff(ts)
+    crossed = np.zeros(len(delta), dtype=bool)
+    starts = offsets[1:-1]
+    starts = starts[(starts > 0) & (starts < n_events)]   # empty records exist
+    if len(starts):
+        crossed[starts - 1] = True          # delta[i] spans two records
+    bad = (delta < 0) & ~crossed
+    if not bad.any():
+        return items, ts, act
+    row_of = np.repeat(np.arange(n_rows, dtype=np.int64), np.diff(offsets))
+    bad_at = np.zeros(n_events, dtype=bool)     # `delta` is one shorter than `ts`
+    bad_at[1:] = bad
+    stats["rows_non_monotonic"] = int(np.unique(row_of[bad_at]).size)
+    order = np.lexsort((np.arange(n_events, dtype=np.int64), ts, row_of))
+    items = items[order]
+    ts = ts[order]
+    if act is not None:
+        act = act[order]
+    return items, ts, act
+
+
+def _select_anchors(
+    offsets: np.ndarray,
+    act: Optional[np.ndarray],
+    mode: str,
+    anchor_gap: int,
+    max_anchors: int,
+    stats: Dict[str, int],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Pick the anchor (target) events of one chunk: (row index, event position).
+
+    Anchors are walked right to left.  A click at position `p` is accepted when
+    `previous_anchor - p >= anchor_gap`, so consecutive rows of one record share
+    at most `window - anchor_gap` events of history; a rejected click does not
+    consume the quota, the scan simply continues further left.
+    """
+    n_rows = len(offsets) - 1
+    if n_rows <= 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    lens = np.diff(offsets).astype(np.int64)
+
+    if act is None:
+        # Without an action column nothing marks a click, so the only defensible
+        # target is the last event and everything before it is history.
+        rows = np.nonzero(lens > 0)[0].astype(np.int64)
+        return rows, (offsets[1:] - 1)[rows].astype(np.int64)
+
+    row_of = np.repeat(np.arange(n_rows, dtype=np.int64), lens)
+    click_pos = np.nonzero(act == ACTION_CLICK)[0].astype(np.int64)
+    click_count = np.bincount(row_of[click_pos], minlength=n_rows).astype(np.int64)
+    stats["rows_without_click"] = int((click_count == 0).sum())
+    if len(click_pos) == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+
+    click_row = row_of[click_pos]
+    click_start = np.searchsorted(click_row, np.arange(n_rows, dtype=np.int64), side="left")
+    rounds = 1 if mode == MODE_VAL else max(1, int(max_anchors))
+    acc = np.full((rounds, n_rows), -1, dtype=np.int64)
+    has = click_count > 0
+    acc[0][has] = click_pos[click_start[has] + click_count[has] - 1]
+
+    def _next_round(prev: np.ndarray) -> np.ndarray:
+        idx = np.searchsorted(click_pos, prev - int(anchor_gap), side="right") - 1
+        ok = (prev >= 0) & (idx >= click_start) & has
+        out = np.full(n_rows, -1, dtype=np.int64)
+        out[ok] = click_pos[idx[ok]]
+        return out
+
+    for r in range(1, rounds):
+        acc[r] = _next_round(acc[r - 1])
+    if rounds > 1:
+        # Would one more anchor have been possible?  Then the cap was binding.
+        stats["rows_capped_by_anchors"] = int((_next_round(acc[-1]) >= 0).sum())
+
+    per_row = (acc >= 0).sum(axis=0)
+    stats["rows_with_single_anchor"] = int((per_row == 1).sum())
+    stats["rows_gap_limited"] = int(
+        ((per_row > 0) & (per_row < np.minimum(click_count, rounds))).sum()
+    )
+
+    rows = np.tile(np.arange(n_rows, dtype=np.int64), rounds)
+    pos = acc.reshape(-1)
+    ok = pos >= 0
+    rows = rows[ok]
+    pos = pos[ok]
+    order = np.lexsort((pos, rows))
+    return rows[order], pos[order]
+
+
 def assemble_chunk(
     items_raw: np.ndarray,
     ts: np.ndarray,
+    act_codes: Optional[np.ndarray],
     raw_offsets: np.ndarray,
-    target_raw: np.ndarray,
+    target_raw: Optional[np.ndarray],
     user_raw: np.ndarray,
     catalog: ItemCatalog,
     vocab: Vocab,
     user_map: UserMap,
     gap_edges: np.ndarray,
-    max_seq_len: int,
-    min_history: int,
-    require_target: bool,
+    mode: str,
+    args,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, int]]:
-    """Vectorised [U, (T, S1..SL), ...] construction for one parquet batch."""
+    """Vectorised [U, (T, S1..SL), ...] construction for one parquet batch.
+
+    Returns (tokens, offsets, targets, users, history_lengths, stats).  One input
+    record can produce several rows (up to `--anchors_per_record`), and rows can
+    come from different records, so nothing here assumes row i came from record i.
+    """
     n_rows = len(raw_offsets) - 1
-    stats = {
+    stats: Dict[str, int] = {
         "rows_in": int(n_rows),
         "rows_kept": 0,
+        "rows_proposed": 0,
+        "rows_short": 0,
+        "rows_unknown_history": 0,
+        "rows_window_truncated": 0,
         "unknown_items": 0,
         "missing_target": 0,
-        "short": 0,
+        "rows_without_click": 0,
+        "rows_capped_by_anchors": 0,
+        "rows_gap_limited": 0,
+        "rows_with_single_anchor": 0,
+        "rows_non_monotonic": 0,
         "items_kept": 0,
     }
-    if n_rows == 0:
+
+    def _empty():
         return (
             np.empty(0, dtype=np.int32),
             np.zeros(1, dtype=np.int64),
@@ -1136,103 +1351,140 @@ def assemble_chunk(
             stats,
         )
 
-    raw_len = np.diff(raw_offsets).astype(np.int64)
-    items_idx = catalog.lookup(items_raw)
-    targets = catalog.lookup(target_raw) if target_raw is not None else np.full(n_rows, -1, np.int32)
+    if n_rows == 0:
+        return _empty()
 
-    row_of = np.repeat(np.arange(n_rows, dtype=np.int64), raw_len)
+    # --- optional history filter: keep clicks only --------------------------
+    if act_codes is not None and bool(getattr(args, "clicks_only", False)):
+        row_of = np.repeat(np.arange(n_rows, dtype=np.int64), np.diff(raw_offsets))
+        keep = act_codes == ACTION_CLICK
+        items_raw = items_raw[keep]
+        ts = ts[keep]
+        act_codes = act_codes[keep]
+        lens = np.bincount(row_of[keep], minlength=n_rows).astype(np.int64)
+        raw_offsets = np.concatenate([[0], np.cumsum(lens)]).astype(np.int64)
 
-    # --- temporal token from gap to the previous interaction -----------------
-    n_raw = len(items_raw)
-    gap = np.zeros(n_raw, dtype=np.float64)
-    if n_raw > 1:
+    items_raw, ts, act_codes = _sort_by_time(items_raw, ts, act_codes, raw_offsets, stats)
+
+    # --- temporal token of every event, from the gap to its predecessor ------
+    gap = np.zeros(len(ts), dtype=np.float64)
+    if len(ts) > 1:
         gap[1:] = np.diff(ts)
-    starts = raw_offsets[:-1][raw_len > 0]
+    starts = raw_offsets[:-1][np.diff(raw_offsets) > 0]
     if len(starts):
         gap[starts] = 0.0
-    gap = np.nan_to_num(gap, nan=0.0, posinf=0.0, neginf=0.0)
-    gap = np.maximum(gap, 0.0)
-
+    gap = np.maximum(np.nan_to_num(gap, nan=0.0, posinf=0.0, neginf=0.0), 0.0)
     if gap_edges.size:
-        temp_bucket = np.digitize(gap, gap_edges).astype(np.int64)
+        bucket = np.digitize(gap, gap_edges).astype(np.int64)
     else:
-        temp_bucket = np.zeros(n_raw, dtype=np.int64)
-    temp_bucket = np.clip(temp_bucket, 0, vocab.n_temporal - 1)
-    temp_tok = (temp_bucket + vocab.offset_temporal).astype(np.int32)
+        bucket = np.zeros(len(ts), dtype=np.int64)
+    bucket = np.clip(bucket, 0, vocab.n_temporal - 1)
+    temp_tok_all = (bucket + vocab.offset_temporal).astype(np.int32)
 
-    # --- drop history items whose item_id is not in the catalog --------------
-    known = items_idx >= 0
-    stats["unknown_items"] = int((~known).sum())
-    items_idx = items_idx[known]
-    temp_tok = temp_tok[known]
-    row_of = row_of[known]
-
-    counts = np.bincount(row_of, minlength=n_rows).astype(np.int64)
-    known_offsets = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
-    pos_in_row = np.arange(len(row_of), dtype=np.int64) - known_offsets[row_of]
-
-    # --- truncate to the most recent max_seq_len interactions ----------------
-    start = np.maximum(counts - max_seq_len, 0)
-    keep_item = pos_in_row >= start[row_of]
-    items_idx = items_idx[keep_item]
-    temp_tok = temp_tok[keep_item]
-    row_of = row_of[keep_item]
-    pos_in_row = pos_in_row[keep_item]
-    pos_local = pos_in_row - start[row_of]
-
-    m = np.minimum(counts, max_seq_len)
-
-    # --- keep rows with enough history and (optionally) a known target ------
-    keep_row = m >= min_history
-    if require_target:
-        keep_row = keep_row & (targets >= 0)
-        stats["missing_target"] = int(((targets < 0) & (m >= min_history)).sum())
-    stats["short"] = int((m < min_history).sum())
-
-    keep_rows_idx = np.nonzero(keep_row)[0]
-    if len(keep_rows_idx) == 0:
-        return (
-            np.empty(0, dtype=np.int32),
-            np.zeros(1, dtype=np.int64),
-            np.empty(0, dtype=np.int64),
-            np.empty(0, dtype=object),
-            np.empty(0, dtype=np.int64),
-            stats,
+    # --- 1. anchors (what each row predicts) --------------------------------
+    if target_raw is not None:
+        # Explicit target column: one row per record, the given item is the label.
+        anchor_row = np.arange(n_rows, dtype=np.int64)
+        anchor_pos = raw_offsets[1:].copy()
+        anchor_item: Optional[np.ndarray] = np.asarray(target_raw)
+    elif mode == MODE_INFER:
+        anchor_row = np.arange(n_rows, dtype=np.int64)
+        anchor_pos = raw_offsets[1:].copy()
+        anchor_item = None
+    else:
+        anchor_row, anchor_pos = _select_anchors(
+            raw_offsets, act_codes, mode,
+            int(args.anchor_gap), int(args.anchors_per_record), stats,
         )
+        anchor_item = items_raw[anchor_pos] if len(anchor_pos) else None
+    n_prop = int(len(anchor_row))
+    stats["rows_proposed"] = n_prop
+    if n_prop == 0:
+        return _empty()
 
-    remap = np.full(n_rows, -1, dtype=np.int64)
-    remap[keep_rows_idx] = np.arange(len(keep_rows_idx), dtype=np.int64)
+    # --- 2. window + minimum history ---------------------------------------
+    window = int(args.window)
+    row_start = raw_offsets[:-1][anchor_row]
+    hist_len = np.minimum(anchor_pos - row_start, window)
+    stats["rows_window_truncated"] = int((anchor_pos - row_start > window).sum())
+    keep = hist_len >= int(args.min_history)
+    if anchor_item is None and mode == MODE_INFER:
+        keep = hist_len > 0                # inference keeps every record
+    stats["rows_short"] = int((~keep).sum())
+    if anchor_item is None:
+        targets = np.full(n_prop, -1, dtype=np.int32)
+    else:
+        targets = catalog.lookup(anchor_item)
+        stats["missing_target"] = int((keep & (targets < 0)).sum())
+        keep = keep & (targets >= 0)
+    sel = np.nonzero(keep)[0]
+    if len(sel) == 0:
+        return _empty()
 
-    item_keep = remap[row_of] >= 0
-    items_idx = items_idx[item_keep]
-    temp_tok = temp_tok[item_keep]
-    pos_local = pos_local[item_keep]
-    new_row = remap[row_of[item_keep]]
+    anchor_row = anchor_row[sel]
+    hist_len = hist_len[sel]
+    hist_end = anchor_pos[sel]
+    hist_start = hist_end - hist_len
+    targets = targets[sel].astype(np.int64)
+    n_keep = int(len(sel))
 
-    m = m[keep_rows_idx]
-    targets = targets[keep_rows_idx].astype(np.int64)
-    user_kept = user_raw[keep_rows_idx]
-    user_dense = user_map.lookup(user_kept)
-    profile_tok = (vocab.offset_profile + user_dense).astype(np.int32)
+    # --- 3. flatten the histories, drop items outside the catalog -----------
+    total = int(hist_len.sum())
+    if total == 0:
+        return _empty()
+    row_of_h = np.repeat(np.arange(n_keep, dtype=np.int64), hist_len)
+    block_base = np.concatenate([[0], np.cumsum(hist_len)[:-1]]).astype(np.int64)
+    flat = np.repeat(hist_start, hist_len) + (
+        np.arange(total, dtype=np.int64) - block_base[row_of_h]
+    )
+    hist_idx = catalog.lookup(items_raw[flat])
+    known = hist_idx >= 0
+    stats["unknown_items"] = int((~known).sum())
+    if not known.all():
+        hist_idx = hist_idx[known]
+        flat = flat[known]
+        row_of_h = row_of_h[known]
 
-    # --- write tokens --------------------------------------------------------
-    if vocab.num_levels != catalog.num_levels:
+    m = np.bincount(row_of_h, minlength=n_keep).astype(np.int64)
+    nonempty = m > 0
+    if not nonempty.all():
+        remap = np.full(n_keep, -1, dtype=np.int64)
+        remap[np.nonzero(nonempty)[0]] = np.arange(int(nonempty.sum()), dtype=np.int64)
+        ev_row = remap[row_of_h]
+        keep_ev = ev_row >= 0
+        hist_idx = hist_idx[keep_ev]
+        flat = flat[keep_ev]
+        row_of_h = ev_row[keep_ev]
+        targets = targets[nonempty]
+        anchor_row = anchor_row[nonempty]
+        m = m[nonempty]
+        n_keep = int(nonempty.sum())
+        stats["rows_unknown_history"] = int((~nonempty).sum())
+        if n_keep == 0:
+            return _empty()
+
+    # --- 4. write tokens ----------------------------------------------------
+    L = catalog.num_levels
+    if vocab.num_levels != L:
         raise AssertionError(
             f"vocab has {vocab.num_levels} SID levels but the catalog has "
-            f"{catalog.num_levels}; rebuild the vocab from this catalog"
+            f"{L}; rebuild the vocab from this catalog"
         )
-    L = catalog.num_levels
     out_len = 1 + m * (1 + L)
     offsets = np.concatenate([[0], np.cumsum(out_len)]).astype(np.int64)
     tokens = np.zeros(int(offsets[-1]), dtype=np.int32)
 
-    base = offsets[new_row] + 1 + pos_local * (1 + L)
-    tokens[base] = temp_tok
+    row_m_base = np.concatenate([[0], np.cumsum(m)[:-1]]).astype(np.int64)
+    pos_local = np.arange(len(hist_idx), dtype=np.int64) - row_m_base[row_of_h]
+    base = offsets[row_of_h] + 1 + pos_local * (1 + L)
+    tokens[base] = temp_tok_all[flat]
 
-    sid_codes = catalog.sid_codes[items_idx]
+    sid_codes = catalog.sid_codes[hist_idx]
     for level in range(L):
         tokens[base + 1 + level] = sid_codes[:, level] + vocab.sid_offsets[level]
 
+    user_kept = user_raw[anchor_row]
+    profile_tok = (vocab.offset_profile + user_map.lookup(user_kept)).astype(np.int32)
     tokens[offsets[:-1]] = profile_tok
 
     if tokens.size and int(tokens.max()) >= vocab.total_size:
@@ -1240,7 +1492,7 @@ def assemble_chunk(
             f"token id {int(tokens.max())} exceeds vocab size {vocab.total_size}"
         )
 
-    stats["rows_kept"] = int(len(targets))
+    stats["rows_kept"] = int(n_keep)
     stats["items_kept"] = int(m.sum())
     return tokens, offsets, targets, user_kept, m, stats
 
@@ -1255,28 +1507,30 @@ def build_tokenized_split(
     args,
     logger: logging.Logger,
     wanted_split: Optional[str] = None,
-    require_target: bool = True,
+    mode: str = MODE_TRAIN,
     row_limit: Optional[int] = None,
     keep_rows: Optional[np.ndarray] = None,
     stream_dir: Optional[str] = None,
 ) -> TokenizedSplit:
     """Tokenise one file/split into a TokenizedSplit.
 
-    `keep_rows` keeps only the given global row indices (used to carve a
-    per-user train/val split out of a single file). `stream_dir` spills the
-    token stream straight to `<stream_dir>/tokens.npy` instead of building the
-    whole int32 array in RAM first.
+    `mode` (train / val / infer) decides the anchors of each record, see the
+    module docstring.  `keep_rows` keeps only the given global row indices (used
+    to carve a per-user train/val split out of a single file).  `stream_dir`
+    spills the token stream straight to `<stream_dir>/tokens.npy` instead of
+    building the whole int32 array in RAM first.
     """
+    counters: Dict[str, int] = {"unknown_actions": 0, "non_click_actions": 0}
     pf = pq.ParquetFile(path)
     if schema.nested_col is not None:
         chunk_iter = _iter_nested_chunks(
             pf, schema, args.read_batch_size, wanted_split, args,
-            leave_one_out=require_target, keep_rows=keep_rows,
+            keep_rows=keep_rows, counters=counters,
         )
     else:
         chunk_iter = _iter_flat_chunks(
             pf, schema, args.read_batch_size, wanted_split,
-            leave_one_out=require_target, keep_rows=keep_rows,
+            keep_rows=keep_rows, args=args, counters=counters,
         )
 
     tok_file = None
@@ -1293,20 +1547,21 @@ def build_tokenized_split(
     targets_parts: List[np.ndarray] = []
     users_parts: List[np.ndarray] = []
 
+    agg: Dict[str, int] = {}
     base = 0
     raw_rows = 0
     kept_rows = 0
-    kept_items = 0
-    unknown_items = 0
     t0 = time.time()
 
-    for bi, (items, ts, raw_offsets, target_raw, user_raw) in enumerate(chunk_iter):
+    for bi, chunk in enumerate(chunk_iter):
+        items, ts, act, raw_offsets, target_raw, user_raw = chunk
         raw_rows += len(raw_offsets) - 1
         tok, off, tgt, usr, _, st = assemble_chunk(
-            items, ts, raw_offsets, target_raw, user_raw,
-            catalog, vocab, user_map, gap_edges,
-            args.max_seq_len, args.min_history, require_target,
+            items, ts, act, raw_offsets, target_raw, user_raw,
+            catalog, vocab, user_map, gap_edges, mode, args,
         )
+        for key, value in st.items():
+            agg[key] = agg.get(key, 0) + int(value)
         if len(tok):
             if tok_file is not None:
                 tok.astype(np.int32, copy=False).tofile(tok_file)
@@ -1317,8 +1572,6 @@ def build_tokenized_split(
             users_parts.append(usr)
             base += len(tok)
             kept_rows += len(tgt)
-            kept_items += st["items_kept"]
-        unknown_items += st["unknown_items"]
 
         if bi % 25 == 0:
             elapsed = max(1e-6, time.time() - t0)
@@ -1340,25 +1593,24 @@ def build_tokenized_split(
             if p is not None and os.path.isfile(p):
                 os.remove(p)
         raise ValueError(
-            f"no usable sequences in {path}. Check the sequence schema, the catalog "
-            "coverage and --min_history. If the sequences store 1-based catalog "
-            "indices (as `preprocess_sequence_cli.py` does) instead of raw item ids, "
-            "remap them to item ids before running."
+            f"no usable sequences in {path}: no event could become a target. "
+            f"Need {args.min_history} events of history before a click "
+            f"(window={args.window}, anchors/record={args.anchors_per_record}, "
+            f"anchor_gap={args.anchor_gap}). Check the sequence schema, the action "
+            "column (only action_type == --action_click_value is a target) and the "
+            "catalog coverage. If the sequences store 1-based catalog indices (as "
+            "`preprocess_sequence_cli.py` does) instead of raw item ids, remap them "
+            "to item ids before running."
         )
 
     if tok_path is not None and tok_raw is not None:
-        # Raw stream -> proper .npy header, one chunk at a time (never in RAM).
-        tokens = np.lib.format.open_memmap(
-            tok_path, mode="w+", dtype=np.int32, shape=(base,)
-        )
-        step = 1 << 24                      # 16M int32 = 64 MB per chunk
-        with open(tok_raw, "rb") as fin:
-            for start in range(0, base, step):
-                stop = min(start + step, base)
-                block = np.fromfile(fin, dtype=np.int32, count=stop - start)
-                tokens[start:stop] = block
-        tokens.flush()
-        del tokens
+        # Raw stream -> one regular .npy (header + payload).  `open_memmap` on a
+        # "*.npy" name would leave a sidecar "*.npy.raw" next to it.
+        header = {"descr": "<i4", "fortran_order": False, "shape": (base,)}
+        with open(tok_path, "wb") as fout:
+            np.lib.format.write_array_header_1_0(fout, header)
+            with open(tok_raw, "rb") as fin:
+                shutil.copyfileobj(fin, fout, length=1 << 24)
         os.remove(tok_raw)
         tokens = np.load(tok_path, mmap_mode="r")
     else:
@@ -1370,15 +1622,39 @@ def build_tokenized_split(
     stats = {
         "rows_read": raw_rows,
         "rows_kept": kept_rows,
+        "anchors_per_record": kept_rows / max(1, raw_rows),
         "tokens": int(len(tokens)),
-        "unknown_items": unknown_items,
-        "avg_items": kept_items / max(1, kept_rows),
+        "avg_items": agg.get("items_kept", 0) / max(1, kept_rows),
+        "rows_proposed": agg.get("rows_proposed", 0),
+        "rows_short": agg.get("rows_short", 0),
+        "rows_unknown_history": agg.get("rows_unknown_history", 0),
+        "rows_window_truncated": agg.get("rows_window_truncated", 0),
+        "rows_gap_limited": agg.get("rows_gap_limited", 0),
+        "rows_capped_by_anchors": agg.get("rows_capped_by_anchors", 0),
+        "rows_with_single_anchor": agg.get("rows_with_single_anchor", 0),
+        "rows_without_click": agg.get("rows_without_click", 0),
+        "rows_missing_target": agg.get("missing_target", 0),
+        "rows_non_monotonic": agg.get("rows_non_monotonic", 0),
+        "unknown_items": agg.get("unknown_items", 0),
+        "unknown_actions": counters["unknown_actions"],
+        "non_click_actions": counters["non_click_actions"],
     }
     logger.info(
-        f"  + {os.path.basename(path)}: {human_int(kept_rows)}/{human_int(raw_rows)} rows, "
-        f"{human_int(len(tokens))} tokens, avg {stats['avg_items']:.1f} items/row, "
-        f"{human_int(unknown_items)} unknown history items dropped "
+        f"  + {os.path.basename(path)}: {human_int(kept_rows)} rows from "
+        f"{human_int(raw_rows)} records ({stats['anchors_per_record']:.2f}/record), "
+        f"{human_int(len(tokens))} tokens, avg {stats['avg_items']:.1f} events/row, "
+        f"window-capped {human_int(stats['rows_window_truncated'])} "
         f"({time.time() - t0:.1f}s)"
+    )
+    logger.info(
+        f"    limits: anchors {human_int(stats['rows_capped_by_anchors'])}, "
+        f"gap {human_int(stats['rows_gap_limited'])}, "
+        f"min_history {human_int(stats['rows_short'])}, "
+        f"all-history-unknown {human_int(stats['rows_unknown_history'])}, "
+        f"no-click {human_int(stats['rows_without_click'])}, "
+        f"target-not-in-catalog {human_int(stats['rows_missing_target'])}, "
+        f"unknown history items {human_int(stats['unknown_items'])}, "
+        f"out-of-order records {human_int(stats['rows_non_monotonic'])}"
     )
     if tokens_parts:
         tokens_parts.clear()
@@ -1549,6 +1825,34 @@ def limit_levels(catalog: "ItemCatalog", n_levels: Optional[int],
     return ItemCatalog(catalog.item_ids, catalog.is_int, codes, prepared=True)
 
 
+def catalog_collision_stats(catalog: "ItemCatalog") -> Dict[str, int]:
+    """How many items share an identical *semantic* SID.
+
+    When the RQ-VAE dump was built with `--add_unique_id` the last level is the
+    per-collision rank, so it carries no semantics: the semantic prefix is
+    levels[:-1]. Without it, the whole code is the semantic SID.
+    """
+    codes = np.asarray(catalog.sid_codes)
+    if codes.size == 0:
+        return {"semantic_levels": 0, "collision_level": 0,
+                "unique_semantic_sids": 0, "items_with_duplicate_sid": 0,
+                "max_items_per_sid": 0}
+    semantic = codes[:, :-1] if codes.shape[1] > 1 else codes
+    keys = semantic.astype(np.int64)
+    base = int(keys.max()) + 1 if keys.size else 1
+    flat = np.zeros(len(keys), dtype=np.int64)
+    for lvl in range(keys.shape[1]):
+        flat = flat * base + keys[:, lvl]
+    _, counts = np.unique(flat, return_counts=True)
+    return {
+        "semantic_levels": int(semantic.shape[1]),
+        "collision_level": int(codes.shape[1] - semantic.shape[1]),
+        "unique_semantic_sids": int(len(counts)),
+        "items_with_duplicate_sid": int(counts[counts > 1].sum()) if len(counts) else 0,
+        "max_items_per_sid": int(counts.max()) if len(counts) else 0,
+    }
+
+
 def _load_catalog(path: str, args, logger: logging.Logger) -> "ItemCatalog":
     if path.lower().endswith((".json", ".jsonl")):
         return load_catalog_from_json(path, args, logger)
@@ -1599,6 +1903,14 @@ def preprocess(args, logger: logging.Logger) -> Dict[str, Any]:
 
     catalog = _load_catalog(args.catalog_path, args, logger)
     catalog = limit_levels(catalog, args.num_sid_levels, logger)
+    collisions = catalog_collision_stats(catalog)
+    logger.info(
+        f"  + collisions: {human_int(collisions['unique_semantic_sids'])} distinct "
+        f"semantic SIDs over {human_int(catalog.size)} items "
+        f"({human_int(collisions['items_with_duplicate_sid'])} items share one, "
+        f"max {collisions['max_items_per_sid']}/group); collision level tokenised: "
+        f"{'yes' if collisions['collision_level'] else 'no'}"
+    )
 
     seq_schema = detect_sequence_schema(args.sequence_path, args)
     logger.info(f"  > sequence schema: {describe_schema(seq_schema)}")
@@ -1637,12 +1949,12 @@ def preprocess(args, logger: logging.Logger) -> Dict[str, Any]:
     logger.info(f"  + wrote vocab.json / catalog_* / users_* / gap_edges.npy -> {out_dir}")
 
     # --- 3. tokenise the splits -------------------------------------------
-    def build(path, schema, wanted, limit, require_target=True,
+    def build(path, schema, wanted, limit, mode=MODE_TRAIN,
               keep_rows=None, dir_name=None):
         # Streaming: the token stream lands directly in <out_dir>/<dir_name>/tokens.npy
         return build_tokenized_split(
             path, schema, catalog, vocab, user_map, gap_edges, args, logger,
-            wanted_split=wanted, require_target=require_target, row_limit=limit,
+            wanted_split=wanted, mode=mode, row_limit=limit,
             keep_rows=keep_rows,
             stream_dir=os.path.join(out_dir, dir_name) if dir_name else None,
         )
@@ -1654,12 +1966,12 @@ def preprocess(args, logger: logging.Logger) -> Dict[str, Any]:
         train_split = build(args.sequence_path, seq_schema, None, args.max_rows,
                             dir_name="train")
         val_split = build(args.val_sequence_path, val_schema, None, args.max_val_rows,
-                          dir_name="val")
+                          mode=MODE_VAL, dir_name="val")
     elif seq_schema.split_col is not None:
         train_split = build(args.sequence_path, seq_schema, "train", args.max_rows,
                             dir_name="train")
         val_split = build(args.sequence_path, seq_schema, "val", args.max_val_rows,
-                          dir_name="val")
+                          mode=MODE_VAL, dir_name="val")
     else:
         # Single file without a split column: hash users, not rows, so a user's
         # whole history stays on one side (the two passes filter rows before
@@ -1684,7 +1996,7 @@ def preprocess(args, logger: logging.Logger) -> Dict[str, Any]:
         train_split = build(args.sequence_path, seq_schema, None, args.max_rows,
                             keep_rows=~val_mask, dir_name="train")
         val_split = build(args.sequence_path, seq_schema, None, args.max_rows,
-                          keep_rows=val_mask, dir_name="val")
+                          mode=MODE_VAL, keep_rows=val_mask, dir_name="val")
 
     if len(train_split) == 0:
         raise SystemExit("training split is empty; check --min_history and the catalog")
@@ -1699,9 +2011,9 @@ def preprocess(args, logger: logging.Logger) -> Dict[str, Any]:
     stats["val"] = val_split.stats
 
     if infer_schema is not None:
-        # No leave-one-out: inference keeps the whole history and has no label.
+        # No anchor: inference keeps the whole windowed history and has no label.
         infer_split = build(args.infer_sequence_path, infer_schema, None,
-                            args.max_rows, require_target=False, dir_name="infer")
+                            args.max_rows, mode=MODE_INFER, dir_name="infer")
         if len(infer_split):
             save_split(infer_split, os.path.join(out_dir, "infer"))
             splits["infer"] = int(len(infer_split))
@@ -1725,6 +2037,12 @@ def preprocess(args, logger: logging.Logger) -> Dict[str, Any]:
         "split_stats": stats,
         "catalog_size": int(catalog.size),
         "num_levels": int(catalog.num_levels),
+        "catalog_collisions": collisions,
+        "clicks_only": bool(args.clicks_only),
+        "action_click_value": float(args.action_click_value),
+        "anchors_per_record": int(args.anchors_per_record),
+        "anchor_gap": int(args.anchor_gap),
+        "history_actions_col": seq_schema.history_actions_col,
         "vocab_size": int(vocab.total_size),
         "sid_sizes": list(vocab.sid_sizes),
         "sid_offsets": list(vocab.sid_offsets),
@@ -1732,7 +2050,8 @@ def preprocess(args, logger: logging.Logger) -> Dict[str, Any]:
         "offset_profile": int(vocab.offset_profile),
         "n_temporal_bins": int(vocab.n_temporal),
         "n_users": int(user_map.n_profile - 1),
-        "max_seq_len": int(args.max_seq_len),
+        "max_seq_len": int(args.window),      # kept for train_digr.py
+        "window": int(args.window),
         "min_history": int(args.min_history),
         "max_gap_seconds": float(args.max_gap_seconds),
         "val_ratio": float(args.val_ratio),
@@ -1747,11 +2066,17 @@ def preprocess(args, logger: logging.Logger) -> Dict[str, Any]:
         "summary",
         {
             "Catalog": f"{human_int(catalog.size)} items x {catalog.num_levels} levels",
+            "Collisions": f"{human_int(collisions['items_with_duplicate_sid'])} dup items, "
+                          f"max {collisions['max_items_per_sid']}/group",
+            "Clicks only": str(bool(args.clicks_only)),
             "Tokens": human_int(vocab.total_size),
             "Users": human_int(user_map.n_profile - 1),
+            "Rows / record": f"{stats['train']['anchors_per_record']:.2f} train, "
+                             f"{stats['val']['anchors_per_record']:.2f} val",
             "Train / val": f"{human_int(splits['train'])} / {human_int(splits['val'])}",
             "Infer": human_int(splits.get("infer", 0)),
-            "Max history": f"{args.max_seq_len} items",
+            "Window": f"{args.window} events",
+            "Anchors": f"k={args.anchors_per_record}, gap>={args.anchor_gap} events",
             "Output": os.path.abspath(out_dir),
             "Elapsed": f"{time.time() - t_all:.1f}s",
         },
@@ -1796,13 +2121,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--seq_col", type=str, default=None, help="list<struct> interaction column")
     p.add_argument("--history_col", type=str, default=None, help="flat list<int> history column")
     p.add_argument("--history_ts_col", type=str, default=None)
+    p.add_argument("--history_actions_col", type=str, default=None,
+                   help="flat list column of action types aligned with "
+                        "--history_col (auto-detected as history_actions/actions)")
     p.add_argument("--target_col", type=str, default=None)
     p.add_argument("--split_col", type=str, default=None)
     p.add_argument("--item_key", type=str, default=None)
     p.add_argument("--ts_key", type=str, default=None)
     p.add_argument("--action_key", type=str, default=None)
-    p.add_argument("--action_click_value", type=float, default=1.0)
-    p.add_argument("--target_from_last_click", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--action_click_value", type=float, default=1.0,
+                   help="value of `action_type` that counts as a click")
+    p.add_argument("--clicks_only", action=argparse.BooleanOptionalAction, default=False,
+                   help="keep only action_type==--action_click_value events in the "
+                        "history (default keeps every event: clicks, exposures and "
+                        "null actions all count as history, only clicks can be a "
+                        "target)")
 
     # catalog schema overrides
     p.add_argument("--catalog_item_col", type=str, default=None)
@@ -1813,14 +2146,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="subtract this from every SID code read from a .json "
                         "catalog (use 1 for 1-based code dumps)")
     p.add_argument("--num_sid_levels", type=int, default=DEFAULT_NUM_SID_LEVELS,
-                   help="keep only the first N SID levels; `index_rqvae_prod.json` "
-                        "appends an `--add_unique_id` collision rank as the last "
-                        "code, which is not a semantic level (<=0 keeps all)")
+                   help="keep only the first N SID levels; 0 (the default) keeps "
+                        "every level, i.e. the `--add_unique_id` collision rank is "
+                        "tokenised as the last SID level. Use 4 to drop it.")
 
     # tokenisation
-    p.add_argument("--max_seq_len", type=int, default=DEFAULT_MAX_SEQ_LEN,
-                   help="history items kept per row (the most recent ones)")
-    p.add_argument("--min_history", type=int, default=DEFAULT_MIN_HISTORY)
+    p.add_argument("--window", "--max_seq_len", dest="window", type=int,
+                   default=DEFAULT_WINDOW,
+                   help="events of history kept before each anchor (the most "
+                        "recent ones)")
+    p.add_argument("--min_history", type=int, default=DEFAULT_MIN_HISTORY,
+                   help="events of history a row needs to be kept")
+    p.add_argument("--anchors_per_record", type=int, default=DEFAULT_ANCHORS_PER_RECORD,
+                   help="max rows one record may produce (its most recent clicks)")
+    p.add_argument("--anchor_gap", type=int, default=DEFAULT_ANCHOR_GAP,
+                   help="minimum distance in events between two accepted anchors "
+                        "of one record; skipped clicks do not count against "
+                        "--anchors_per_record")
     p.add_argument("--n_temporal_bins", type=int, default=DEFAULT_N_TEMPORAL_BINS)
     p.add_argument("--max_gap_seconds", type=float, default=DEFAULT_MAX_GAP_SECONDS)
     p.add_argument("--max_rows", type=int, default=None)
@@ -1837,6 +2179,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     args.seq_col = _none_if_blank(args.seq_col)
     args.history_col = _none_if_blank(args.history_col)
     args.history_ts_col = _none_if_blank(args.history_ts_col)
+    args.history_actions_col = _none_if_blank(args.history_actions_col)
     args.target_col = _none_if_blank(args.target_col)
     args.split_col = _none_if_blank(args.split_col)
     args.item_key = _none_if_blank(args.item_key)
@@ -1848,10 +2191,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
     if args.n_temporal_bins < 1:
         p.error("--n_temporal_bins must be >= 1")
-    if args.max_seq_len < 1:
-        p.error("--max_seq_len must be >= 1")
-    if args.min_history < 0:
-        p.error("--min_history must be >= 0")
+    if args.window < 1:
+        p.error("--window must be >= 1")
+    if args.min_history < 1:
+        p.error("--min_history must be >= 1")
+    if args.anchors_per_record < 1:
+        p.error("--anchors_per_record must be >= 1")
+    if args.anchor_gap < 0:
+        p.error("--anchor_gap must be >= 0")
     if not 0.0 <= args.val_ratio < 1.0:
         p.error("--val_ratio must be in [0, 1)")
     if args.read_batch_size < 1:
