@@ -33,6 +33,23 @@ Inputs (defaults match the repo snapshots in `data_snapshot.md`)
      `history_items`/`target`, but with 1-BASED CATALOG INDICES and no
      `user_id`; remap those indices to raw item ids before using them here.
 
+`--user_feat_path` (optional parquet, one row per user) -- STATIC USER CONTEXT
+-----------------------------------------------------------------------------
+  Every column except the user id is tokenised into a per-user feature block
+  that opens the row (before the history).  The id column is
+  `--user_feat_id_col` (auto-detected: user_id / userid / uid / user / ...); the
+  tokenised columns are `--user_feat_cols` (default: every other column, in file
+  order).  The raw user id itself is never a token.
+  * value tokens are per column: column c owns its own contiguous range, so two
+    columns can never share a token id even when their values overlap;
+  * a scalar column takes one slot; a list column takes one slot per value
+    (order preserved, capped at `--max_feat_len` slots, 0 = the longest list
+    actually seen); a missing value (null, empty list) takes that column's UNK
+    token;
+  * a user absent from the file gets every column's UNK token;
+  * a duplicated user id is rejected instead of silently picking a row;
+  * the per-split `users.npy` still holds the raw user ids (for evaluation).
+
 Anchors -- how many rows one record produces
 ---------------------------------------------
   * an ANCHOR is an event whose item becomes the label `y`; only clicks
@@ -79,7 +96,10 @@ Outputs (`--output_dir`, default `digr_data/`)
   catalog_item_ids.npy           catalog order == the label space y
   catalog_sid_codes.npy          [|I|, L] int32 SID codes
   catalog_meta.json              {is_int, size, num_levels}
-  users.npy / users_meta.json    profile vocabulary (raw user ids)
+  user_feat_meta.json            static-feature columns, cardinalities,
+                                 block lengths, value counters
+  users.npy / users_meta.json    legacy empty profile vocabulary
+                                 (read by train_digr.py, holds no user)
   gap_edges.npy                  temporal bin edges
   train/ val/ [infer/]           tokens.npy, offsets.npy, targets.npy,
                                  users.npy, stats.json  (int32 CSR per row)
@@ -91,12 +111,14 @@ Outputs (`--output_dir`, default `digr_data/`)
 rows_window_truncated / rows_gap_limited / rows_capped_by_anchors /
 rows_with_single_anchor / rows_without_click / rows_missing_target /
 rows_non_monotonic / unknown_items / unknown_actions / non_click_actions /
-tokens / avg_items / anchors_per_record.
+feat_tokens / rows_not_in_feat_file / tokens / avg_items / anchors_per_record.
 
 Token layout written per row (one slot per interaction, as in the plan):
-  [U, (T_1, S_1_1 .. S_1_L), (T_2, S_2_1 .. S_2_L), ...]   len = 1 + T*(1+L)
+  [F_1 .. F_M, SEP, (T_1, S_1_1 .. S_1_L), (T_2, S_2_1 .. S_2_L), ...]
+  len = 1 + M + T*(1+L)
   T <= --window: the events of history, newest last, anchor excluded.
-  U   = offset_profile + dense user index (0 = UNK)
+  F_j = offset_features + local id of the j-th slot of the user's feature block
+        (M slots, one block per user, M = 0 without --user_feat_path)
   T_i = offset_temporal + log-spaced gap bin (first interaction = bin 0)
   S_i = sid_offsets[l] + code_l
 
@@ -153,7 +175,9 @@ DEFAULT_ANCHORS_PER_RECORD = 3      # upper bound on rows per record
 DEFAULT_ANCHOR_GAP = 5              # events between two anchors of one record
 DEFAULT_N_TEMPORAL_BINS = 64
 DEFAULT_MAX_GAP_SECONDS = 30 * 24 * 3600
-DEFAULT_MAX_PROFILE_TOKENS = 65536
+DEFAULT_MAX_FEAT_LEN = 0            # 0 = the longest list actually seen
+FEATURE_ID_CANDIDATES = ("user_id", "userid", "uid", "user",
+                         "user_key", "visitor_id", "id")
 DEFAULT_READ_BATCH_SIZE = 8192
 DEFAULT_VAL_RATIO = 0.02
 DEFAULT_NUM_SID_LEVELS = 0         # 0 = keep every catalog level, incl. the
@@ -171,6 +195,9 @@ MODE_INFER = "infer"                # no label, the whole windowed history
 
 BANNER_WIDTH = 88
 MANIFEST_NAME = "preprocess_meta.json"
+# Files that must exist inside digr_data/<split>/ for `load_split` to accept it.
+SPLIT_FILES = ("tokens.npy", "offsets.npy", "targets.npy", "users.npy",
+               "stats.json")
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +440,11 @@ class IdIndex:
 
 
 class UserMap:
-    """Dense profile index: raw user id -> 1..N (0 = UNK profile token)."""
+    """Legacy dense profile index (kept so old train checkpoints still load).
+
+    Users are no longer tokenised: static user context comes from
+    `--user_feat_path`.  New datasets write an empty map here.
+    """
 
     def __init__(self, users, is_int: bool):
         self.index = IdIndex(users, is_int, prepared=False)
@@ -436,17 +467,381 @@ class UserMap:
         return cls(users, bool(meta["is_int"]))
 
 
+@dataclass
+class FeatureColumn:
+    """One tokenised `--user_feat_path` column.
+
+    `cardinality` distinct values occupy `cardinality` tokens; the next id is
+    that column's UNK slot, used for a missing value (null, empty list or a code
+    that never appeared).  Columns never share ids, so two columns with the same
+    values stay distinguishable.
+    """
+
+    name: str
+    is_list: bool
+    cardinality: int
+    max_len: int = 1            # slots one row may take (list cap; 1 for scalars)
+
+    @property
+    def size(self) -> int:
+        return int(self.cardinality) + 1     # values + one UNK slot
+
+
+class UserFeatureMap:
+    """Static user attributes as one flat, per-user token block (CSR).
+
+    Row `u` owns `codes[offsets[u]:offsets[u + 1]]`: for every column, in file
+    order, its values (list) or its single value (scalar), already mapped to a
+    LOCAL token id in `[0, n_local)`.  The final token id is
+    `vocab.offset_features + local id`, which is why the local layout (values of
+    a column, then its UNK slot, columns back to back) must match the vocabulary
+    layout exactly -- `Vocab.feature_sizes` is built from `columns`.
+
+    The last row (`n_rows`) is synthetic and holds every column's UNK slot, so a
+    user that is absent from the file still gets a full block: the block length
+    stays a property of the columns, and the row offsets stay a plain cumsum.
+    """
+
+    def __init__(self, columns, user_ids, is_int: bool, codes, offsets,
+                 counters: Optional[Dict[str, Any]] = None,
+                 path: Optional[str] = None, id_column: Optional[str] = None):
+        self.columns: List[FeatureColumn] = list(columns)
+        self.codes = np.asarray(codes, dtype=np.int32)
+        self.offsets = np.asarray(offsets, dtype=np.int64)
+        self.index = IdIndex(user_ids, is_int, prepared=False)
+        self.counters: Dict[str, int] = dict(counters or {})
+        self.path = path
+        self.id_column = id_column
+
+        self.local_bases: List[int] = []
+        cursor = 0
+        for col in self.columns:
+            self.local_bases.append(cursor)
+            cursor += col.size
+        self.n_local = cursor
+        if len(self.offsets) != self.n_rows + 2:
+            raise ValueError(
+                f"feature offsets must describe {self.n_rows} users + 1 UNK row, "
+                f"got {len(self.offsets) - 1} rows"
+            )
+
+    @classmethod
+    def empty(cls) -> "UserFeatureMap":
+        return cls([], np.empty(0, dtype=np.int64), True,
+                   np.zeros(0, dtype=np.int32), np.zeros(2, dtype=np.int64))
+
+    @property
+    def n_rows(self) -> int:
+        return len(self.offsets) - 2          # the last row is the UNK block
+
+    @property
+    def n_columns(self) -> int:
+        return len(self.columns)
+
+    @property
+    def max_len(self) -> int:
+        if len(self.offsets) < 2:
+            return 0
+        return int(np.max(np.diff(self.offsets))) if len(self.offsets) > 1 else 0
+
+    def lookup(self, raw_users) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Raw user ids -> (row index, block start, block length)."""
+        idx = self.index.lookup(raw_users)
+        idx = np.where(idx < 0, self.n_rows, idx).astype(np.int64)
+        start = self.offsets[idx]
+        return idx, start, self.offsets[idx + 1] - start
+
+    def meta(self) -> Dict[str, Any]:
+        lens = np.diff(self.offsets) if len(self.offsets) > 1 else np.zeros(1, np.int64)
+        return {
+            "path": self.path,
+            "id_column": self.id_column,
+            "n_users": int(self.n_rows),
+            "n_columns": int(self.n_columns),
+            "columns": [
+                {"name": c.name, "is_list": bool(c.is_list),
+                 "cardinality": int(c.cardinality), "max_len": int(c.max_len),
+                 "size": int(c.size), "local_base": int(b)}
+                for c, b in zip(self.columns, self.local_bases)
+            ],
+            "block_len_min": int(lens.min()),
+            "block_len_max": int(lens.max()),
+            "block_len_mean": round(float(lens.mean()), 2),
+            "counters": dict(self.counters),
+        }
+
+    def save(self, out_dir: str) -> None:
+        with open(os.path.join(out_dir, "user_feat_meta.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(self.meta(), f, indent=2)
+
+
+def _feature_values(col, name: str, path: str) -> Tuple[np.ndarray, np.ndarray]:
+    """(int64 values in row order, slots per row) of one feature column.
+
+    Nulls become `_INT64_SENTINEL`; they keep their slot and turn into the
+    column's UNK token later.  A scalar column always takes exactly one slot, so
+    its block length does not depend on whether the value is present.
+    """
+    if _is_list_type(col.type):
+        lens = _lengths_array(col)
+        vals, is_int = normalize_ids(_col_to_numpy(_flatten_list(col)))
+        if not is_int:
+            raise SystemExit(
+                f"{path}: column '{name}' holds non-numeric values; integers only "
+                "(drop it with --user_feat_cols)"
+            )
+        if len(vals) != int(lens.sum()):
+            raise ValueError(
+                f"{path}: column '{name}' flattening mismatch "
+                f"({len(vals)} values for {int(lens.sum())} slots)"
+            )
+        return vals, lens
+    vals, is_int = normalize_ids(_col_to_numpy(col))
+    if not is_int:
+        raise SystemExit(
+            f"{path}: column '{name}' holds non-numeric values; integers only "
+            "(drop it with --user_feat_cols)"
+        )
+    return vals, np.ones(len(vals), dtype=np.int64)
+
+
+def _encode_feature_column(raw, lens, col: FeatureColumn, values: np.ndarray,
+                           local_base: int, counters: Dict[str, int]
+                           ) -> Tuple[np.ndarray, np.ndarray]:
+    """-> (slots per row, local token per slot) for one column of one batch."""
+    if col.is_list:
+        take = np.minimum(lens, int(col.max_len))
+    else:
+        take = np.ones_like(lens)
+    counters["values_truncated"] += int((lens - take).sum())
+
+    absent = take <= 0
+    slot_len = np.where(absent, 1, take).astype(np.int64)
+    row_base = np.concatenate([[0], np.cumsum(slot_len)[:-1]]).astype(np.int64)
+    out = np.empty(int(slot_len.sum()), dtype=np.int32)
+    unk_tok = np.int32(local_base + int(col.cardinality))
+    if absent.any():
+        out[row_base[absent]] = unk_tok
+
+    keep_n = np.where(absent, 0, take).astype(np.int64)
+    n_keep = int(keep_n.sum())
+    if n_keep:
+        row_of = np.repeat(np.arange(len(lens), dtype=np.int64), keep_n)
+        kbase = np.concatenate([[0], np.cumsum(keep_n)[:-1]]).astype(np.int64)
+        within = np.arange(n_keep, dtype=np.int64) - kbase[row_of]
+        src = np.concatenate([[0], np.cumsum(lens)[:-1]])[row_of] + within
+        dst = row_base[row_of] + within
+        vals = raw[src]
+        if len(values):
+            pos = np.clip(np.searchsorted(values, vals), 0, len(values) - 1)
+            known = values[pos] == vals
+        else:
+            pos = np.zeros(len(vals), dtype=np.int64)
+            known = np.zeros(len(vals), dtype=bool)
+        counters["values_unknown"] += int(
+            (~known & (vals != _INT64_SENTINEL)).sum()
+        )
+        out[dst] = np.where(known, local_base + pos, unk_tok).astype(np.int32)
+    return slot_len, out
+
+
+def _interleave_feature_blocks(slot_lens: List[np.ndarray],
+                               col_tokens: List[np.ndarray]
+                               ) -> Tuple[np.ndarray, np.ndarray]:
+    """Column blocks (all rows of one column) -> per-row blocks (all columns)."""
+    n = len(slot_lens[0]) if slot_lens else 0
+    rows = np.arange(n, dtype=np.int64)
+    row_tot = np.zeros(n, dtype=np.int64)
+    for sl in slot_lens:
+        row_tot += sl
+    row_base = np.concatenate([[0], np.cumsum(row_tot)[:-1]]).astype(np.int64)
+    block = np.empty(int(row_tot.sum()), dtype=np.int32)
+    pre = np.zeros(n, dtype=np.int64)          # slots taken by earlier columns
+    for sl, toks in zip(slot_lens, col_tokens):
+        n_slots = int(toks.size)
+        if n_slots:
+            row_of = np.repeat(rows, sl)
+            cbase = np.concatenate([[0], np.cumsum(sl)[:-1]]).astype(np.int64)
+            within = np.arange(n_slots, dtype=np.int64) - cbase[row_of]
+            block[row_base[row_of] + pre[row_of] + within] = toks
+        pre = pre + sl
+    return block, row_tot
+
+
+def _detect_feature_id_col(names: Sequence[str], explicit: Optional[str]) -> str:
+    if explicit is not None:
+        if explicit not in names:
+            raise SystemExit(
+                f"--user_feat_id_col '{explicit}' is not a column of the feature "
+                f"file ({list(names)})"
+            )
+        return explicit
+    for cand in FEATURE_ID_CANDIDATES:
+        if cand in names:
+            return cand
+    for name in names:
+        if "user" in name.lower():
+            return name
+    raise SystemExit(
+        f"cannot find the user id column among {list(names)}; "
+        "pass --user_feat_id_col"
+    )
+
+
+def build_user_feature_map(path: str, args, logger: logging.Logger) -> UserFeatureMap:
+    """Read `--user_feat_path` into a per-user token block (two passes)."""
+    t0 = time.time()
+    pf = pq.ParquetFile(path)
+    names = list(pf.schema_arrow.names)
+    id_col = _detect_feature_id_col(names, getattr(args, "user_feat_id_col", None))
+    wanted = ([str(c) for c in args.user_feat_cols]
+              if getattr(args, "user_feat_cols", None)
+              else [n for n in names if n != id_col])
+    if id_col in wanted:
+        raise SystemExit(f"--user_feat_cols must not contain the id column '{id_col}'")
+    for name in wanted:
+        if name not in names:
+            raise SystemExit(
+                f"--user_feat_cols: '{name}' is not a column of {path} ({names})"
+            )
+    if not wanted:
+        raise SystemExit(f"{path} has no column to tokenise besides '{id_col}'")
+
+    cap = int(getattr(args, "max_feat_len", 0) or 0)
+    read = int(getattr(args, "read_batch_size", DEFAULT_READ_BATCH_SIZE))
+
+    # --- pass 1: every value that exists becomes a token of its column -------
+    seen: Dict[str, set] = {name: set() for name in wanted}
+    is_list: Dict[str, bool] = {name: False for name in wanted}
+    obs_max: Dict[str, int] = {name: 0 for name in wanted}
+    counters: Dict[str, int] = {"values_null": 0, "values_unknown": 0,
+                                "values_truncated": 0}
+    rows_seen = 0
+    for batch in pf.iter_batches(batch_size=read, columns=wanted):
+        rows_seen += batch.num_rows
+        for name in wanted:
+            col = batch.column(batch.schema.get_field_index(name))
+            is_list[name] = _is_list_type(col.type)
+            vals, lens = _feature_values(col, name, path)
+            bad = vals == _INT64_SENTINEL
+            counters["values_null"] += int(bad.sum())
+            good = vals[~bad]
+            if good.size:
+                seen[name].update(np.unique(good).tolist())
+            if lens.size:
+                obs_max[name] = max(obs_max[name], int(lens.max()))
+
+    columns: List[FeatureColumn] = []
+    values: List[np.ndarray] = []
+    local_bases: List[int] = []
+    cursor = 0
+    for name in wanted:
+        vals = np.asarray(sorted(seen[name]), dtype=np.int64)
+        if is_list[name]:
+            length = cap if cap > 0 else max(1, obs_max[name])
+        else:
+            length = 1
+        columns.append(FeatureColumn(name=name, is_list=bool(is_list[name]),
+                                     cardinality=int(len(vals)),
+                                     max_len=int(length)))
+        values.append(vals)
+        local_bases.append(cursor)
+        cursor += len(vals) + 1
+
+    # --- pass 2: encode every user into its block ---------------------------
+    code_parts: List[np.ndarray] = []
+    len_parts: List[np.ndarray] = []
+    user_parts: List[np.ndarray] = []
+    null_id_rows = 0
+    for batch in pf.iter_batches(batch_size=read, columns=[id_col] + wanted):
+        users, id_is_int = normalize_ids(_col_to_numpy(batch.column(0)))
+        if not id_is_int:
+            raise SystemExit(
+                f"{path}: '{id_col}' holds non-numeric ids; integers only "
+                "(pass --user_feat_id_col if this is not the user id)"
+            )
+        keep_rows = users != _INT64_SENTINEL
+        if not keep_rows.all():
+            null_id_rows += int((~keep_rows).sum())
+            users = users[keep_rows]
+            batch = batch.filter(pa.array(keep_rows))
+        if batch.num_rows == 0:
+            continue
+        slot_lens: List[np.ndarray] = []
+        col_tokens: List[np.ndarray] = []
+        for i, (col_def, vals, base) in enumerate(zip(columns, values, local_bases)):
+            raw, lens = _feature_values(batch.column(i + 1), col_def.name, path)
+            sl, toks = _encode_feature_column(raw, lens, col_def, vals, base, counters)
+            slot_lens.append(sl)
+            col_tokens.append(toks)
+        block_codes, row_tot = _interleave_feature_blocks(slot_lens, col_tokens)
+        code_parts.append(block_codes)
+        len_parts.append(row_tot)
+        user_parts.append(users)
+
+    codes = np.concatenate(code_parts) if code_parts else np.zeros(0, np.int32)
+    row_tot = np.concatenate(len_parts) if len_parts else np.zeros(0, np.int64)
+    users = np.concatenate(user_parts) if user_parts else np.zeros(0, np.int64)
+    if len(users):
+        uniq, counts = np.unique(users, return_counts=True)
+        dup = uniq[counts > 1]
+        if dup.size:
+            raise SystemExit(
+                f"{path}: user id {int(dup[0])} appears {int(counts[counts > 1][0])} "
+                f"times ({int(dup.size)} duplicated ids); the feature file needs "
+                "exactly one row per user"
+            )
+
+    offsets = np.concatenate([[0], np.cumsum(row_tot)]).astype(np.int64)
+    absent = np.asarray([base + col.cardinality
+                         for base, col in zip(local_bases, columns)], dtype=np.int32)
+    codes = np.concatenate([codes.astype(np.int32), absent])
+    offsets = np.concatenate([offsets, np.asarray([offsets[-1] + len(absent)],
+                                                  dtype=np.int64)])
+
+    counters["rows_read"] = int(rows_seen)
+    counters["rows_null_id"] = int(null_id_rows)
+    feat_map = UserFeatureMap(columns, users, True, codes, offsets, counters,
+                              path=path, id_column=id_col)
+    logger.info(
+        f"  + user features from {path}: {human_int(feat_map.n_rows)} users x "
+        f"{len(columns)} columns -> {human_int(cursor)} tokens "
+        f"(block {int(np.diff(offsets).min())}-{feat_map.max_len}, "
+        f"{int(codes.size)} codes, {time.time() - t0:.1f}s)"
+    )
+    for col in columns:
+        logger.info(
+            f"      {col.name}: {'list' if col.is_list else 'scalar'}, "
+            f"{human_int(col.cardinality)} values (+UNK), "
+            f"max {human_int(col.max_len)} slots/row"
+        )
+    if counters["values_truncated"]:
+        logger.info(
+            f"      ! {human_int(counters['values_truncated'])} values truncated "
+            f"by --max_feat_len {cap}"
+        )
+    if null_id_rows:
+        logger.info(f"      ! {human_int(null_id_rows)} rows without a user id skipped")
+    return feat_map
+
+
 # ---------------------------------------------------------------------------
 # Phase 1: vocabulary partition + catalog
 # ---------------------------------------------------------------------------
 
 @dataclass
 class Vocab:
-    """Contiguous, disjoint token ranges (the table from the plan)."""
+    """Contiguous, disjoint token ranges (the table from the plan).
+
+    `feature_sizes[c]` is the size of static-feature column c: its distinct
+    values plus one UNK slot at the end.  Columns keep separate ranges, so two
+    columns never share a token id even when their values overlap.
+    """
 
     sid_sizes: List[int]
     n_temporal: int
-    n_profile: int
+    feature_sizes: Optional[List[int]] = None
     n_special: int = 2          # PAD = 0, SEP/BOS = 1
     pad_id: int = 0
     sep_id: int = 1
@@ -459,6 +854,12 @@ class Vocab:
         self.sid_sizes = [int(s) for s in self.sid_sizes]
         if any(s < 1 for s in self.sid_sizes):
             raise ValueError(f"invalid SID level sizes: {self.sid_sizes}")
+        self.feature_sizes = [int(s) for s in (self.feature_sizes or [])]
+        if any(s < 2 for s in self.feature_sizes):
+            raise ValueError(
+                f"invalid feature sizes (a column needs 1 value + 1 UNK): "
+                f"{self.feature_sizes}"
+            )
 
         cursor = int(self.n_special)
         self.sid_offsets: List[int] = []
@@ -467,25 +868,43 @@ class Vocab:
             cursor += size
         self.offset_temporal = cursor
         cursor += int(self.n_temporal)
-        self.offset_profile = cursor
-        cursor += int(self.n_profile)
+        self.offset_features = cursor
+        self.feature_offsets: List[int] = []
+        for size in self.feature_sizes:
+            self.feature_offsets.append(cursor)
+            cursor += size
         self.total_size = cursor
 
     @property
     def num_levels(self) -> int:
         return len(self.sid_sizes)
 
+    @property
+    def num_features(self) -> int:
+        return len(self.feature_sizes)
+
+    @property
+    def feature_unk_ids(self) -> List[int]:
+        return [off + size - 1
+                for off, size in zip(self.feature_offsets, self.feature_sizes)]
+
+    def feature_local_bases(self) -> List[int]:
+        """Where each column starts inside the feature block (row relative)."""
+        return [off - self.offset_features for off in self.feature_offsets]
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "sid_sizes": list(self.sid_sizes),
             "n_temporal": int(self.n_temporal),
-            "n_profile": int(self.n_profile),
+            "feature_sizes": list(self.feature_sizes),
             "n_special": int(self.n_special),
             "pad_id": int(self.pad_id),
             "sep_id": int(self.sep_id),
             "sid_offsets": list(self.sid_offsets),
             "offset_temporal": int(self.offset_temporal),
-            "offset_profile": int(self.offset_profile),
+            "offset_features": int(self.offset_features),
+            "feature_offsets": list(self.feature_offsets),
+            "feature_unk_ids": list(self.feature_unk_ids),
             "total_size": int(self.total_size),
             "num_levels": int(self.num_levels),
         }
@@ -495,7 +914,7 @@ class Vocab:
         return cls(
             sid_sizes=list(d["sid_sizes"]),
             n_temporal=int(d["n_temporal"]),
-            n_profile=int(d["n_profile"]),
+            feature_sizes=list(d.get("feature_sizes") or []),
             n_special=int(d.get("n_special", 2)),
             pad_id=int(d.get("pad_id", 0)),
             sep_id=int(d.get("sep_id", 1)),
@@ -748,7 +1167,7 @@ def load_catalog_from_json(path: str, args, logger: logging.Logger) -> ItemCatal
     return catalog
 
 
-def build_vocab(catalog: ItemCatalog, user_map: UserMap, args) -> Vocab:
+def build_vocab(catalog: ItemCatalog, feat_map: UserFeatureMap, args) -> Vocab:
     if catalog.size == 0:
         raise ValueError("empty catalog")
     maxima = catalog.sid_codes.max(axis=0).astype(np.int64) + 1
@@ -759,7 +1178,7 @@ def build_vocab(catalog: ItemCatalog, user_map: UserMap, args) -> Vocab:
     return Vocab(
         sid_sizes=sizes,
         n_temporal=int(args.n_temporal_bins),
-        n_profile=int(user_map.n_profile),
+        feature_sizes=[col.size for col in feat_map.columns],
     )
 
 
@@ -1312,12 +1731,12 @@ def assemble_chunk(
     user_raw: np.ndarray,
     catalog: ItemCatalog,
     vocab: Vocab,
-    user_map: UserMap,
+    feat_map: UserFeatureMap,
     gap_edges: np.ndarray,
     mode: str,
     args,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, int]]:
-    """Vectorised [U, (T, S1..SL), ...] construction for one parquet batch.
+    """Vectorised [F.., SEP, (T, S1..SL), ...] construction for one parquet batch.
 
     Returns (tokens, offsets, targets, users, history_lengths, stats).  One input
     record can produce several rows (up to `--anchors_per_record`), and rows can
@@ -1339,6 +1758,8 @@ def assemble_chunk(
         "rows_with_single_anchor": 0,
         "rows_non_monotonic": 0,
         "items_kept": 0,
+        "feat_tokens": 0,
+        "rows_not_in_feat_file": 0,
     }
 
     def _empty():
@@ -1463,38 +1884,53 @@ def assemble_chunk(
         if n_keep == 0:
             return _empty()
 
-    # --- 4. write tokens ----------------------------------------------------
+    # --- 4. write [feature block, SEP, history] -----------------------------
     L = catalog.num_levels
     if vocab.num_levels != L:
         raise AssertionError(
             f"vocab has {vocab.num_levels} SID levels but the catalog has "
             f"{L}; rebuild the vocab from this catalog"
         )
-    out_len = 1 + m * (1 + L)
-    offsets = np.concatenate([[0], np.cumsum(out_len)]).astype(np.int64)
+    if vocab.num_features != feat_map.n_columns:
+        raise AssertionError(
+            f"vocab has {vocab.num_features} feature columns but the feature map "
+            f"has {feat_map.n_columns}; rebuild the vocab from this feature file"
+        )
+
+    feat_row, feat_start, feat_len = feat_map.lookup(user_raw[anchor_row])
+    row_len = 1 + feat_len + m * (1 + L)
+    offsets = np.concatenate([[0], np.cumsum(row_len)]).astype(np.int64)
     tokens = np.zeros(int(offsets[-1]), dtype=np.int32)
+    tokens[offsets[:-1] + feat_len] = vocab.sep_id
+
+    total_feat = int(feat_len.sum())
+    if total_feat:
+        row_of_f = np.repeat(np.arange(n_keep, dtype=np.int64), feat_len)
+        fbase = np.concatenate([[0], np.cumsum(feat_len)[:-1]]).astype(np.int64)
+        within_f = np.arange(total_feat, dtype=np.int64) - fbase[row_of_f]
+        tokens[offsets[row_of_f] + within_f] = (
+            feat_map.codes[feat_start[row_of_f] + within_f] + vocab.offset_features
+        )
 
     row_m_base = np.concatenate([[0], np.cumsum(m)[:-1]]).astype(np.int64)
     pos_local = np.arange(len(hist_idx), dtype=np.int64) - row_m_base[row_of_h]
-    base = offsets[row_of_h] + 1 + pos_local * (1 + L)
+    base = offsets[row_of_h] + feat_len[row_of_h] + 1 + pos_local * (1 + L)
     tokens[base] = temp_tok_all[flat]
 
     sid_codes = catalog.sid_codes[hist_idx]
     for level in range(L):
         tokens[base + 1 + level] = sid_codes[:, level] + vocab.sid_offsets[level]
 
-    user_kept = user_raw[anchor_row]
-    profile_tok = (vocab.offset_profile + user_map.lookup(user_kept)).astype(np.int32)
-    tokens[offsets[:-1]] = profile_tok
-
     if tokens.size and int(tokens.max()) >= vocab.total_size:
         raise AssertionError(
             f"token id {int(tokens.max())} exceeds vocab size {vocab.total_size}"
         )
 
+    stats["feat_tokens"] = total_feat
+    stats["rows_not_in_feat_file"] = int((feat_row == feat_map.n_rows).sum())
     stats["rows_kept"] = int(n_keep)
     stats["items_kept"] = int(m.sum())
-    return tokens, offsets, targets, user_kept, m, stats
+    return tokens, offsets, targets, user_raw[anchor_row], m, stats
 
 
 def build_tokenized_split(
@@ -1502,7 +1938,7 @@ def build_tokenized_split(
     schema: SequenceSchema,
     catalog: ItemCatalog,
     vocab: Vocab,
-    user_map: UserMap,
+    feat_map: UserFeatureMap,
     gap_edges: np.ndarray,
     args,
     logger: logging.Logger,
@@ -1558,7 +1994,7 @@ def build_tokenized_split(
         raw_rows += len(raw_offsets) - 1
         tok, off, tgt, usr, _, st = assemble_chunk(
             items, ts, act, raw_offsets, target_raw, user_raw,
-            catalog, vocab, user_map, gap_edges, mode, args,
+            catalog, vocab, feat_map, gap_edges, mode, args,
         )
         for key, value in st.items():
             agg[key] = agg.get(key, 0) + int(value)
@@ -1638,6 +2074,8 @@ def build_tokenized_split(
         "unknown_items": agg.get("unknown_items", 0),
         "unknown_actions": counters["unknown_actions"],
         "non_click_actions": counters["non_click_actions"],
+        "feat_tokens": agg.get("feat_tokens", 0),
+        "rows_not_in_feat_file": agg.get("rows_not_in_feat_file", 0),
     }
     logger.info(
         f"  + {os.path.basename(path)}: {human_int(kept_rows)} rows from "
@@ -1656,6 +2094,12 @@ def build_tokenized_split(
         f"unknown history items {human_int(stats['unknown_items'])}, "
         f"out-of-order records {human_int(stats['rows_non_monotonic'])}"
     )
+    if stats["feat_tokens"]:
+        logger.info(
+            f"    features: {human_int(stats['feat_tokens'])} tokens "
+            f"({human_int(stats['rows_not_in_feat_file'])} rows of users "
+            "missing from --user_feat_path, each all-UNK)"
+        )
     if tokens_parts:
         tokens_parts.clear()
     return TokenizedSplit(
@@ -1686,71 +2130,6 @@ def _collect_users(path: str, col: Optional[str], limit: Optional[int],
     if limit is not None:
         arr = arr[: int(limit)]        # the last batch usually overshoots
     return normalize_ids(arr)
-
-
-def build_user_map(
-    sources: Sequence[Tuple[str, Optional[str], Optional[int]]],
-    logger: logging.Logger,
-    max_profile_tokens: Optional[int] = None,
-) -> UserMap:
-    arrays: List[np.ndarray] = []
-    flags: List[bool] = []
-    for path, col, limit in sources:
-        arr, is_int = _collect_users(path, col, limit)
-        if len(arr):
-            arrays.append(arr)
-            flags.append(is_int)
-    if not arrays:
-        logger.warning("  ! no user column found; every sequence gets the UNK profile token")
-        return UserMap(np.empty(0, dtype=np.int64), True)
-
-    cap = None if max_profile_tokens is None else max(1, int(max_profile_tokens))
-
-    if all(flags):
-        pool = np.concatenate(arrays)
-        del arrays
-        # Null ids arrive as the int64 sentinel; they must map to UNK, not a user.
-        pool = pool[pool != _INT64_SENTINEL]
-        if pool.size == 0:
-            logger.warning("  ! every user id was null; using the UNK profile token")
-            return UserMap(np.empty(0, dtype=np.int64), True)
-        users, counts = np.unique(pool, return_counts=True)
-        del pool
-        if cap is not None and len(users) > cap:
-            top = np.argsort(-counts, kind="stable")[:cap]
-            logger.info(
-                f"  + profile vocabulary capped at {human_int(cap)} users "
-                f"(from {human_int(len(counts))}; the tail maps to the UNK token)"
-            )
-            users = users[top]
-        return UserMap(users, True)
-
-    seen: Dict[str, int] = {}
-    for arr in arrays:
-        for v in arr.tolist():
-            if v is None:
-                continue
-            s = str(v)
-            if s in ("None", "", "nan"):
-                continue
-            seen[s] = seen.get(s, 0) + 1
-    if cap is not None and len(seen) > cap:
-        keep = sorted(seen.items(), key=lambda kv: -kv[1])[:cap]
-        logger.info(
-            f"  + profile vocabulary capped at {human_int(cap)} users "
-            f"(from {human_int(len(seen))}; the tail maps to the UNK token)"
-        )
-        return UserMap(np.asarray([k for k, _ in keep], dtype=object), False)
-    return UserMap(np.asarray(sorted(seen), dtype=object), False)
-
-# ==== END MOVED DATA CODE ====
-
-
-# ---------------------------------------------------------------------------
-# Split persistence (the training script loads exactly these files)
-# ---------------------------------------------------------------------------
-
-SPLIT_FILES = ("tokens.npy", "offsets.npy", "targets.npy", "users.npy", "stats.json")
 
 
 def save_split(split: "TokenizedSplit", out_dir: str) -> None:
@@ -1887,7 +2266,7 @@ def preprocess(args, logger: logging.Logger) -> Dict[str, Any]:
     _check_output_dir(out_dir, args.overwrite)
     os.makedirs(out_dir, exist_ok=True)
 
-    # --- 1. catalog + profile vocabulary + token layout ---------------------
+    # --- 1. catalog + user features + token layout --------------------------
     log_banner(logger, "DiGR PREPROCESSING")
     log_card(
         logger,
@@ -1928,32 +2307,41 @@ def preprocess(args, logger: logging.Logger) -> Dict[str, Any]:
         logger.info(f"  > infer schema: {describe_schema(infer_schema)}")
         sources.append((args.infer_sequence_path, infer_schema.user_col, args.max_rows))
 
-    user_map = build_user_map(sources, logger, args.max_profile_tokens)
-    logger.info(f"  + profile vocabulary: {human_int(user_map.n_profile - 1)} users (+UNK)")
+    if args.user_feat_path:
+        feat_map = build_user_feature_map(args.user_feat_path, args, logger)
+    else:
+        feat_map = UserFeatureMap.empty()
+        logger.info("  + no --user_feat_path: rows start with SEP, no user context")
 
-    vocab = build_vocab(catalog, user_map, args)
+    vocab = build_vocab(catalog, feat_map, args)
     gap_edges = build_gap_edges(args.n_temporal_bins, args.max_gap_seconds)
     logger.info(
         f"  + vocabulary: total={human_int(vocab.total_size)} "
         f"(special={vocab.n_special}, SID={vocab.sid_sizes} @ {vocab.sid_offsets}, "
         f"temporal={vocab.n_temporal} @ {vocab.offset_temporal}, "
-        f"profile={vocab.n_profile} @ {vocab.offset_profile})"
+        f"features={vocab.feature_sizes} @ {vocab.offset_features})"
     )
 
     # --- 2. persist the static artefacts ----------------------------------
     with open(os.path.join(out_dir, "vocab.json"), "w", encoding="utf-8") as f:
         json.dump(vocab.to_dict(), f, indent=2)
     catalog.save(out_dir)
-    user_map.save(out_dir)
+    # train_digr.py still loads a UserMap; the user block is now the feature
+    # block, so it stays empty on purpose (no user id is tokenised any more).
+    UserMap(np.empty(0, dtype=np.int64), True).save(out_dir)
+    feat_map.save(out_dir)
     np.save(os.path.join(out_dir, "gap_edges.npy"), gap_edges)
-    logger.info(f"  + wrote vocab.json / catalog_* / users_* / gap_edges.npy -> {out_dir}")
+    logger.info(
+        f"  + wrote vocab.json / catalog_* / user_feat_meta.json / "
+        f"gap_edges.npy -> {out_dir}"
+    )
 
     # --- 3. tokenise the splits -------------------------------------------
     def build(path, schema, wanted, limit, mode=MODE_TRAIN,
               keep_rows=None, dir_name=None):
         # Streaming: the token stream lands directly in <out_dir>/<dir_name>/tokens.npy
         return build_tokenized_split(
-            path, schema, catalog, vocab, user_map, gap_edges, args, logger,
+            path, schema, catalog, vocab, feat_map, gap_edges, args, logger,
             wanted_split=wanted, mode=mode, row_limit=limit,
             keep_rows=keep_rows,
             stream_dir=os.path.join(out_dir, dir_name) if dir_name else None,
@@ -2031,6 +2419,8 @@ def preprocess(args, logger: logging.Logger) -> Dict[str, Any]:
             "infer_sequence_path": os.path.abspath(args.infer_sequence_path)
             if args.infer_sequence_path else None,
             "catalog_path": os.path.abspath(args.catalog_path),
+            "user_feat_path": os.path.abspath(args.user_feat_path)
+            if args.user_feat_path else None,
         },
         "sequence_schema": describe_schema(seq_schema),
         "splits": splits,
@@ -2047,9 +2437,13 @@ def preprocess(args, logger: logging.Logger) -> Dict[str, Any]:
         "sid_sizes": list(vocab.sid_sizes),
         "sid_offsets": list(vocab.sid_offsets),
         "offset_temporal": int(vocab.offset_temporal),
-        "offset_profile": int(vocab.offset_profile),
+        "offset_features": int(vocab.offset_features),
+        "feature_sizes": [int(s) for s in vocab.feature_sizes],
+        "feature_offsets": [int(o) for o in vocab.feature_offsets],
         "n_temporal_bins": int(vocab.n_temporal),
-        "n_users": int(user_map.n_profile - 1),
+        "n_users": int(feat_map.n_rows),
+        "user_features": feat_map.meta(),
+        "max_feat_tokens": int(feat_map.max_len),
         "max_seq_len": int(args.window),      # kept for train_digr.py
         "window": int(args.window),
         "min_history": int(args.min_history),
@@ -2070,7 +2464,8 @@ def preprocess(args, logger: logging.Logger) -> Dict[str, Any]:
                           f"max {collisions['max_items_per_sid']}/group",
             "Clicks only": str(bool(args.clicks_only)),
             "Tokens": human_int(vocab.total_size),
-            "Users": human_int(user_map.n_profile - 1),
+            "Users": f"{human_int(feat_map.n_rows)} x "
+                     f"{feat_map.n_columns} feature cols",
             "Rows / record": f"{stats['train']['anchors_per_record']:.2f} train, "
                              f"{stats['val']['anchors_per_record']:.2f} val",
             "Train / val": f"{human_int(splits['train'])} / {human_int(splits['val'])}",
@@ -2167,9 +2562,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--max_gap_seconds", type=float, default=DEFAULT_MAX_GAP_SECONDS)
     p.add_argument("--max_rows", type=int, default=None)
     p.add_argument("--max_val_rows", type=int, default=None)
-    p.add_argument("--max_profile_tokens", type=int, default=DEFAULT_MAX_PROFILE_TOKENS,
-                   help="cap on user-profile tokens (most frequent users win; "
-                        "the tail and unseen users map to UNK)")
+    p.add_argument("--user_feat_path", type=str, default=None,
+                   help="optional parquet of static user attributes (one row per "
+                        "user, e.g. data/user_feat.parquet); every non-id column "
+                        "becomes a per-user feature block in front of the history")
+    p.add_argument("--user_feat_id_col", type=str, default=None,
+                   help="user id column of --user_feat_path (auto-detected)")
+    p.add_argument("--user_feat_cols", type=str, nargs="+", default=None,
+                   help="columns of --user_feat_path to tokenise (default: every "
+                        "column except the id column, in file order)")
+    p.add_argument("--max_feat_len", type=int, default=DEFAULT_MAX_FEAT_LEN,
+                   help="max slots one LIST feature column may use (0 = the longest "
+                        "list actually seen); longer lists are truncated")
     p.add_argument("--val_ratio", type=float, default=DEFAULT_VAL_RATIO)
     p.add_argument("--read_batch_size", type=int, default=DEFAULT_READ_BATCH_SIZE)
     p.add_argument("--seed", type=int, default=SEED)
@@ -2188,6 +2592,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     args.catalog_item_col = _none_if_blank(args.catalog_item_col)
     args.val_sequence_path = _none_if_blank(args.val_sequence_path)
     args.infer_sequence_path = _none_if_blank(args.infer_sequence_path)
+    args.user_feat_path = _none_if_blank(args.user_feat_path)
+    args.user_feat_id_col = _none_if_blank(args.user_feat_id_col)
 
     if args.n_temporal_bins < 1:
         p.error("--n_temporal_bins must be >= 1")
@@ -2201,6 +2607,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         p.error("--anchor_gap must be >= 0")
     if not 0.0 <= args.val_ratio < 1.0:
         p.error("--val_ratio must be in [0, 1)")
+    if args.max_feat_len < 0:
+        p.error("--max_feat_len must be >= 0 (0 = longest list seen)")
     if args.read_batch_size < 1:
         p.error("--read_batch_size must be >= 1")
     if args.max_gap_seconds <= 0:
@@ -2225,6 +2633,8 @@ def _validate_paths(args) -> None:
         raise SystemExit(f"validation file not found: {args.val_sequence_path}")
     if args.infer_sequence_path and not os.path.exists(args.infer_sequence_path):
         raise SystemExit(f"inference file not found: {args.infer_sequence_path}")
+    if args.user_feat_path and not os.path.exists(args.user_feat_path):
+        raise SystemExit(f"user feature file not found: {args.user_feat_path}")
 
 
 def main(argv: Optional[Sequence[str]] = None):

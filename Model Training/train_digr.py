@@ -20,7 +20,7 @@ INPUTS
 --------------------------------------------------------------------------------
 This file consumes a *preprocessed* dataset directory (`--data_dir`, default
 `digr_data/`) produced by `preprocess_digr.py`.  Raw parquet parsing, catalog
-loading, user profiles, gap bins and tokenisation all live in that phase; this
+loading, user features, gap bins and tokenisation all live in that phase; this
 file only trains / infers over the written CSR arrays.
 
   digr_data/
@@ -29,7 +29,8 @@ file only trains / infers over the written CSR arrays.
     catalog_item_ids.npy      |I| raw item ids      (target = row index)
     catalog_sid_codes.npy     |I| x L SID codes
     catalog_meta.json         num_levels / codebook sizes
-    users.npy, users_meta.json  profile vocabulary (top-N users, 0 = UNK)
+    users.npy, users_meta.json  legacy empty profile vocabulary (unused)
+    user_feat_meta.json       static feature columns (M tokens per row)
     gap_edges.npy             temporal bin edges
     train/, val/ (optional infer/)   tokens.npy offsets.npy targets.npy
                                       users.npy stats.json
@@ -40,9 +41,13 @@ with the exact `preprocess_digr.py` command to re-run.
 --------------------------------------------------------------------------------
 TOKEN LAYOUT (one slot per interaction, exactly as in the plan)
 --------------------------------------------------------------------------------
-  [U, (T_1, S_1_1 .. S_1_L), (T_2, S_2_1 .. S_2_L), ...]   len = 1 + T*(1+L)
+  [F_1 .. F_M, SEP, (T_1, S_1_1 .. S_1_L), ...]   len = M + 1 + T*(1+L)
 
-  U   = profile token (offset_profile + dense user index, 0 = UNK)
+  F_j = static user-feature token = offset_features + (slot j of the user's
+        feature block); M = 0 when no --user_feat_path was given, so a row
+        without static context is just [SEP, (T, S..)*].  The block is a
+        property of the user, not of the event, and it never enters the item
+        branch.
   T_i = temporal token = discretised gap to the previous interaction, log-spaced
         bins over [1s, --max_gap_seconds]; the first interaction is bin 0.
         (Hour-of-day / day-of-week tokens would need a second temporal slot; the
@@ -514,7 +519,7 @@ def load_backbone(model_name: str, vocab_size: int, args, logger: logging.Logger
         with torch.no_grad():
             emb = backbone.get_input_embeddings()
             emb.weight.normal_(mean=0.0, std=0.02)
-        logger.info("  + input embeddings re-initialised (fresh SID/temporal/profile rows)")
+        logger.info("  + input embeddings re-initialised (fresh SID/temporal/feature rows)")
 
     backbone.config.vocab_size = int(vocab_size)
     backbone.config.pad_token_id = 0
@@ -637,6 +642,7 @@ class RunMeta:
     l2_normalize: bool
     max_seq_len: int
     dtype: str
+    max_feat_tokens: int = 0        # M, from the dataset manifest
 
     def save(self, out_dir: str):
         os.makedirs(out_dir, exist_ok=True)
@@ -652,6 +658,7 @@ class RunMeta:
                     "temperature": float(self.temperature),
                     "l2_normalize": bool(self.l2_normalize),
                     "max_seq_len": int(self.max_seq_len),
+                    "max_feat_tokens": int(self.max_feat_tokens),
                     "dtype": self.dtype,
                     "num_levels": int(self.vocab.num_levels),
                     "catalog_size": int(self.catalog.size),
@@ -680,6 +687,7 @@ class RunMeta:
             l2_normalize=bool(head["l2_normalize"]),
             max_seq_len=int(head["max_seq_len"]),
             dtype=head.get("dtype", "bf16"),
+            max_feat_tokens=int(head.get("max_feat_tokens", 0) or 0),
         )
 
 
@@ -711,11 +719,12 @@ def _load_static_meta(data_dir: str, logger: logging.Logger
         f"  + loaded vocabulary from {data_dir}: total={human_int(vocab.total_size)} "
         f"(SID={vocab.sid_sizes} @ {vocab.sid_offsets}, "
         f"temporal={vocab.n_temporal} @ {vocab.offset_temporal}, "
-        f"profile={vocab.n_profile} @ {vocab.offset_profile})"
+        f"features={vocab.feature_sizes} @ {vocab.offset_features})"
     )
     logger.info(
         f"  + catalog: {human_int(catalog.size)} items x {catalog.num_levels} levels, "
-        f"profiles={human_int(user_map.n_profile - 1)} users (+UNK)"
+        f"static user features: {len(vocab.feature_sizes)} column(s), "
+        f"{human_int(manifest.get('max_feat_tokens', 0) or 0)} token(s) per row"
     )
     return vocab, catalog, user_map, gap_edges, manifest
 
@@ -756,6 +765,7 @@ def _resolve_meta(args, logger: logging.Logger) -> RunMeta:
         l2_normalize=bool(args.l2_normalize),
         max_seq_len=int(manifest.get("max_seq_len") or 0),
         dtype=args.dtype,
+        max_feat_tokens=int(manifest.get("max_feat_tokens") or 0),
     )
 
 
@@ -770,12 +780,15 @@ def _load_splits(args, meta: RunMeta, logger: logging.Logger
                 f"the '{name}' split in {args.data_dir} is empty; re-run preprocessing "
                 "with a lower --min_history / a wider --max_rows"
             )
-        # `lengths` counts tokens: 1 profile token + (1 temporal + L SID) per item.
+        # `lengths` counts tokens: M feature tokens + SEP + (1 temporal + L SID)
+        # per event.  M is a property of the user, not of the row, so derive the
+        # event count after removing it.
         n_levels = max(1, meta.vocab.num_levels)
-        max_items = int((int(split.lengths.max()) - 1) // (1 + n_levels))
+        max_feat = int(meta.max_feat_tokens)
+        max_items = int((int(split.lengths.max()) - max_feat - 1) // (1 + n_levels))
         if meta.max_seq_len and max_items > meta.max_seq_len:
             logger.warning(
-                f"  ! '{name}' has sequences of {max_items} items but the dataset was "
+                f"  ! '{name}' has sequences of {max_items} events but the dataset was "
                 f"prepared with --window={meta.max_seq_len} (stale digr_data?)"
             )
         logger.info(
@@ -1408,7 +1421,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--gradient_checkpointing", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--reinit_embeddings", action=argparse.BooleanOptionalAction, default=True,
                    help="draw N(0,0.02) for the resized token table (every id in the "
-                        "custom vocab is a new SID/temporal/profile token, so the "
+                        "custom vocab is a new SID/temporal/feature token, so the "
                         "truncated Qwen text rows carry no useful semantics)")
     p.add_argument("--l2_normalize", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)

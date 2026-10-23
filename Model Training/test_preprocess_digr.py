@@ -185,14 +185,18 @@ def _vocab(out_dir: str) -> dict:
         return json.load(f)
 
 
-def _decode_row(tokens, offsets, r: int, vocab: dict, by_codes: dict) -> list:
-    """Item ids of the history of row `r`, in order (the target is not in it)."""
+def _decode_row(tokens, offsets, r: int, vocab: dict, by_codes: dict,
+                feat_len: int = 0) -> list:
+    """Item ids of the history of row `r`, in order (the target is not in it).
+
+    `feat_len` is the number of static-feature slots in front of the SEP.
+    """
     sid_offsets = vocab["sid_offsets"]
     L = len(sid_offsets)
     stride = 1 + L
     start, end = int(offsets[r]), int(offsets[r + 1])
     hist = []
-    pos = start + 1
+    pos = start + feat_len + 1
     while pos + stride <= end:
         codes = tuple(int(tokens[pos + 1 + lvl]) - sid_offsets[lvl] for lvl in range(L))
         hist.append(by_codes[codes])
@@ -200,8 +204,14 @@ def _decode_row(tokens, offsets, r: int, vocab: dict, by_codes: dict) -> list:
     return hist
 
 
-def _row_len(n_events: int, num_levels: int = NUM_LEVELS) -> int:
-    return 1 + n_events * (1 + num_levels)
+def _feat_block(tokens, offsets, r: int, vocab: dict, n: int) -> list:
+    """The `n` static-feature slots of row `r`, as local ids (column relative)."""
+    start = int(offsets[r])
+    return [int(t) - vocab["offset_features"] for t in tokens[start:start + n]]
+
+
+def _row_len(n_events: int, num_levels: int = NUM_LEVELS, feat_len: int = 0) -> int:
+    return 1 + feat_len + n_events * (1 + num_levels)
 
 
 # ---------------------------------------------------------------------------
@@ -558,9 +568,9 @@ def test_token_layout(workspace):
     tokens, row_offsets, _ = _tokens(out_dir, "train")
     assert tokens.max() < vocab["total_size"]
     assert tokens.min() >= 0
-    profile = tokens[row_offsets[:-1]]          # first token of every row
-    assert np.all(profile >= vocab["offset_profile"])
-    assert np.all(profile < vocab["offset_profile"] + vocab["n_profile"])
+    # every row is [SEP, (T, S..)*] when no user features were given
+    assert np.all(tokens[row_offsets[:-1]] == vocab["sep_id"])
+    assert vocab["offset_features"] == vocab["total_size"]
 
 
 def test_unknown_user_falls_back_to_unk(workspace):
@@ -568,10 +578,13 @@ def test_unknown_user_falls_back_to_unk(workspace):
     _write_parquet(paths["train"], [
         {"user_id": None, "seq": _seq((1, CLICK, 1000), (2, CLICK, 1060))},
     ])
-    out_dir, _, _ = _run(workspace, paths, ["--min_history", "1"])
+    out_dir, manifest, _ = _run(workspace, paths, ["--min_history", "1"])
     tokens, row_offsets, _ = _tokens(out_dir, "train")
     vocab = _vocab(out_dir)
-    assert int(tokens[row_offsets[0]]) == vocab["offset_profile"]  # dense index 0 == UNK
+    # no feature file: the row opens with SEP, the history starts right after it
+    assert int(tokens[row_offsets[0]]) == vocab["sep_id"]
+    assert manifest["n_users"] == 0
+    assert manifest["max_feat_tokens"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -669,3 +682,198 @@ def test_flat_without_actions_or_target_uses_the_last_event(workspace):
     assert [int(t) for t in targets] == [by_item[3]]
     assert _decode_row(tokens, offsets, 0, vocab, by_codes) == [1, 2]
     assert manifest["split_stats"]["train"]["non_click_actions"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 9. static user context (--user_feat_path)
+# ---------------------------------------------------------------------------
+#
+# The mock feature file is built so every column rule has one obvious answer:
+#
+#   age  : {3, 5}       -> 2 values + UNK  = 3 tokens, local base 0
+#   city : {7, 8}       -> 2 values + UNK  = 3 tokens, local base 3
+#   tags : {1, 2}       -> 2 values + UNK  = 3 tokens, local base 6
+#
+#   user 100: age 3, city 7, tags [1, 2]  -> [0, 3, 6, 7]  (4 slots)
+#   user 101: age 5, city null, tags []   -> [1, 5, 8]     (one UNK, 3 slots)
+#   user 102: age 5, city 7, tags null    -> [1, 3, 8]
+#   user 200: age 3, city 8, tags [2]     -> [0, 4, 7]
+#   anyone else (103, 105, 201) is absent -> [2, 5, 8]     (all UNK)
+
+FEAT_ROWS = [
+    {"user_id": 100, "age": 3, "city": 7, "tags": [1, 2]},
+    {"user_id": 101, "age": 5, "city": None, "tags": []},
+    {"user_id": 102, "age": 5, "city": 7, "tags": None},
+    {"user_id": 200, "age": 3, "city": 8, "tags": [2]},
+]
+
+FEAT_SCHEMA = pa.schema([
+    ("user_id", pa.int64()),
+    ("age", pa.int64()),
+    ("city", pa.int64()),
+    ("tags", pa.list_(pa.int64())),
+])
+
+UNK_BLOCK = [2, 5, 8]        # one UNK slot per column, in file order
+
+
+def _write_feat(workspace, rows=FEAT_ROWS) -> str:
+    path = os.path.join(workspace, "user_feat.parquet")
+    pq.write_table(pa.Table.from_pylist(rows, schema=FEAT_SCHEMA), path)
+    return path
+
+
+def _user_rows(out_dir: str, split: str) -> dict:
+    """first row index of every user id in a split."""
+    users = np.load(os.path.join(out_dir, split, "users.npy"), allow_pickle=True)
+    rows = {}
+    for r, u in enumerate(users.tolist()):
+        rows.setdefault(int(u), r)
+    return rows
+
+
+def _split_stats(out_dir: str, split: str) -> dict:
+    with open(os.path.join(out_dir, split, "stats.json"), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def test_user_features_layout(workspace):
+    paths = _setup(workspace)
+    feat = _write_feat(workspace)
+    out_dir, manifest, _ = _run(workspace, paths, ["--user_feat_path", feat])
+
+    vocab = _vocab(out_dir)
+    assert vocab["feature_sizes"] == [3, 3, 3]
+    assert [int(o) - vocab["offset_features"] for o in vocab["feature_offsets"]] == [0, 3, 6]
+    assert vocab["total_size"] == vocab["offset_features"] + 9
+
+    tokens, offsets, _ = _tokens(out_dir, "train")
+    _, by_codes, _ = _maps(out_dir)
+    rows = _user_rows(out_dir, "train")
+    # user 100: 4 slots; user 101: null city + empty list -> two UNK slots
+    assert _feat_block(tokens, offsets, rows[100], vocab, 4) == [0, 3, 6, 7]
+    assert _feat_block(tokens, offsets, rows[101], vocab, 3) == [1, 5, 8]
+    # the history is untouched by the feature block
+    assert _decode_row(tokens, offsets, rows[100], vocab, by_codes, feat_len=4) == [1, 2, 2]
+    assert _decode_row(tokens, offsets, rows[101], vocab, by_codes, feat_len=3) == [4, 5]
+    # SEP sits right after the block
+    for user, n, n_events in ((100, 4, 3), (101, 3, 2)):
+        r = rows[user]
+        start = int(offsets[r])
+        assert int(tokens[start + n]) == vocab["sep_id"]
+        assert int(offsets[r + 1]) - start == _row_len(n_events, feat_len=n)
+
+    assert manifest["max_feat_tokens"] == 4
+    assert manifest["n_users"] == 4
+    assert [c["name"] for c in manifest["user_features"]["columns"]] == ["age", "city", "tags"]
+    assert _split_stats(out_dir, "train")["rows_not_in_feat_file"] == 0
+
+
+def test_user_features_val_row_gets_the_same_block(workspace):
+    paths = _setup(workspace)
+    feat = _write_feat(workspace)
+    out_dir, _, _ = _run(workspace, paths, ["--user_feat_path", feat,
+                                            "--min_history", "1"])
+    tokens, offsets, _ = _tokens(out_dir, "val")
+    _, by_codes, _ = _maps(out_dir)
+    vocab = _vocab(out_dir)
+    rows = _user_rows(out_dir, "val")
+    # user 200: the last click is the anchor, history is the event before it
+    assert _feat_block(tokens, offsets, rows[200], vocab, 3) == [0, 4, 7]
+    assert _decode_row(tokens, offsets, rows[200], vocab, by_codes, feat_len=3) == [3, 4]
+    # user 201 is absent from the feature file -> a full all-UNK block
+    assert _feat_block(tokens, offsets, rows[201], vocab, 3) == UNK_BLOCK
+    assert _split_stats(out_dir, "val")["rows_not_in_feat_file"] == 1
+
+
+def test_user_features_absent_user_in_train(workspace):
+    paths = _setup(workspace)
+    feat = _write_feat(workspace)
+    _write_parquet(paths["train"], [
+        {"user_id": 999, "seq": _seq((1, CLICK, 1000), (2, CLICK, 1010))},
+    ])
+    out_dir, _, _ = _run(workspace, paths, ["--user_feat_path", feat,
+                                            "--min_history", "1"])
+    tokens, offsets, _ = _tokens(out_dir, "train")
+    vocab = _vocab(out_dir)
+    assert _feat_block(tokens, offsets, 0, vocab, 3) == UNK_BLOCK
+    assert _split_stats(out_dir, "train")["rows_not_in_feat_file"] == 1
+
+
+def test_max_feat_len_truncates_a_list_column(workspace):
+    paths = _setup(workspace)
+    feat = _write_feat(workspace)
+    out_dir, manifest, _ = _run(workspace, paths, ["--user_feat_path", feat,
+                                                   "--max_feat_len", "1"])
+    vocab = _vocab(out_dir)
+    tokens, offsets, _ = _tokens(out_dir, "train")
+    rows = _user_rows(out_dir, "train")
+    # tags [1, 2] -> only 1 is kept, so user 100 has 3 slots instead of 4
+    assert _feat_block(tokens, offsets, rows[100], vocab, 3) == [0, 3, 6]
+    assert manifest["max_feat_tokens"] == 3
+    assert manifest["user_features"]["columns"][2]["max_len"] == 1
+    assert manifest["user_features"]["counters"]["values_truncated"] == 1
+
+
+def test_user_feat_cols_selects_columns(workspace):
+    paths = _setup(workspace)
+    feat = _write_feat(workspace)
+    out_dir, manifest, _ = _run(workspace, paths, ["--user_feat_path", feat,
+                                                   "--user_feat_cols", "city"])
+    vocab = _vocab(out_dir)
+    tokens, offsets, _ = _tokens(out_dir, "train")
+    rows = _user_rows(out_dir, "train")
+    assert vocab["feature_sizes"] == [3]
+    # city is the only column, so its values start at local base 0: 7 -> 0, 8 -> 1
+    assert _feat_block(tokens, offsets, rows[100], vocab, 1) == [0]
+    assert _feat_block(tokens, offsets, rows[101], vocab, 1) == [2]   # null -> UNK
+    assert [c["name"] for c in manifest["user_features"]["columns"]] == ["city"]
+
+
+def test_user_feat_id_col_must_be_a_column(workspace):
+    paths = _setup(workspace)
+    feat = _write_feat(workspace)
+    with pytest.raises(SystemExit, match="not a column of the feature file"):
+        _run(workspace, paths, ["--user_feat_path", feat,
+                                "--user_feat_id_col", "nope"])
+
+
+def test_user_feat_id_col_must_not_be_tokenised(workspace):
+    paths = _setup(workspace)
+    feat = _write_feat(workspace)
+    with pytest.raises(SystemExit, match="must not contain the id column"):
+        _run(workspace, paths, ["--user_feat_path", feat,
+                                "--user_feat_cols", "user_id", "city"])
+
+
+def test_user_feat_duplicate_ids_rejected(workspace):
+    paths = _setup(workspace)
+    feat = _write_feat(workspace, FEAT_ROWS + [
+        {"user_id": 100, "age": 3, "city": 8, "tags": []},
+    ])
+    with pytest.raises(SystemExit, match="appears 2 times"):
+        _run(workspace, paths, ["--user_feat_path", feat])
+
+
+def test_user_feat_non_numeric_column_rejected(workspace):
+    paths = _setup(workspace)
+    feat = os.path.join(workspace, "user_feat.parquet")
+    schema = pa.schema([("user_id", pa.int64()), ("city", pa.string())])
+    pq.write_table(pa.Table.from_pylist(
+        [{"user_id": 100, "city": "oslo"}], schema=schema,
+    ), feat)
+    with pytest.raises(SystemExit, match="non-numeric"):
+        _run(workspace, paths, ["--user_feat_path", feat])
+
+
+def test_user_feat_missing_file_is_an_error(workspace):
+    paths = _setup(workspace)
+    args = pp.parse_args([
+        "--sequence_path", paths["train"],
+        "--catalog_path", paths["catalog"],
+        "--user_feat_path", os.path.join(workspace, "nope.parquet"),
+        "--output_dir", os.path.join(workspace, "out"),
+        "--overwrite",
+    ])
+    with pytest.raises(SystemExit, match="user feature file not found"):
+        pp._validate_paths(args)
