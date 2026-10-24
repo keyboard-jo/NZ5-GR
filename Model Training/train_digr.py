@@ -5,8 +5,8 @@ DiGR: LLM-backbone generative retrieval from RQ-VAE Semantic IDs
 Implements the DiGR plan:
 
   Phase 1 - vocabulary partition + catalog SID buffer
-  Phase 2 - Qwen backbone with LoRA (attention projections) and trainable
-            input embeddings (`modules_to_save=["embed_tokens"]`)
+  Phase 2 - Qwen backbone, full fine-tune by default (`--use_lora` opts into
+            LoRA attention projections + trainable input embeddings)
   Phase 3 - dual-branch forward pass:
               h_x = backbone(sequence)[last non-pad token]
               V   = mean_l E[catalog_sid_token_l]          (item branch)
@@ -66,7 +66,9 @@ H800 PERFORMANCE NOTES
           = (1/L) * sum_l g[catalog_token_{i,l}] / tau,  g = h_x E^T
   where E is the (tiny, ~10k rows) token embedding table.  Gradients reach the
   SID embedding rows exactly as in the V formulation, at a fraction of the
-  memory.  `torch.cat` over catalog chunks keeps it explicit and simple.
+  memory.  The [B, |I|] logit tensor is pre-allocated once and filled chunk-
+  wise (no `torch.cat` of a second full-size tensor); `--sampled_softmax` swaps
+  the exact denominator for `--num_negatives` uniform negatives per step.
 * bf16 + FlashAttention-2 + gradient checkpointing + fused AdamW.
 * Tokenisation is not repeated here: the int32 CSR buffers are loaded once from
   `digr_data/<split>/`; collation is a bulk numpy pad, and a length-bucketed
@@ -87,6 +89,11 @@ QUICK START
   python train_digr.py --mode train --data_dir digr_data \
       --batch_size 32 --grad_accum 2 --epochs 3 --compile
 
+  # 1b) resume an interrupted run; final/ always holds the newest state,
+  #     including the mid-epoch save written every --save_steps steps
+  python train_digr.py --mode train --data_dir digr_data \
+      --resume digr_runs/digr_<timestamp>/final --epochs 3
+
   # 2) top-K retrieval with the frozen catalog matrix V
   python train_digr.py --mode infer \
       --checkpoint digr_runs/digr_<timestamp>/final \
@@ -97,10 +104,11 @@ QUICK START
       --checkpoint digr_runs/digr_<timestamp>/final
 
 Artefacts written per run directory:
-  adapter_model.safetensors + adapter_config.json   (LoRA + modules_to_save)
+  model.safetensors + config.json                   (full fine-tune)
+  adapter_model.safetensors + adapter_config.json   (only with --use_lora)
   vocab.json, catalog_item_ids.npy, catalog_sid_codes.npy, catalog_meta.json
   users.npy, users_meta.json, gap_edges.npy, head_config.json
-  train_state.pt (epoch/step/best/optimizer/scheduler/scaler)
+  train_state.pt (epoch/batch/step/best/optimizer/scheduler/scaler)
   catalog_vectors.npy  (|I| x d, the Phase-4 inference cache)
   best/  final/  logs/train.log  (infer writes predictions.parquet)
 """
@@ -113,10 +121,12 @@ import logging
 import math
 import os
 import random
+import shutil
 import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import islice
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -180,7 +190,7 @@ DEFAULT_MODEL_NAME = "Qwen/Qwen3-4B"
 DEFAULT_DATA_DIR = "digr_data"
 DEFAULT_OUTPUT_DIR = "digr_runs"
 
-DEFAULT_BATCH_SIZE = 64
+DEFAULT_BATCH_SIZE = 512
 DEFAULT_EVAL_BATCH_SIZE = 128
 
 DEFAULT_LR = 2e-4
@@ -196,6 +206,9 @@ DEFAULT_LORA_R = 16
 DEFAULT_LORA_ALPHA = 32
 DEFAULT_LORA_DROPOUT = 0.05
 DEFAULT_LOGIT_CHUNK = 500_000
+DEFAULT_NUM_NEGATIVES = 100_000
+DEFAULT_SAVE_STEPS = 1000        # mid-epoch checkpoint interval; 0 disables
+EVAL_KS = (1, 5, 10)                   # ranking cut-offs reported by evaluate()
 
 BANNER_WIDTH = 88
 
@@ -404,27 +417,63 @@ class DiGRRetriever(torch.nn.Module):
         return self.encode(input_ids, attention_mask)
 
     def item_logits(self, h: torch.Tensor) -> torch.Tensor:
-        """Full-catalog logits via the exact V=E[catalog_sids] factorisation."""
+        """Full-catalog logits via the exact V=E[catalog_sids] factorisation.
+
+        The [B, |I|] result is pre-allocated once and every chunk is written
+        straight into it (no intermediate list, no `torch.cat` of a second
+        full-size tensor).  Values are bit-identical to the cat version.
+        """
         w = _embedding_weight(self.backbone)
         if self.l2_normalize:
             h = F.normalize(h, dim=-1)
             w = F.normalize(w.float(), dim=-1).to(w.dtype)
 
-        # [B, vocab] projection; vocab is tiny (~10k), the catalog is not.
+        # [B, vocab] projection; vocab is tiny (~2k), the catalog is not.
         # fp32 accumulation of the SID sum: bf16 logits would add ~1e-2 noise on
-        # the CE input at tau=0.07, for a [B, chunk] tensor only.
+        # the CE input at tau=0.07.
         g = torch.matmul(h, w.t()).float()
         scale = 1.0 / (self.num_levels * self.temperature)
 
-        chunks: List[torch.Tensor] = []
         n = self.catalog_size
+        out = torch.empty((h.shape[0], n), dtype=torch.float32, device=h.device)
         for start in range(0, n, self.logit_chunk):
             toks = self.catalog_token_ids[start:start + self.logit_chunk]
             acc = g.index_select(1, toks[:, 0])
             for level in range(1, self.num_levels):
                 acc = acc + g.index_select(1, toks[:, level])
-            chunks.append(acc * scale)
-        return torch.cat(chunks, dim=1)
+            out[:, start:start + self.logit_chunk] = acc * scale
+        return out
+
+    def item_logits_sampled(self, h: torch.Tensor, targets: torch.Tensor,
+                            neg_tokens: torch.Tensor) -> torch.Tensor:
+        """Sampled-softmax logits [B, 1+N]: column 0 = positive, 1..N = negatives.
+
+        `neg_tokens` is [N, L] (shared across the batch); the positive tokens are
+        `self.catalog_token_ids[targets]`.  Uniform proposal, with the log(K/N)
+        partition correction applied to the negatives so the estimator matches
+        the exact full-softmax gradient in expectation.
+        """
+        w = _embedding_weight(self.backbone)
+        if self.l2_normalize:
+            h = F.normalize(h, dim=-1)
+            w = F.normalize(w.float(), dim=-1).to(w.dtype)
+
+        g = torch.matmul(h, w.t()).float()
+        scale = 1.0 / (self.num_levels * self.temperature)
+
+        pos_toks = self.catalog_token_ids[targets]          # [B, L]
+        pos = g.gather(1, pos_toks[:, 0:1])
+        for level in range(1, self.num_levels):
+            pos = pos + g.gather(1, pos_toks[:, level:level + 1])
+        pos = pos * scale                                  # [B, 1]
+
+        neg = g.index_select(1, neg_tokens[:, 0])
+        for level in range(1, self.num_levels):
+            neg = neg + g.index_select(1, neg_tokens[:, level])
+        log_k_over_n = math.log(max(1.0, self.catalog_size / max(1, neg_tokens.shape[0])))
+        neg = neg * scale + log_k_over_n                   # [B, N]
+
+        return torch.cat([pos, neg], dim=1)
 
     @torch.inference_mode()
     def precompute_vectors(self, dtype=torch.bfloat16) -> torch.Tensor:
@@ -570,6 +619,22 @@ def build_peft_backbone(backbone, args, logger: logging.Logger):
     return model
 
 
+def _load_full_checkpoint(model_name: str, ckpt_dir: str, args, logger: logging.Logger):
+    """Load a full fine-tune checkpoint (no peft).
+
+    The checkpoint was saved with the resized vocab, so no re-resize is needed.
+    """
+    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+    load_dtype = dtype_map[args.dtype]
+    try:
+        model = AutoModel.from_pretrained(ckpt_dir, dtype=load_dtype)
+    except TypeError:
+        model = AutoModel.from_pretrained(ckpt_dir, torch_dtype=load_dtype)
+    model.config.use_cache = False
+    logger.info(f"  + full fine-tune checkpoint loaded from {ckpt_dir}")
+    return model
+
+
 def catalog_token_matrix(catalog: ItemCatalog, vocab: Vocab) -> np.ndarray:
     if catalog.num_levels != vocab.num_levels:
         raise ValueError(
@@ -579,6 +644,32 @@ def catalog_token_matrix(catalog: ItemCatalog, vocab: Vocab) -> np.ndarray:
     for level, off in enumerate(vocab.sid_offsets):
         toks[:, level] = catalog.sid_codes[:, level].astype(np.int64) + off
     return toks
+
+
+def resolve_label_subset(cat_tokens: np.ndarray, train_targets: np.ndarray,
+                         val_targets: np.ndarray, label_subset: str
+                         ) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (label_token_matrix, remap) for `--label_subset`.
+
+    * `full`: the whole catalog; remap is the identity.
+    * `clicked`: only items that appear as a train/val target (the trainable
+      label space); remap[old_catalog_row] -> new label index.
+
+    The label matrix keeps the [K', L] layout of `catalog_token_matrix`;
+    applying `remap` to a split's `targets` re-indexes them into [0, K').
+    """
+    n = int(cat_tokens.shape[0])
+    if label_subset == "full":
+        return cat_tokens, np.arange(n, dtype=np.int64)
+    if label_subset == "clicked":
+        clicked = np.unique(np.concatenate(
+            [np.asarray(train_targets, dtype=np.int64),
+             np.asarray(val_targets, dtype=np.int64)]
+        ))
+        remap = np.full(n, -1, dtype=np.int64)
+        remap[clicked] = np.arange(len(clicked), dtype=np.int64)
+        return cat_tokens[clicked], remap
+    raise ValueError(f"unknown --label_subset: {label_subset!r}")
 
 
 def build_optimizer(model: torch.nn.Module, args) -> torch.optim.Optimizer:
@@ -643,6 +734,7 @@ class RunMeta:
     max_seq_len: int
     dtype: str
     max_feat_tokens: int = 0        # M, from the dataset manifest
+    use_lora: bool = False          # full fine-tune by default
 
     def save(self, out_dir: str):
         os.makedirs(out_dir, exist_ok=True)
@@ -659,6 +751,7 @@ class RunMeta:
                     "l2_normalize": bool(self.l2_normalize),
                     "max_seq_len": int(self.max_seq_len),
                     "max_feat_tokens": int(self.max_feat_tokens),
+                    "use_lora": bool(self.use_lora),
                     "dtype": self.dtype,
                     "num_levels": int(self.vocab.num_levels),
                     "catalog_size": int(self.catalog.size),
@@ -688,6 +781,10 @@ class RunMeta:
             max_seq_len=int(head["max_seq_len"]),
             dtype=head.get("dtype", "bf16"),
             max_feat_tokens=int(head.get("max_feat_tokens", 0) or 0),
+            use_lora=bool(head.get(
+                "use_lora",
+                os.path.isfile(os.path.join(ckpt_dir, "adapter_config.json")),
+            )),
         )
 
 
@@ -766,6 +863,7 @@ def _resolve_meta(args, logger: logging.Logger) -> RunMeta:
         max_seq_len=int(manifest.get("max_seq_len") or 0),
         dtype=args.dtype,
         max_feat_tokens=int(manifest.get("max_feat_tokens") or 0),
+        use_lora=bool(args.use_lora),
     )
 
 
@@ -806,11 +904,22 @@ def _load_splits(args, meta: RunMeta, logger: logging.Logger
 @torch.inference_mode()
 def evaluate(model: DiGRRetriever, loader: DataLoader, device: torch.device,
              amp_dtype: torch.dtype, use_amp: bool) -> Dict[str, float]:
+    """Full-catalog ranking metrics.
+
+    Every row carries exactly one target, so hit rate and recall coincide and
+    the returned keys say `recall@k`. `ndcg@k = 1/log2(rank+1)` for rank <= k
+    (IDCG = 1), and `mrr` is truncated at `max(EVAL_KS)`.  A row whose target
+    misses the top `kmax` is scored as rank `kmax + 1`, so it is a miss at
+    every `k` and adds zero gain (rank 0 would pass every test).
+    """
+
     model.eval()
+    kmax = max(EVAL_KS)
     total_loss = 0.0
     total_n = 0
-    correct1 = 0
-    correct5 = 0
+    hits = {k: 0 for k in EVAL_KS}
+    gains = {k: 0.0 for k in EVAL_KS}
+    rr = 0.0
 
     for ids, mask, targets, _ in loader:
         ids = ids.to(device, non_blocking=True)
@@ -825,31 +934,82 @@ def evaluate(model: DiGRRetriever, loader: DataLoader, device: torch.device,
 
         total_loss += float(loss.item()) * b
         total_n += b
-        pred = logits.argmax(dim=-1)
-        correct1 += int((pred == targets).sum().item())
-        k = min(5, logits.shape[1])
-        topk = logits.topk(k, dim=1).indices
-        correct5 += int((topk == targets.unsqueeze(1)).any(dim=1).sum().item())
+
+        topk = logits.topk(min(kmax, logits.shape[1]), dim=1).indices
+        match = topk == targets.unsqueeze(1)
+        found = match.any(dim=1)
+        # A miss gets rank kmax + 1 (not 0) so it fails every `rank <= k` test
+        # and contributes no gain.  Rank 0 would pass every test and turn
+        # 1 / log2(rank + 1) into a division by zero.
+        rank = torch.where(
+            found, match.to(torch.int64).argmax(dim=1) + 1,
+            torch.full_like(targets, kmax + 1),
+        ).double()
+        for k in EVAL_KS:
+            hit = rank <= k
+            hits[k] += int(hit.sum().item())
+            gains[k] += float(
+                torch.where(hit, 1.0 / torch.log2(rank + 1.0),
+                            torch.zeros_like(rank)).sum().item()
+            )
+        rr += float(
+            torch.where(found, 1.0 / rank.clamp(min=1.0),
+                        torch.zeros_like(rank)).sum().item()
+        )
 
     n = max(1, total_n)
-    return {
+    out: Dict[str, float] = {
         "loss": total_loss / n,
-        "acc@1": correct1 / n,
-        "acc@5": correct5 / n,
+        "acc@1": hits[1] / n,
+        "acc@5": hits[5] / n,
         "n": total_n,
     }
+    for k in EVAL_KS:
+        out[f"recall@{k}"] = hits[k] / n
+        out[f"ndcg@{k}"] = gains[k] / n
+    out["mrr"] = rr / n
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Checkpoint IO
 # ---------------------------------------------------------------------------
 
+def resolve_resume_position(state: Dict[str, Any], steps_per_epoch: int) -> Tuple[int, int]:
+    """(epoch, batch offset) to continue from a `train_state.pt` payload.
+
+    State format is `{"epoch": e, "batch": b}` where `e` is the epoch being
+    worked on and `b` is how many micro-batches of it are already consumed.
+    `b >= steps_per_epoch` means that epoch finished (what the epoch-end save
+    writes), so training continues at `e + 1`.  Checkpoints written before the
+    `batch` key existed stored the last *completed* epoch, hence `e + 1`.
+    """
+    if "batch" in state:
+        ep = int(state.get("epoch", 0))
+        ba = int(state.get("batch", 0))
+        if ba >= steps_per_epoch:
+            return ep + 1, 0
+        return ep, ba
+    return int(state.get("epoch", 0)) + 1, 0
+
+
 def save_checkpoint(model, meta: RunMeta, out_dir: str, state: Optional[Dict[str, Any]] = None):
-    os.makedirs(out_dir, exist_ok=True)
-    model.save_pretrained(out_dir, safe_serialization=True)
-    meta.save(out_dir)
+    """Write a checkpoint atomically: build `<dir>.tmp`, then swap it in.
+
+    A job that dies while writing must not destroy the previous good checkpoint,
+    which is exactly what writing straight into `out_dir` would do (it replaces
+    the shards in place).  The window between the rmtree and the rename is
+    microseconds; the multi-second write happens inside `<dir>.tmp`.
+    """
+    tmp = out_dir.rstrip("/" + chr(92)) + ".tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp, exist_ok=True)
+    model.save_pretrained(tmp, safe_serialization=True)
+    meta.save(tmp)
     if state is not None:
-        torch.save(state, os.path.join(out_dir, "train_state.pt"))
+        torch.save(state, os.path.join(tmp, "train_state.pt"))
+    shutil.rmtree(out_dir, ignore_errors=True)
+    os.replace(tmp, out_dir)
 
 
 def save_vectors(model: DiGRRetriever, out_dir: str, dtype_name: str):
@@ -893,15 +1053,16 @@ def run_train(args, logger: logging.Logger):
             "Device": str(device),
             "Precision": f"{args.dtype} (autocast={use_amp})",
             "Backbone": meta.model_name,
-            "LoRA": f"r={args.lora_r}, alpha={args.lora_alpha}, "
-                    f"dropout={args.lora_dropout}, targets=q/k/v/o + embed_tokens",
+            "Training mode": ("LoRA (r={}, alpha={}, dropout={}, q/k/v/o + embed_tokens)"
+                              .format(args.lora_r, args.lora_alpha, args.lora_dropout)
+                              if meta.use_lora else "full fine-tune"),
             "Catalog": f"{human_int(meta.catalog.size)} items x {meta.catalog.num_levels} levels",
             "Vocab": human_int(meta.vocab.total_size),
             "Temperature": meta.temperature,
             "L2 normalise": meta.l2_normalize,
             "Max history": f"{meta.max_seq_len} events",
             "Batch / eval": f"{args.batch_size} / {args.eval_batch_size}",
-            "LR (LoRA / embed)": f"{args.lr} / {args.lr * args.embed_lr_mult}",
+            "LR (backbone / embed)": f"{args.lr} / {args.lr * args.embed_lr_mult}",
             "Epochs / max steps": f"{args.epochs} / {args.max_steps}",
             "Resume": args.resume or "fresh",
             "Data dir": args.data_dir,
@@ -909,6 +1070,31 @@ def run_train(args, logger: logging.Logger):
     )
 
     train_split, val_split = _load_splits(args, meta, logger)
+
+    # Resolve the softmax denominator *before* datasets are built so remapped
+    # targets flow into the collated batches.
+    cat_tokens_full = catalog_token_matrix(meta.catalog, meta.vocab)
+    cat_tokens, target_remap = resolve_label_subset(
+        cat_tokens_full, train_split.targets, val_split.targets, args.label_subset
+    )
+    if args.label_subset == "clicked":
+        for split in (train_split, val_split):
+            split.targets = target_remap[split.targets]
+            if (split.targets < 0).any():
+                raise ValueError(
+                    "label subset 'clicked' dropped a target row; this is a bug "
+                    "(clicked is the union of train+val targets)"
+                )
+        logger.info(
+            f"  + label subset 'clicked': softmax over {human_int(cat_tokens.shape[0])} "
+            f"items (full catalog {human_int(meta.catalog.size)})"
+        )
+    if args.sampled_softmax and args.num_negatives >= cat_tokens.shape[0]:
+        raise ValueError(
+            f"--num_negatives={args.num_negatives} must be < the label space "
+            f"{int(cat_tokens.shape[0])}"
+        )
+
     train_indices = np.arange(len(train_split), dtype=np.int64)
     val_indices = np.arange(len(val_split), dtype=np.int64)
     train_lengths = train_split.lengths[train_indices]
@@ -931,19 +1117,30 @@ def run_train(args, logger: logging.Logger):
     )
 
     # --- model ---------------------------------------------------------------
-    backbone = load_backbone(meta.model_name, meta.vocab.total_size, args, logger)
     if args.resume:
-        logger.info(f"  > loading LoRA adapter from {args.resume}")
-        _, PeftModel, _ = _require_peft()
-        peft_model = PeftModel.from_pretrained(backbone, args.resume, is_trainable=True)
-        if args.gradient_checkpointing:
-            _enable_gradient_checkpointing(peft_model, logger)
+        if meta.use_lora:
+            backbone = load_backbone(meta.model_name, meta.vocab.total_size, args, logger)
+            logger.info(f"  > loading LoRA adapter from {args.resume}")
+            _, PeftModel, _ = _require_peft()
+            backbone_model = PeftModel.from_pretrained(backbone, args.resume, is_trainable=True)
+            if args.gradient_checkpointing:
+                _enable_gradient_checkpointing(backbone_model, logger)
+        else:
+            backbone_model = _load_full_checkpoint(meta.model_name, args.resume, args, logger)
+            if args.gradient_checkpointing:
+                _enable_gradient_checkpointing(backbone_model, logger)
     else:
-        peft_model = build_peft_backbone(backbone, args, logger)
+        backbone = load_backbone(meta.model_name, meta.vocab.total_size, args, logger)
+        if meta.use_lora:
+            backbone_model = build_peft_backbone(backbone, args, logger)
+        else:
+            backbone_model = backbone
+            backbone_model.train()
+            if args.gradient_checkpointing:
+                _enable_gradient_checkpointing(backbone_model, logger)
 
-    cat_tokens = catalog_token_matrix(meta.catalog, meta.vocab)
     retriever = DiGRRetriever(
-        peft_model,
+        backbone_model,
         catalog_token_ids=cat_tokens,
         temperature=meta.temperature,
         l2_normalize=meta.l2_normalize,
@@ -957,7 +1154,7 @@ def run_train(args, logger: logging.Logger):
         train_forward = torch.compile(retriever, dynamic=True)
 
     # --- optimisation --------------------------------------------------------
-    optimizer = build_optimizer(peft_model, args)
+    optimizer = build_optimizer(backbone_model, args)
 
     steps_per_epoch = max(1, len(train_ds) // args.batch_size)
     total_steps = args.max_steps if args.max_steps else args.epochs * steps_per_epoch
@@ -984,22 +1181,35 @@ def run_train(args, logger: logging.Logger):
     best_val = float("inf")
 
     state_path = os.path.join(args.resume, "train_state.pt") if args.resume else None
+    start_batch = 0
     if state_path and os.path.isfile(state_path):
         state = torch.load(state_path, map_location="cpu")
-        start_epoch = int(state.get("epoch", 0)) + 1
         global_step = int(state.get("global_step", 0))
         best_val = float(state.get("best_val", float("inf")))
+        start_epoch, start_batch = resolve_resume_position(state, steps_per_epoch)
+        saved_bs = state.get("batch_size")
+        if saved_bs is not None and int(saved_bs) != int(args.batch_size):
+            logger.warning(
+                f"  ! checkpoint was written with --batch_size {int(saved_bs)} but this "
+                f"run uses {args.batch_size}; the mid-epoch skip offset is approximate"
+            )
         try:
             optimizer.load_state_dict(state["optimizer"])
             scheduler.load_state_dict(state["scheduler"])
             if scaler is not None and state.get("scaler") is not None:
                 scaler.load_state_dict(state["scaler"])
             logger.info(
-                f"  + training state restored: epoch={start_epoch}, step={global_step}, "
-                f"best_val={best_val:.4f}"
+                f"  + training state restored: epoch={start_epoch}, "
+                f"skip {start_batch}/{steps_per_epoch} batches, "
+                f"step={global_step}, best_val={best_val:.4f}"
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"  ! could not restore optimizer/scheduler state: {exc}")
+    if start_epoch >= args.epochs:
+        logger.warning(
+            f"  ! checkpoint already at epoch {start_epoch}/{args.epochs}; "
+            "nothing to train (raise --epochs to extend the run)"
+        )
 
     # --- loaders -------------------------------------------------------------
     collate = make_collate(meta.vocab.pad_id)
@@ -1053,6 +1263,14 @@ def run_train(args, logger: logging.Logger):
         optimizer.zero_grad(set_to_none=True)
 
         epoch_t0 = time.time()
+        resume_skip = start_batch if epoch == start_epoch else 0
+        if resume_skip:
+            logger.info(
+                f"  > epoch {epoch + 1}: skipping {human_int(resume_skip)} already-consumed "
+                f"micro-batches (resume)"
+            )
+        epoch_iter = train_loader if not resume_skip else islice(train_loader, resume_skip, None)
+        batches_done = resume_skip
         micro = 0
         running_loss = 0.0
         running_acc = 0.0
@@ -1061,18 +1279,31 @@ def run_train(args, logger: logging.Logger):
         pending = False
         pending_micros = 0
 
-        for ids, mask, targets, _ in train_loader:
+        for ids, mask, targets, _ in epoch_iter:
             ids = ids.to(device, non_blocking=True)
             mask = mask.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
             tokens_seen += int(mask.sum().item())
+            batches_done += 1
 
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 h = model(ids, mask)
-                logits = model.item_logits(h)
-                loss = F.cross_entropy(
-                    logits, targets, label_smoothing=float(args.label_smoothing)
-                )
+                if args.sampled_softmax:
+                    neg_tokens = retriever.catalog_token_ids[
+                        torch.randint(0, retriever.catalog_size, (args.num_negatives,),
+                                      device=device)
+                    ]
+                    logits = model.item_logits_sampled(h, targets, neg_tokens)
+                    loss = F.cross_entropy(
+                        logits,
+                        torch.zeros(h.shape[0], dtype=torch.long, device=device),
+                        label_smoothing=float(args.label_smoothing),
+                    )
+                else:
+                    logits = model.item_logits(h)
+                    loss = F.cross_entropy(
+                        logits, targets, label_smoothing=float(args.label_smoothing)
+                    )
 
             scaled_loss = loss / float(args.grad_accum)
             if scaler is not None:
@@ -1085,7 +1316,10 @@ def run_train(args, logger: logging.Logger):
             pending_micros += 1
             with torch.no_grad():
                 running_loss += float(loss.item())
-                running_acc += float((logits.argmax(dim=-1) == targets).float().mean().item())
+                if args.sampled_softmax:
+                    running_acc += float((logits.argmax(dim=-1) == 0).float().mean().item())
+                else:
+                    running_acc += float((logits.argmax(dim=-1) == targets).float().mean().item())
                 window += 1
 
             if micro % args.grad_accum != 0:
@@ -1107,6 +1341,26 @@ def run_train(args, logger: logging.Logger):
             pending = False
             pending_micros = 0
             global_step += 1
+
+            if args.save_steps and batches_done % args.save_steps == 0:
+                save_checkpoint(
+                    backbone_model, meta, final_dir,
+                    state={
+                        "epoch": epoch,
+                        "batch": batches_done,
+                        "batch_size": int(args.batch_size),
+                        "global_step": global_step,
+                        "best_val": best_val,
+                        "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict(),
+                        "scaler": scaler.state_dict() if scaler is not None else None,
+                    },
+                )
+                logger.info(
+                    f"  + mid-epoch checkpoint @ ep {epoch + 1} "
+                    f"batch {human_int(batches_done)}/{human_int(steps_per_epoch)} "
+                    f"-> {final_dir}"
+                )
 
             if global_step % args.log_interval == 0:
                 elapsed = max(1e-6, time.time() - epoch_t0)
@@ -1160,21 +1414,25 @@ def run_train(args, logger: logging.Logger):
             )
         logger.info(
             f"  == epoch {epoch + 1} done in {(time.time() - epoch_t0) / 60:.1f} min | "
-            f"val loss {val['loss']:.4f} | acc@1 {val['acc@1']:.4f} | "
-            f"acc@5 {val['acc@5']:.4f}"
+            f"val loss {val['loss']:.4f} | R@1 {val['recall@1']:.4f} | "
+            f"R@5 {val['recall@5']:.4f} | R@10 {val['recall@10']:.4f} | "
+            f"nDCG@10 {val['ndcg@10']:.4f} | MRR {val['mrr']:.4f}"
         )
         if writer is not None:
             writer.add_scalar("val/loss", val["loss"], epoch + 1)
-            writer.add_scalar("val/acc1", val["acc@1"], epoch + 1)
-            writer.add_scalar("val/acc5", val["acc@5"], epoch + 1)
+            for k in EVAL_KS:
+                writer.add_scalar(f"val/recall@{k}", val[f"recall@{k}"], epoch + 1)
+                writer.add_scalar(f"val/ndcg@{k}", val[f"ndcg@{k}"], epoch + 1)
+            writer.add_scalar("val/mrr", val["mrr"], epoch + 1)
 
         improved = val["loss"] < best_val
         if improved:
             best_val = val["loss"]
             save_checkpoint(
-                peft_model, meta, best_dir,
+                backbone_model, meta, best_dir,
                 state={
                     "epoch": epoch,
+                    "batch": steps_per_epoch,
                     "global_step": global_step,
                     "best_val": best_val,
                     "optimizer": optimizer.state_dict(),
@@ -1186,9 +1444,10 @@ def run_train(args, logger: logging.Logger):
 
         if (epoch + 1) % max(1, args.save_interval) == 0 or stop:
             save_checkpoint(
-                peft_model, meta, final_dir,
+                backbone_model, meta, final_dir,
                 state={
                     "epoch": epoch,
+                    "batch": steps_per_epoch,
                     "global_step": global_step,
                     "best_val": best_val,
                     "optimizer": optimizer.state_dict(),
@@ -1202,9 +1461,10 @@ def run_train(args, logger: logging.Logger):
     # --- final artefacts (Phase 4 inference cache) ---------------------------
     if final_saved_epoch != epoch or not os.path.isdir(final_dir):
         save_checkpoint(
-            peft_model, meta, final_dir,
+            backbone_model, meta, final_dir,
             state={
                 "epoch": epoch,
+                "batch": steps_per_epoch,
                 "global_step": global_step,
                 "best_val": best_val,
                 "optimizer": optimizer.state_dict(),
@@ -1212,7 +1472,16 @@ def run_train(args, logger: logging.Logger):
                 "scaler": scaler.state_dict() if scaler is not None else None,
             },
         )
-    path, shape = save_vectors(raw_retriever, final_dir, args.vector_dtype)
+    export_retriever = raw_retriever
+    if args.label_subset == "clicked":
+        export_retriever = DiGRRetriever(
+            raw_retriever.backbone,
+            catalog_token_ids=cat_tokens_full,
+            temperature=meta.temperature,
+            l2_normalize=meta.l2_normalize,
+            logit_chunk=args.logit_chunk,
+        ).to(device)
+    path, shape = save_vectors(export_retriever, final_dir, args.vector_dtype)
     logger.info(f"  + cached catalog vectors {shape} -> {path}")
     if writer is not None:
         writer.flush()
@@ -1237,14 +1506,17 @@ def load_for_inference(args, logger: logging.Logger):
     amp_dtype = dtype_map[args.dtype]
     use_amp = device.type == "cuda" and args.dtype != "fp32"
 
-    backbone = load_backbone(model_name, meta.vocab.total_size, args, logger)
-    _, PeftModel, _ = _require_peft()
-    peft_model = PeftModel.from_pretrained(backbone, args.checkpoint, is_trainable=False)
-    peft_model.eval()
+    if meta.use_lora:
+        backbone = load_backbone(model_name, meta.vocab.total_size, args, logger)
+        _, PeftModel, _ = _require_peft()
+        model = PeftModel.from_pretrained(backbone, args.checkpoint, is_trainable=False)
+    else:
+        model = _load_full_checkpoint(model_name, args.checkpoint, args, logger)
+    model.eval()
 
     cat_tokens = catalog_token_matrix(meta.catalog, meta.vocab)
     retriever = DiGRRetriever(
-        peft_model,
+        model,
         catalog_token_ids=cat_tokens,
         temperature=meta.temperature,
         l2_normalize=meta.l2_normalize,
@@ -1387,7 +1659,7 @@ def run_export(args, logger: logging.Logger):
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="DiGR: Qwen + LoRA generative retrieval over RQ-VAE Semantic IDs",
+        description="DiGR: Qwen generative retrieval over RQ-VAE Semantic IDs",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -1418,6 +1690,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--lora_r", type=int, default=DEFAULT_LORA_R)
     p.add_argument("--lora_alpha", type=int, default=DEFAULT_LORA_ALPHA)
     p.add_argument("--lora_dropout", type=float, default=DEFAULT_LORA_DROPOUT)
+    p.add_argument("--use_lora", action=argparse.BooleanOptionalAction, default=False,
+                   help="use LoRA (q/k/v/o + embed_tokens) instead of full fine-tune")
     p.add_argument("--gradient_checkpointing", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--reinit_embeddings", action=argparse.BooleanOptionalAction, default=True,
                    help="draw N(0,0.02) for the resized token table (every id in the "
@@ -1426,6 +1700,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--l2_normalize", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
     p.add_argument("--logit_chunk", type=int, default=DEFAULT_LOGIT_CHUNK)
+    p.add_argument("--label_subset", choices=["full", "clicked"], default="full",
+                   help="softmax denominator: 'full' = whole catalog; 'clicked' = only "
+                        "items that appear as a train/val target (targets are remapped)")
+    p.add_argument("--sampled_softmax", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="train with sampled softmax over --num_negatives uniform "
+                        "negatives instead of the exact full-catalog denominator "
+                        "(eval still uses the exact denominator)")
+    p.add_argument("--num_negatives", type=int, default=DEFAULT_NUM_NEGATIVES)
     p.add_argument("--compile", action="store_true")
 
     # optimisation
@@ -1442,7 +1725,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--grad_clip", type=float, default=DEFAULT_GRAD_CLIP)
     p.add_argument("--label_smoothing", type=float, default=DEFAULT_LABEL_SMOOTHING)
     p.add_argument("--log_interval", type=int, default=20)
-    p.add_argument("--save_interval", type=int, default=1)
+    p.add_argument("--save_interval", type=int, default=1,
+                   help="epochs between checkpoints")
+    p.add_argument("--save_steps", type=int, default=DEFAULT_SAVE_STEPS,
+                   help="also checkpoint every N optimizer steps so a killed job can "
+                        "resume mid-epoch (0 disables)")
 
     # inference
     p.add_argument("--infer_split", choices=["train", "val", "infer"], default="val",
@@ -1466,8 +1753,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         p.error("--batch_size and --eval_batch_size must be >= 1")
     if args.log_interval < 1 or args.save_interval < 1:
         p.error("--log_interval and --save_interval must be >= 1")
+    if args.save_steps < 0:
+        p.error("--save_steps must be >= 0")
     if args.topk < 1 or args.infer_catalog_chunk < 1 or args.logit_chunk < 1:
         p.error("--topk, --infer_catalog_chunk and --logit_chunk must be >= 1")
+    if args.sampled_softmax and args.num_negatives < 1:
+        p.error("--num_negatives must be >= 1 when --sampled_softmax is set")
     if args.bucket_factor < 1 or args.num_workers < 0:
         p.error("--bucket_factor must be >= 1 and --num_workers >= 0")
     if args.max_rows is not None and args.max_rows < 1:
