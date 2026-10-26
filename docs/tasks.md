@@ -99,10 +99,43 @@ These are small, cheap, and they decide whether TIGER's numbers mean anything.
 
 ---
 
+## Phase 3b: regenerate the SID from behaviour (next, before TIGER)
+
+Why: the current SID is RQ-VAE over the itemDNN content embeddings. Those were
+trained in tandem with HSTU for next click, but they measured behaviourally weak:
+effective rank 24.8, and pooled-history kNN over them loses to popularity at every
+cut-off. The additive DiGR score is only as good as the equivalence structure the
+codes impose, and "shares a code" currently means "content-similar", not
+"behaviourally similar". The co-click matrix (25.7M distinct pairs, 3.71% R@10)
+is the behavioural signal to re-cluster around. Agreed by the user (m03201).
+
+- [ ] 3b.1 Build a behavioural item embedding from the **train-split** co-click
+      matrix. Cheapest defensible first pass: truncated SVD of the log-count
+      item-item matrix, rows L2-normalised, dim 256 to match the existing
+      pipeline. No new dependency, minutes of CPU.
+- [ ] 3b.2 Run the existing RQ-VAE over the behavioural vectors to get a new
+      `catalog_sid_codes.npy`. Same codebook sizes (4x256 + 731) unless the
+      utilisation measurement says otherwise. No "more codes": the content
+      codebook already collapses (3.46M prefixes used of 4.29B capacity), so
+      extra levels would just add empty rows.
+- [ ] 3b.3 Gate. Score the new code buckets against the val targets, reusing the
+      prefix scorer in `Model Training/baselines_digr.py`, and compare to the
+      content SID's 18.3156% at depth 1 and 2.5167% at depth 2. If behavioural
+      depth 1 does not clearly beat 18.3%, stop: re-clustering is not worth a
+      retrain, and go straight to TIGER on the old SID.
+- [ ] 3b.4 If the gate passes, re-train DiGR over the new SID (same flags as the
+      frozen run; only `catalog_sid_codes.npy` changes) and score against the same
+      bar: R@10 3.7069% and R@100 10.9873%.
+- [ ] 3b.5 Feed the same new SID to TIGER in Phase 4, so DiGR and TIGER are
+      compared on the same codes.
+
+---
+
 ## Phase 4: build TIGER
 
 Design is settled: **direct SID input**, user feature block carried, temporal
-tokens carried, same backbone. The input format does not change, so
+tokens carried, same backbone. Uses the SID from Phase 3b when the gate passes,
+the current SID otherwise. The input format does not change, so
 `tokens.npy`, `offsets.npy`, `targets.npy`, `LengthBucketBatchSampler`,
 mid-epoch checkpointing and `catalog_sid_codes.npy` are all reused as they are.
 
@@ -171,11 +204,13 @@ of them can be declared a success.
 
 ## Next step
 
-Phase 3. The bar is fixed at R@10 3.7069% and R@100 10.9873%, so the next work is
-the three things TIGER cannot be written without: the trie over the valid code
-prefixes (3.2), the beam-width cost curve (3.3), and the one page that says TIGER
-is scored on a candidate set while DiGR and co-click are scored on the full catalog
-(3.4). All of it is numpy and CPU, testable without the backbone.
+Phase 3b. The bar is fixed at R@10 3.7069% and R@100 10.9873%, and the codes are
+now the suspected failure rather than the objective. So before TIGER, regenerate
+the SID from the co-click matrix (3b.1 to 3b.3). The gate at 3b.3 is the cheapest
+decision point in the project: a few minutes of CPU says whether a behavioural SID
+is worth a 4.6h DiGR retrain, or whether we go straight to TIGER on the current
+codes.
 
-Do not start Phase 4 before 3.3 exists. A beam width chosen after seeing the
-numbers is not a result.
+The trie and beam work (3.2 to 3.4) stay on the list because TIGER needs them
+either way, but they are not on the critical path until the SID question is
+answered.

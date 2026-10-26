@@ -200,9 +200,12 @@ on which level-0 code the user is in when choosing level 2.
 What TIGER does not fix:
 
 - It keeps the SID, so it inherits whatever the codes do not carry.
-- It keeps 0.376-ish parameters per item at the last level. Level 5 has 731 rows,
-  so the deep codes are as coarse as DiGR's. If the failure is per-item resolution,
-  TIGER inherits part of it.
+- It still shares the 731 level-5 output vectors across every prefix. What it
+  gains over DiGR is the conditioning: the prefix flows into the hidden state, so
+  the 731 vectors are re-weighted per bucket and each bucket gets its own ranking
+  instead of one global scale. Within a bucket there are at most 731 items, so the
+  deep level is close to per-item resolution. The cap that remains is the top four
+  codes deciding which bucket an item lands in.
 - Beam search is approximate. Its numbers are a lower bound at R@k for k above the
   beam width, and that asymmetry has to be stated whenever the table is shown.
 
