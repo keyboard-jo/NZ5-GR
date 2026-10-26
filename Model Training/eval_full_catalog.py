@@ -53,10 +53,10 @@ REF_POPULARITY_R1 = 0.00439453125          # 0.4395%
 # of this value silently loses the last digit, and every lift ratio here divides
 # by it.
 REF_POPULARITY_R10 = 1321 / 98304          # 0.0134379069, i.e. 1.3438%
-# co-click kNN at --history_window 5, the strongest form measured. Window 1 ties
-# at R@10 but loses everywhere above it, so window 5 is the bar to quote.
-REF_COCLICK = {1: 0.007853, 10: 0.036011, 100: 0.104492,
-               1000: 0.236176, 10000: 0.441905}
+# co-click kNN at --history_window 20, the strongest form measured. The sweep
+# 5 -> 10 -> 20 kept rising and window 20 also wins rank 1, so this is the bar.
+REF_COCLICK = {1: 0.008057, 10: 0.037069, 100: 0.109873,
+               1000: 0.253021, 10000: 0.468882}
 REF_COCLICK_R10 = REF_COCLICK[10]
 REF_POPULARITY = {1: 0.00439453125, 10: 1321 / 98304, 100: 0.047862,
                   1000: 0.147288, 10000: 0.368215}

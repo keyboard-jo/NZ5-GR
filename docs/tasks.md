@@ -1,202 +1,181 @@
 # Tasks
 
-State as of 2026-10-26. DiGR is trained, measured and **frozen** at
-`digr_0p6b_e3_full_sampled300k/final`, the baselines are in, and the docs are
-written. TIGER is the next build because it is in the proposal. This file is the
-order of work, with the reason each item exists.
+Working list, ordered. Scope is fixed by `docs/problems.md` section 1: compare
+three retrieval methods that use RQ-VAE Semantic IDs, all on the same backbone,
+same data, same evaluator.
 
-The core problem the ordering solves: TIGER changes the **objective** but keeps the
-**Semantic ID**. Nothing measured so far separates three very different ceilings.
+- **DiGR**: additive read of 1,755 shared code rows. Built, trained, frozen.
+- **TIGER**: autoregressive factorisation over the five codes. Not built.
+- **heuristic**: count tables. Built, and currently winning.
 
-- the LLM encoder is weak
-- the SID representation is the ceiling
-- the next-click task is mostly noise at this data size
+Continuous-vector retrieval and ANN are deferred, not cancelled. See the last
+section for why they are out of this table.
 
-If the second or third is true, TIGER lands where DiGR landed and the proposal's
-head-to-head reads badly. The items in Phase 1 and 2 are what make TIGER's number
-interpretable instead of just another point. They are all CPU-minutes or one short
-GPU job, and they have to happen before the code gets written.
+State as of 2026-10-26.
 
 ---
 
-## Phase 0. Freeze the record
+## Phase 0: freeze what exists (done)
 
-- [x] **Decide DiGR is frozen at `digr_0p6b_e3_full_sampled300k/final`.**
-      Four more GPU-hours on DiGR delays TIGER and cannot beat co-click.
-      Done: `results.md` names that one checkpoint and stops citing the others.
-- [x] **Fix `REF_POPULARITY_R10`** to exactly `1321 / 98304` (1.3438%). The old
-      constant was `1320 / 98304` = 1.3428%, one row short, and the copy in
-      `eval_full_catalog.py` had drifted in the eighth digit as well.
-      Done: both modules now carry the fraction, and a test asserts they agree.
-- [x] **Add a `docs/README.md` index** listing `math.md`, `data.md`,
-      `sid_math.md`, `problems.md`, `results.md`, `tasks.md`, one line each,
-      so a reader knows where to start.
-
----
-
-## Phase 1. The cheap measurements that decide what TIGER's result means
-
-All of these are CPU, minutes, and each one can change the conclusion.
-
-- [ ] **1.1 co-click at window 10 and 20.** 46 s each.
-      Why: the window sweep has not plateaued (window 3 to 5 still adds 6.8% at
-      R@1 and 6.6% at R@10), so the bar TIGER has to clear is still moving. Right
-      now it is R@10 3.6011% / R@100 10.4492% at window 5. Building TIGER against
-      a bar that turns out to be 4.5% would waste the run.
-      Done when `baselines_h10.json` and `baselines_h20.json` exist and the bar is
-      written down as a single number.
-- [ ] **1.2 Repeat-consumption rate.** On the 98,304 val rows, compute
-      `P(target == last event)`, `P(target in history)`, `P(target in the co-click
-      successors of the last 5)`.
-      Why: this is the quantity co-click is really exploiting. If 30% of targets
-      are literally the previous item, the task is partly memorisation and every
-      model number is capped by it. It also measures the headroom TIGER can win by
-      simply attending to its own input.
-      Done when the three fractions are in `results.md`.
-- [ ] **1.3 Train and val user overlap.** `users.npy` exists in both splits.
-      Why: if the same users appear in train and val, co-click memorises exact
-      user-event pairs through the item graph and its advantage is partly a split
-      artefact. Cheap to check, and it is the first question a reviewer asks.
-      Done when overlap is reported as a fraction of val rows.
-- [ ] **1.4 Does the SID carry co-click signal at all?** Compare
-      `P(target's depth-1 code | last item's depth-1 code)` against the marginal
-      base rate `1/256 = 0.39%`, and the same at depth 2 against `1/65536`.
-      Why: B3 already proved first-order code transitions are useless because
-      levels 0 to 3 are 100% dense over 65,536 cells with 34M transitions on them.
-      This measures whether the codes are hopeless or merely badly used. If depth
-      1 gives no lift, TIGER-over-SID cannot beat co-click-over-item-ids and that
-      has to be known before the run, not after.
-      Done when both lifts are printed next to the 1/256 base rate.
-- [ ] **1.5 Target-side coverage.** How many of the 98,304 val targets appear in
-      the train target set, and how many are items with zero training exposure.
-      Why: a target that never appeared in train cannot be learned, only
-      generalised to. This sets the floor that no model can cross and explains part
-      of the 50% miss at R@10000.
-      Done when the coverage fraction is in `results.md`.
+- [x] Freeze DiGR at `digr_0p6b_e3_full_sampled300k/final`. Not `best`, because
+      epoch 2 has the lower val loss and epoch 3 ranks better.
+- [x] `REF_POPULARITY_R10` corrected to exactly `1321 / 98304`
+      (`0.013437906901041666`) in both `Model Training/baselines_digr.py` and
+      `Model Training/eval_full_catalog.py`, with a test that pins the two
+      modules to the same value.
+- [x] `docs/README.md` index, `docs/results.md` holding every measured table.
+- [x] `Model Training/` reorganised: notebooks into `notebooks/`, slurm wrappers
+      into `slurm/`, an index README at the root of that directory.
+- [x] `Model Training/embedding_knn_nextclick.py` and its wrapper, so the item
+      embedding can be scored against real next clicks. Result: it loses to
+      popularity at every cut-off. Recorded, not a blocker.
+- [x] SID prefixes scored against real targets instead of self-graded.
 
 ---
 
-## Phase 2. The one experiment that tests the whole premise
+## Phase 1: what the data actually says (done)
 
-- [ ] **2.1 SASRec or GRU4Rec over raw item ids, same sequences, same split.**
-      Roughly 15 to 30 min on the H800, or a few hours on a big CPU.
-      Why: this is the only measurement that separates "the representation is the
-      ceiling" from "the task is the ceiling". It uses no SIDs, no content, no LLM,
-      just 4,783,154 item embeddings and the same 1,719,430 sequences.
-      - If it reaches R@10 around 15%, the SID is the bottleneck. TIGER keeps the
-        SID, so it inherits the bottleneck, and the honest proposal framing becomes
-        "we reproduce the published framework and show the representation is the
-        limit", which needs the number to make the claim.
-      - If it lands near 7%, the ceiling is the task and the data, and no
-        generative-retrieval variant will clear it.
-      - If it lands near 3%, then co-click's edge is memorisation only and the
-        LLM story is intact.
-      This is also the standard baseline any reviewer will ask for, so it is not
-      optional work.
-      Done when R@1 / R@10 / R@100 are in `results.md` on the same 98,304 rows.
-- [ ] **2.2 A matched-capacity item-id baseline if 2.1 is close to DiGR.**
-      Matrix factorisation or EASE over item ids, R@100 style.
-      Why: DiGR's scoring head is 1,755 code rows times 1,024 = 1,797,120
-      parameters. The co-click table holds 25,669,281 distinct pairs, 14.3x more
-      capacity. That gap alone could explain the whole result, with no statement
-      about the LLM either way.
-      Done when one capacity-matched model has a number.
+- [x] 1.1 How often is the target an item the user already clicked? **0.05%** of
+      val rows. The harness essentially forbids repeats, so a reranker over
+      history is not the answer.
+- [x] 1.2 Depth-1 SID bucket of the last clicked item holds the target
+      **18.3156%** of the time, over 19,308 candidates on average. Depth 2 holds
+      it **2.5167%** of the time over 345.9. Against real targets, not
+      self-graded.
+- [x] 1.3 The quantization is faithful: 18.3156% at depth 1 matches the 16% to
+      20% that the raw vectors' own kNN curve extrapolates to. The RQ-VAE is not
+      destroying signal.
+- [x] 1.4 Target coverage. 488,945 of 4,783,154 items (10.22%) appear as a
+      training target. 37.43% of the top-10 slots filled by the embedding are
+      training targets against that 10.22% base rate, so it is still a popularity
+      smoother, just a weak one.
+- [x] 1.5 User overlap between train and val: still unmeasured. Low cost, low
+      priority now that the failure is localised to the score.
 
 ---
 
-## Phase 3. Measurement infrastructure TIGER needs and does not have
+## Phase 2: fix the bar before building TIGER (done)
 
-- [ ] **3.1 Build the prefix trie.** 3,459,854 valid four-code prefixes out of
-      `256^4 = 4,294,967,296`, so 0.08% of combinations are legal. Unconstrained
-      generation would emit garbage IDs almost always. Minutes of CPU, one artifact
-      next to `digr_data/`.
-      Done when the trie loads and enumerates the top-k continuations of a prefix.
-- [ ] **3.2 Measure the decode cost before committing to a beam size.** Constrained
-      beam decoding is 4 sequential forward passes per step width, so it is far
-      more expensive than `evaluate()`'s single item-logit pass. Beam 100 is needed
-      to report R@100 because beam size caps reachable k.
-      Why: unknown cost, and it decides whether the TIGER eval is 3 minutes or 3
-      hours. Measure on 2,000 rows first.
-      Done when a seconds-per-row figure exists for beam 10 / 100 / 1000.
-- [ ] **3.3 Decide and document the fifth-level protocol.** 1,878,898 items (39.3%)
-      share a four-code prefix, and the level-5 code has 731 values whose ordering
-      is an arbitrary rank, not content.
-      Why: this single choice changes every TIGER number.
-      - score five codes: level 5 must be predicted from co-click within the group,
-        which is a memory task, not a language task
-      - score four codes and call a shared prefix a hit: inflates recall by up to
-        39% relative to DiGR and co-click, which are scored on exact item identity
-        - score four codes strictly, requiring the full five: keeps comparability
-        and loses whatever the level-5 rank could have given
-      Pick one, write the reason in `results.md`, and never quote a TIGER number
-      without it.
-- [ ] **3.4 Build a sliced evaluator.** Every number so far is one average over
-      98,304 rows. Add slices: cold user (no history in train), warm user, repeat
-      target (already in history) versus new target, and head / body / tail of the
-      popularity distribution.
-      Why: this is where the proposal's real claim lives. co-click wins the average
-      because it memorises pairs; DiGR's only structural advantage is a genuine
-      catalog-wide ranking with a long tail, and a short candidate list cannot do
-      that. A single average actively hides the difference the work is about.
-      Done when DiGR, co-click and popularity all report the same slices.
+- [x] 2.1 Co-click at windows 10 and 20, same 98,304 val rows, same
+      `--ks 1,10,100,1000,10000`. Window 20 won.
+- [x] 2.2 Recorded in `docs/results.md`, and `REF_COCLICK` in both
+      `Model Training/baselines_digr.py` and `Model Training/eval_full_catalog.py`
+      now carries the window 20 numbers, with windows 1, 5 and 10 kept beside it
+      so the sweep does not have to be rerun.
+- [x] 2.3 TIGER acceptance bar restated: **beat R@10 3.7069% and R@100 10.9873%**.
+- [x] 2.4 The sweep is closed, not deferred. R@10 went 3.6011 to 3.6794 to 3.7069,
+      steps shrinking 0.35x per doubling, so the asymptote is about 0.015 points
+      higher and further widening is not worth a job.
 
 ---
 
-## Phase 4. Build TIGER
+## Phase 3: protocol, then the trie
 
-Confirmed already: direct SID as input (not title text), plus the user feature
-block and the temporal token, on the unchanged Qwen3-0.6B, so DiGR versus TIGER is
-a single-variable ablation of the objective.
+These are small, cheap, and they decide whether TIGER's numbers mean anything.
 
-- [ ] **4.1 Target construction.** `catalog_sid_codes[targets]` plus `sid_offsets`,
-      five positions, teacher forced, loss on those positions only.
-      Zero preprocessing change: the row already carries SIDs in the same vocab.
-- [ ] **4.2 The factorised objective and loss.**
-      `P(item) = P(c1) P(c2|c1) P(c3|c1c2) P(c4|c1c2c3) P(c5|...)`, five CE terms
-      per row instead of one softmax over the catalog. Reuse the existing dataset,
-      collate, sampler, checkpointing and resume machinery unchanged.
-- [ ] **4.3 Trie-constrained inference** using 3.1, reporting at whatever the
-      protocol in 3.3 requires.
-- [ ] **4.4 Run it.** Expect about 90 minutes per epoch, the same as DiGR, because
-      the 137-token forward pass dominates and the five extra prediction positions
-      are almost free. Three epochs is 4.6 GPU-hours, same budget as DiGR.
-- [ ] **4.5 Report against the real bar**, which is co-click at the best window
-      from 1.1, not DiGR at R@10 2.5940%. Also report the slices from 3.4, since
-      the average may not be where TIGER wins.
-
----
-
-## Phase 5. Write it up
-
-- [ ] **5.1 Decide the claim before writing the prose.** Current evidence says a
-      four-second co-click count table beats a 4.6-GPU-hour model at every cut-off
-      from rank 10 to rank 1,000 (DiGR edges R@1 by 7 rows). The defensible claims that survive are: catalog-wide ranking
-      with a long tail, cold-start handling, and user-feature conditioning. The
-      indefensible claim is "beats the baselines". Write to the first list.
-- [ ] **5.2 `results.md` gets the honest table**, with compute cost next to every
-      metric, because the 4,100x cost ratio is itself a finding.
-- [ ] **5.3 `problems.md` keeps the negative results**: B3 dead by construction, the
-      label-subset experiment, the popularity metric bug, the 62% extrapolation that
-      measured 49.77%, the subset-space checkpoint selection.
+- [x] 3.1 **Fifth-level protocol: decided.** The headline table scores **exact
+      item identity** for all four arms. 39.3% of items share their first four
+      codes and level 5 is an arbitrary rank inside the group, so a prefix hit
+      would inflate recall by up to 39% relative and only for the SID arms. A
+      prefix-hit variant is a footnote, never the headline. Confirmed by the user
+      (m03114, paraphrased).
+- [ ] 3.2 **Build the trie over the 4,783,154 code tuples.** Only 3,459,854 of the
+      4,294,967,296 possible four-code prefixes exist, so unconstrained decoding
+      would emit invalid codes almost always. A prefix index already exists in
+      `Model Training/baselines_digr.py` (`build_prefix_index`), so this is a
+      reuse, not new code.
+- [ ] 3.3 **Measure decode cost for beam widths 10, 50, 100, 500.** R@k above the
+      beam width is structurally unreachable, so the beam has to be at least 1,000
+      for the R@1000 and R@10000 rows to be comparable. If 1,000 is too slow, the
+      table gets a beam-width column and the comparison is stated per cut-off.
+- [ ] 3.4 **Sliced evaluator.** At beam 1,000 the candidate set is 1,000 per query,
+      not 4,783,154, so TIGER is scored by candidate-set ranking while DiGR and
+      co-click are scored by full-catalog ranking. Same metric names, different
+      candidate space. Write the one page that says so before writing the code.
+- [ ] 3.5 Optional sanity run. A tiny SASRec or GRU4Rec over item ids, about 15
+      minutes on GPU, tells us whether an item-id sequence model clears co-click
+      at all on this slice. It is not part of the three-arm table but it bounds
+      what any SID method can hope for.
 
 ---
 
-## Compute
+## Phase 4: build TIGER
 
-4.6 GPU-hours spent on DiGR. Remaining Phase 1 and Phase 3 work is CPU only.
-Phase 2.1 is roughly 0.3 to 0.5 GPU-hours. Phase 4 is 4.6 GPU-hours plus whatever
-3.2 shows decoding costs. Budget about 6 GPU-hours to finish, excluding sweeps, and
-probe any sweep on 1,000 steps (about 26 minutes) rather than a full run.
+Design is settled: **direct SID input**, user feature block carried, temporal
+tokens carried, same backbone. The input format does not change, so
+`tokens.npy`, `offsets.npy`, `targets.npy`, `LengthBucketBatchSampler`,
+mid-epoch checkpointing and `catalog_sid_codes.npy` are all reused as they are.
 
-## The short answer to "what before TIGER"
+- [ ] 4.1 Head. Replace the single full-catalog softmax with five per-level terms.
+      The target for row `j` is `catalog_sid_codes[targets[j]]`, five codes, and
+      the loss is the sum of five cross-entropies over 256, 256, 256, 256, 731.
+      Level 5 has 731 classes, so the last level stays cheap.
+- [ ] 4.2 Inputs. Append the five code tokens to the row after the last event, in
+      the same layout the events already use: temporal token, then five code
+      tokens. Teacher-forced during training, so one forward pass gives all five
+      losses.
+- [ ] 4.3 Inference. Trie-constrained beam, level by level, no teacher forcing.
+      Report the beam width with every number.
+- [ ] 4.4 Reuse, do not rebuild: the training loop, the sampler, atomic
+      checkpointing, `--resume`, `--save_steps`, `--log_interval`, the CSV log and
+      the early-stop-on-val-loss logic all exist in `Model Training/train_digr.py`.
+      Estimate 600 to 800 lines in a new `Model Training/train_tiger.py`.
+- [ ] 4.5 Budget one epoch first. The target sequence is six tokens instead of
+      one, so expect 1.3x to 1.6x a DiGR epoch, roughly 2 to 2.5 h. Extend with
+      `--resume` only if the curve is still moving.
+- [ ] 4.6 Run all five cut-offs, write `R@1/10/100/1000/10000`, nDCG@10, MRR@10,
+      and the beam width into `docs/results.md`.
 
-Three things, in this order.
+---
 
-1. **2.1, the item-id sequential baseline.** One short GPU job that decides whether
-   TIGER can possibly win, and therefore how the proposal's results chapter is
-   framed. Everything else in Phase 1 is cheap context for it.
-2. **1.1, the co-click window sweep to 10 and 20.** TIGER needs a fixed number to
-   be measured against, and the current bar is still rising.
-3. **3.3 and 3.4, the fifth-level protocol and the sliced evaluator.** Both change
-   TIGER's numbers before a single line of training code is written, and both are
-   decisions, not work.
+## Phase 5: the table and the write-up
+
+- [ ] 5.1 One table, four rows (popularity, co-click, DiGR, TIGER), five cut-offs,
+      one column for cost, one column for the candidate space.
+- [ ] 5.2 The conditional-ranking column: "given the target is in the top 1,000,
+      how often does it reach the top 10". This is the column that makes the
+      failure legible, and it currently reads co-click 14.65%, DiGR 12.01%,
+      popularity 9.12%.
+- [ ] 5.3 State the degrees-of-freedom arithmetic explicitly: DiGR's item side is
+      1,755 rows of 1,024 dimensions, 1,797,120 parameters for 4,783,154 items,
+      **0.376 per item**.
+- [ ] 5.4 State what the co-click table has that the model does not: 25,669,281
+      distinct pairs, 5.37 successors per item. This is the honest answer to "why
+      does a count table win".
+- [ ] 5.5 Regenerate every number with `eval_full_catalog.py` and
+      `baselines_digr.py`. Do not quote a number from a notebook, and do not quote
+      the retired ones in `docs/problems.md` section 10.
+
+---
+
+## Deferred: continuous-vector retrieval and ANN
+
+The design that won both competitions, and the only one with per-item resolution.
+Not part of the three-arm table, by decision, but it is the first thing after it.
+
+- [ ] D.1 A query tower and one vector per item, trained with InfoNCE over a large
+      negative bank, served by ANN. This is the arm with 1,024 parameters per item
+      instead of 0.376.
+- [ ] D.2 Action-type conditioning, per the published winners. Currently an
+      explicit non-goal in the DiGR design, and the highest-value change with
+      published evidence behind it.
+- [ ] D.3 Richer time features: absolute timestamps, relative gaps, session
+      structure, periodicity. We currently have one coarse temporal token.
+- [ ] D.4 A data-scale check. 1.72M sequences and 34M events is small next to a
+      competition dataset, and some of the 5x gap may be dose rather than design.
+
+Do not start these before the three-arm table exists. Without a measured bar, any
+of them can be declared a success.
+
+---
+
+## Next step
+
+Phase 3. The bar is fixed at R@10 3.7069% and R@100 10.9873%, so the next work is
+the three things TIGER cannot be written without: the trie over the valid code
+prefixes (3.2), the beam-width cost curve (3.3), and the one page that says TIGER
+is scored on a candidate set while DiGR and co-click are scored on the full catalog
+(3.4). All of it is numpy and CPU, testable without the backbone.
+
+Do not start Phase 4 before 3.3 exists. A beam width chosen after seeing the
+numbers is not a result.

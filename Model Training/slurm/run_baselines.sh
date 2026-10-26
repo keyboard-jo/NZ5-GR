@@ -37,7 +37,10 @@ mkdir -p "${OUT_DIR}"
 # The history window is swept because the published co-click run used window 1,
 # the weakest form, and already tied DiGR at R@10 and R@100. 10000 is included
 # so the recall curve can be read instead of extrapolated.
-for W in 1 3 5; do
+# Window 5 won the first sweep at R@10/R@100 but the curve had not flattened,
+# so 10 and 20 are here to pin the bar before TIGER is measured against it.
+# Window 5 is repeated so the whole table comes from one job.
+for W in 5 10 20; do
   python baselines_digr.py \
     --data_dir "${DATA_DIR}" \
     --eval_split val \

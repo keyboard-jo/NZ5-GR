@@ -14,7 +14,9 @@ recall coincide. `MRR` is truncated at rank 10 everywhere.
 | B3 SID transition (first order, smoothing 0.5) | 3,805 s CPU, 8 workers | 0.0244% | 0.1801% | 0.9410% | 4.2236% | - | 0.00087 | 0.00060 |
 | B4 co-click kNN, window 1, decay 0.5 | 4 s + 46 s CPU | 0.5686% | 2.5238% | 7.4646% | 18.5822% | 39.4318% | 0.01405 | 0.01065 |
 | B4 co-click kNN, window 3, decay 0.5 | 4 s + 46 s CPU | 0.7355% | 3.3783% | 9.6130% | 21.9757% | 42.3777% | 0.01865 | 0.01405 |
-| **B4 co-click kNN, window 5, decay 0.5** | **4 s + 46 s CPU** | **0.7853%** | **3.6011%** | **10.4492%** | **23.6176%** | **44.1905%** | **0.01989** | **0.01499** |
+| B4 co-click kNN, window 5, decay 0.5 | 4 s + 44 s CPU | 0.7853% | 3.6011% | 10.4492% | 23.6176% | 44.1905% | 0.01989 | 0.01499 |
+| B4 co-click kNN, window 10, decay 0.5 | 4 s + 44 s CPU | 0.7985% | 3.6794% | 10.8531% | 24.8311% | 46.2148% | 0.02030 | 0.01529 |
+| **B4 co-click kNN, window 20, decay 0.5** | **4 s + 43 s CPU** | **0.8057%** | **3.7069%** | **10.9873%** | **25.3021%** | **46.8882%** | **0.02044** | **0.01539** |
 | DiGR 0.6B, 3 epochs, 300k sampled negatives | 4.6 GPU-h + 3.2 min eval | 0.7924% | 2.5940% | 7.5094% | 21.6003% | 49.7691% | 0.01570 | 0.01258 |
 | item-embedding kNN, mean of last 1 clicked | 9 min GPU | 0.0173% | 0.5636% | 2.4638% | 8.1807% | - | - | 0.00151 |
 | item-embedding kNN, mean of last 3 clicked | 9 min GPU | 0.0376% | 0.3560% | 2.2156% | 9.7646% | - | - | 0.00112 |
@@ -25,11 +27,14 @@ val loss (11.2342 against 11.2431) but epoch 3 ranks better at every cut-off, so
 `final` is the checkpoint behind the row above and no further DiGR runs are
 planned.
 
-co-click (window 5) over DiGR: R@1 **0.99x**, R@10 **1.39x**, R@100 **1.39x**,
-R@1000 **1.09x**, R@10000 0.89x, nDCG@10 1.27x, MRR 1.19x.
-DiGR over co-click (window 1): R@1 1.39x, R@10 1.03x, R@100 1.01x, R@1000 1.16x,
-R@10000 1.26x.
-DiGR over popularity: R@1 1.80x, R@10 1.93x, R@10000 1.35x.
+co-click (window 20) over DiGR: R@1 **1.02x**, R@10 **1.43x**, R@100 **1.46x**,
+R@1000 **1.17x**, R@10000 0.94x, nDCG@10 1.30x, MRR 1.22x.
+DiGR over co-click (window 20): R@1 0.98x, R@10 0.70x, R@100 0.68x, R@1000 0.85x,
+R@10000 1.06x.
+co-click (window 20) over popularity: R@1 1.83x, R@10 2.76x, R@100 2.30x,
+R@1000 1.72x, R@10000 1.27x.
+DiGR over popularity: R@1 1.80x, R@10 1.93x, R@100 1.57x, R@1000 1.47x,
+R@10000 1.35x.
 DiGR over B3: R@1 32.4x, R@10 14.4x, R@100 8.0x.
 
 Compute ratio DiGR : co-click = 4.6 GPU-h : 4 s = about **4,100x**.
@@ -43,31 +48,46 @@ vector. The old number is retired; every "lift over popularity" claim quoted
 before this is 39% too generous at R@10: DiGR beats popularity 1.93x at R@10,
 not 2.69x.
 
-## 2. A co-click count table beats the model wherever the model was ahead
+## 2. A co-click count table beats the model at every cut-off but the far tail
 
 The published co-click run used window 1, the weakest form. Sweeping the window
-changes the picture completely:
+changes the picture completely, and window 20 is where it closes:
 
 | window | R@1 | R@10 | R@100 | R@1000 | R@10000 |
 |---|---|---|---|---|---|
 | 1 | 0.5686% | 2.5238% | 7.4646% | 18.5822% | 39.4318% |
 | 3 | 0.7355% | 3.3783% | 9.6130% | 21.9757% | 42.3777% |
 | 5 | 0.7853% | 3.6011% | 10.4492% | 23.6176% | 44.1905% |
+| 10 | 0.7985% | 3.6794% | 10.8531% | 24.8311% | 46.2148% |
+| 20 | 0.8057% | 3.7069% | 10.9873% | 25.3021% | 46.8882% |
 | DiGR | 0.7924% | 2.5940% | 7.5094% | 21.6003% | 49.7691% |
 
-At window 5 co-click ties DiGR at R@1 (0.7853% vs 0.7924%, 7 rows out of 98,304)
-and beats it everywhere else up to rank 1,000: 1.39x at R@10, 1.39x at R@100,
-1.09x at R@1000, 1.27x at nDCG@10, 1.19x at MRR. The earlier "DiGR sharpens the
-top-1" reading was an artifact of comparing against the weakest baseline; that
-edge is gone.
+Three things changed as the window widened.
 
-DiGR's only remaining win is R@10000: 49.7691% against 44.1905%, a 1.13x edge in
-the far tail. That is the one band where a model that scores all 4,783,154 items
-beats a table that can only propose a few dozen.
+**The R@1 tie is gone.** At window 5 co-click tied DiGR at rank 1 (0.7853%
+against 0.7924%, 7 rows out of 98,304). At window 20 it wins there as well,
+0.8057% against 0.7924%, so DiGR reproduces at exactly one cut-off out of the five.
 
-The window sweep has not plateaued (window 3 to 5 still adds 6.8% at R@1 and
-6.6% at R@10), and val rows average 19.87 events, so window 10 and 20 are worth
-46 seconds each.
+**The margins widened.** Window 20 beats DiGR by 1.43x at R@10, 1.46x at R@100,
+1.17x at R@1000, 1.30x at nDCG@10 and 1.22x at MRR. The earlier "DiGR sharpens
+the top" reading was an artifact of comparing against the weakest baseline.
+
+**The sweep has closed.** Window 5 to 10 added 2.2% at R@10, window 10 to 20 added
+0.7%. The steps shrink by roughly 0.35x per doubling, which puts the asymptote
+only about 0.015 points above window 20 (R@10 near 3.72%, R@1 near 0.814%).
+Widening further costs another job for a movement smaller than one row in two
+thousand.
+
+DiGR's only remaining win is R@10000: 49.7691% against 46.8882%, a 1.06x edge in
+the far tail, down from 1.13x against window 5. That is still the one band where a
+model that scores all 4,783,154 items beats a table that can only propose a few
+dozen candidates, but it is now the only one.
+
+Why the far end of the window still matters despite `decay 0.5`: a successor seen
+once at distance 10 contributes 0.5^10 = 9.8e-4, while one seen 566 times at
+distance 19 contributes 566 x 0.5^19 = 1.1e-3. The tail keeps adding signal for a
+handful of very common transitions, which is why window 20 still gained over 10
+and why that gain is shrinking.
 
 ## 3. B3 (SID transition) is a negative result, and why
 
@@ -108,12 +128,12 @@ at k = 10,000. The measured value is 49.77%, so the tail slope drops from 1.06 t
 
 Practical reading: a two-stage pipeline keeping 10,000 candidates (0.21% of the
 catalog) recovers half the targets, and co-click with the same budget recovers
-44%. Neither is a clean win for the model.
+47%. Neither is a clean win for the model.
 
 ## 5. The asymmetry that still matters for deployment
 
 A co-click list is short by construction: 5.37 distinct successors per item on
-average (max 566), so a window-5 query proposes roughly 5.37 x 5 = 27 real
+average (max 566), so a window-20 query proposes roughly 5.37 x 20 = 107 real
 candidates and then pads with the popularity order. Most of its R@1000 and
 R@10000 therefore *is* the popularity baseline (36.8215% at R@10000), not
 co-click signal. DiGR, by contrast, produces a genuinely model-ranked list at
@@ -147,14 +167,12 @@ row = [sep][feature tokens][sep][temporal][sid x 5] [temporal][sid x 5] ...
   signal; 1,878,898 items (39%) share a four-code prefix. Keep it in the target
   and also report a 4-code diagnostic.
 
-The bar TIGER has to clear is no longer DiGR: it is co-click at window 5, i.e.
-**R@10 3.6011% and R@100 10.4492%**. Beam size caps the reachable k, so R@100 at
+The bar TIGER has to clear is no longer DiGR: it is co-click at window 20, i.e.
+**R@10 3.7069% and R@100 10.9873%**. Beam size caps the reachable k, so R@100 at
 beam 100 is the headline metric.
 
 ## 7. Open items
 
-- co-click at `--history_window 10` and `20`. 46 s each, and the sweep has not
-  plateaued.
 - B3 at the wide cut-offs, only if the negative result is going into the report.
 - Check whether train and val share users (`users.npy` in both splits). If they
   do, both methods benefit but co-click benefits more directly from exact pair

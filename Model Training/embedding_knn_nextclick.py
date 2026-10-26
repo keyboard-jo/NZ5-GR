@@ -74,8 +74,8 @@ MRR_K = 10          # MRR stays at 10 even when the widest recall cut-off is 100
 REFERENCE: Dict[str, Dict[str, float]] = {
     "popularity": {"R@1": 0.004395, "R@10": 1321 / 98304, "R@100": 0.047862,
                    "R@1000": 0.147288, "mrr@10": 0.006480},
-    "coclick_w5": {"R@1": 0.007853, "R@10": 0.036011, "R@100": 0.104492,
-                   "R@1000": 0.236176, "mrr@10": 0.014990},
+    "coclick_w20": {"R@1": 0.008057, "R@10": 0.037069, "R@100": 0.109873,
+                    "R@1000": 0.253021, "mrr@10": 0.015390},
     "digr": {"R@1": 0.007924, "R@10": 0.025940, "R@100": 0.075094,
              "R@1000": 0.216003, "mrr@10": 0.012580},
 }
@@ -826,7 +826,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     log.info("-" * 78)
     log.info(f"  {'reference (same 98,304 rows, same targets)':<18}")
-    for name in ("popularity", "coclick_w5", "digr"):
+    for name in ("popularity", "coclick_w20", "digr"):
         ref = REFERENCE[name]
         m = {f"recall@{k}": ref.get(f"R@{k}", math.nan) for k in cli.ks}
         m["mrr"] = ref["mrr@10"]

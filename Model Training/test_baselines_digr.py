@@ -440,8 +440,14 @@ def test_reference_constants_are_the_measured_baselines():
     assert B.REF_COCLICK["R@10"] > B.REF_DIGR["R@10"]
     assert B.REF_COCLICK["R@100"] > B.REF_DIGR["R@100"]
     assert B.REF_DIGR["R@10000"] > B.REF_COCLICK["R@10000"]
-    # R@1 is a tie: 7 rows out of 98,304
-    assert abs(B.REF_DIGR["R@1"] - B.REF_COCLICK["R@1"]) < 1e-4
+    # R@1 stopped being a tie once the window reached 20: the count table takes
+    # it outright, so DiGR now holds exactly one cut-off, the far tail.
+    assert B.REF_COCLICK["R@1"] > B.REF_DIGR["R@1"]
+    assert B.REF_COCLICK["R@1"] - B.REF_DIGR["R@1"] < 2e-3
+    # The window sweep has to stay ordered, or the recorded bar is not the best
+    # measured one.
+    assert (B.REF_COCLICK_H1["R@10"] < B.REF_COCLICK_H5["R@10"]
+            < B.REF_COCLICK_H10["R@10"] < B.REF_COCLICK["R@10"])
 
 
 def test_both_modules_quote_the_same_popularity_r10():

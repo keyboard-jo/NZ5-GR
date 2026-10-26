@@ -87,11 +87,19 @@ REF_POPULARITY_R100 = 0.047862             # 4.7862%
 REF_POPULARITY_R1000 = 0.147288            # 14.7288%
 REF_POPULARITY_R10000 = 0.368215           # 36.8215%
 REF_POPULARITY_MRR = 0.00648
-# B4 co-click. The number that matters is window 5, not window 1: widening the
-# window is what turns a tie into a 1.39x loss for the model.
-REF_COCLICK = {"R@1": 0.007853, "R@10": 0.036011, "R@100": 0.104492,
-               "R@1000": 0.236176, "R@10000": 0.441905, "mrr": 0.01499}
-REF_COCLICK_NDCG10 = 0.01989
+# B4 co-click. Window 20 is the bar, not window 1 and not window 5. The sweep
+# 5 -> 10 -> 20 kept rising (R@10 3.6011 -> 3.6794 -> 3.7069) in decaying steps
+# (+2.2% then +0.7%), so the curve has essentially closed. Window 20 also takes
+# rank 1, which window 5 only tied, so DiGR now holds exactly one cut-off: the
+# far tail at R@10000.  Any TIGER number is measured against these.
+REF_COCLICK = {"R@1": 0.008057, "R@10": 0.037069, "R@100": 0.109873,
+               "R@1000": 0.253021, "R@10000": 0.468882, "mrr": 0.01539}
+REF_COCLICK_NDCG10 = 0.02044
+# Earlier windows, kept so the sweep can be read without rerunning it.
+REF_COCLICK_H10 = {"R@1": 0.007985, "R@10": 0.036794, "R@100": 0.108531,
+                   "R@1000": 0.248311, "R@10000": 0.462148, "mrr": 0.01529}
+REF_COCLICK_H5 = {"R@1": 0.007853, "R@10": 0.036011, "R@100": 0.104492,
+                  "R@1000": 0.236176, "R@10000": 0.441905, "mrr": 0.014990}
 REF_COCLICK_H1 = {"R@1": 0.005686, "R@10": 0.025238, "R@100": 0.074646,
                   "R@1000": 0.185822, "R@10000": 0.394318, "mrr": 0.01065}
 # B3 sid_transition is kept for the record but is off by default: it took 3,805 s
@@ -916,21 +924,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"   (recorded earlier, not re-scored)"
         )
     logger.info(
-        f"  {'DiGR ckpt':<16} R@1 {REF_DIGR['R@1'] * 100:7.4f}%  "
-        f"R@10 {REF_DIGR['R@10'] * 100:7.4f}%  "
-        f"nDCG@10 {REF_DIGR_NDCG10:.5f}  MRR {REF_DIGR['mrr']:.5f}"
-    )
-    logger.info(
-        "  DiGR R@100 / R@1000: not measured yet -- that is what "
-        "`eval_full_catalog.py --ks 1,5,10,100,1000` produces, and it decides "
-        "whether the baselines below are losing to a real retriever or just to "
-        "a popularity smoother"
+        f"  {'DiGR ckpt':<16} "
+        + "  ".join(f"R@{k} {REF_DIGR[f'R@{k}'] * 100:7.4f}%"
+                    for k in EVAL_KS if f"R@{k}" in REF_DIGR)
+        + f"  nDCG@10 {REF_DIGR_NDCG10:.5f}  MRR {REF_DIGR['mrr']:.5f}"
     )
     for kind, metrics in results.items():
         logger.info(
-            f"  DiGR / {kind}: "
-            f"R@1 {REF_DIGR['R@1'] / max(1e-12, metrics['recall@1']):.2f}x   "
-            f"R@10 {REF_DIGR['R@10'] / max(1e-12, metrics['recall@10']):.2f}x"
+            f"  DiGR / {kind:<12} "
+            + "  ".join(
+                f"R@{k} "
+                f"{REF_DIGR[f'R@{k}'] / max(1e-12, metrics[f'recall@{k}']):.2f}x"
+                for k in EVAL_KS if f"R@{k}" in REF_DIGR
+            )
+            + "   (< 1.00x means the baseline wins)"
         )
     if "popularity" in results:
         got = results["popularity"]
