@@ -430,12 +430,16 @@ def test_reference_constants_are_the_measured_baselines():
     assert B.REF_POPULARITY_R1 == pytest.approx(0.00439453125)
     # Re-measured by this script; an earlier ad-hoc run's 0.9644% did not
     # reproduce because it used a different frequency vector.
-    assert B.REF_POPULARITY_R10 == pytest.approx(0.013427734375)
+    assert B.REF_POPULARITY_R10 == pytest.approx(1321 / 98304)
     assert B.REF_DIGR["R@1"] > B.REF_POPULARITY_R1
-    assert B.REF_DIGR["R@10"] > B.REF_COCLICK["R@10"]
-    # The whole point of B4: a 6 s count table is within 1.03x of the LLM at
-    # R@10, so the reference must record that, not a flattering comparison.
-    assert B.REF_DIGR["R@10"] / B.REF_COCLICK["R@10"] < 1.10
+    # The headline of the whole exercise: at the strongest window the count
+    # table wins at R@10 and R@100, and DiGR only holds the far tail. Encode
+    # that so a future edit cannot quietly record a flattering comparison.
+    assert B.REF_COCLICK["R@10"] > B.REF_DIGR["R@10"]
+    assert B.REF_COCLICK["R@100"] > B.REF_DIGR["R@100"]
+    assert B.REF_DIGR["R@10000"] > B.REF_COCLICK["R@10000"]
+    # R@1 is a tie: 7 rows out of 98,304
+    assert abs(B.REF_DIGR["R@1"] - B.REF_COCLICK["R@1"]) < 1e-4
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +557,24 @@ def test_accumulate_keeps_mrr_at_ten_when_the_ks_are_wide():
     assert metrics["recall@100"] == 1.0
     assert metrics["ndcg@100"] == pytest.approx(1 / math.log2(61))
     assert metrics["mrr"] == 0.0
+
+
+def test_accumulate_misses_stay_misses_when_ks_are_raised_by_cli(monkeypatch):
+    # main() reassigns the module globals from --ks. accumulate() must resolve
+    # its kmax default at call time, otherwise a miss would get rank 1001 and
+    # count as a hit at k=10000.
+    monkeypatch.setattr(B, "EVAL_KS", (1, 10, 10000))
+    monkeypatch.setattr(B, "KMAX", 10000)
+    metrics = B.empty_metrics()
+    assert "recall@10000" in metrics
+    B.accumulate(metrics, np.arange(1, 11, dtype=np.int64), 0)   # miss
+    assert metrics["recall@10000"] == 0.0
+    assert metrics["mrr"] == 0.0
+    # and a hit inside the wider window still counts
+    metrics = B.empty_metrics()
+    B.accumulate(metrics, np.arange(1, 11, dtype=np.int64), 3)   # rank 3
+    assert metrics["recall@10000"] == 1.0
+    assert metrics["recall@1"] == 0.0
 
 
 def test_coclick_cold_fill_is_bounded_by_the_catalog(data_dir, logger):

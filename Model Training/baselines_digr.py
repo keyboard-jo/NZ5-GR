@@ -80,14 +80,18 @@ TIE_EPS = 1e-6
 # popularity run reported R@10 0.9644%; its R@1 matched to 8 digits but ranks
 # 2-10 did not, so that run used a different frequency vector and is retired.
 REF_POPULARITY_R1 = 0.00439453125          # 0.4395%
-REF_POPULARITY_R10 = 0.013427734375        # 1.3438%  (was 0.9644%, see above)
+REF_POPULARITY_R10 = 0.013437906901041666      # 1321/98304, measured twice
 REF_POPULARITY_R100 = 0.047862             # 4.7862%
 REF_POPULARITY_R1000 = 0.147288            # 14.7288%
+REF_POPULARITY_R10000 = 0.368215           # 36.8215%
 REF_POPULARITY_MRR = 0.00648
-# B4 co-click, the baseline that actually competes: 6 s of counting, no model.
-REF_COCLICK = {"R@1": 0.005676, "R@10": 0.025248, "R@100": 0.074605,
-               "R@1000": 0.185862, "mrr": 0.01065}
-REF_COCLICK_NDCG10 = 0.01405
+# B4 co-click. The number that matters is window 5, not window 1: widening the
+# window is what turns a tie into a 1.39x loss for the model.
+REF_COCLICK = {"R@1": 0.007853, "R@10": 0.036011, "R@100": 0.104492,
+               "R@1000": 0.236176, "R@10000": 0.441905, "mrr": 0.01499}
+REF_COCLICK_NDCG10 = 0.01989
+REF_COCLICK_H1 = {"R@1": 0.005686, "R@10": 0.025238, "R@100": 0.074646,
+                  "R@1000": 0.185822, "R@10000": 0.394318, "mrr": 0.01065}
 # B3 sid_transition is kept for the record but is off by default: it took 3,805 s
 # and scored R@10 0.1801%, 7.5x worse than plain popularity.
 REF_SID_TRANSITION_R10 = 0.001801
@@ -95,8 +99,9 @@ REF_SID_TRANSITION_R10 = 0.001801
 # checkpoint). Epoch 2 has the lower val loss (11.2342) but worse ranking metrics
 # (R@1 0.75%, R@10 2.42%), so `final` is the deployment checkpoint: rank the
 # model by R@10, not by val loss.
-REF_DIGR = {"loss": 11.2431, "R@1": 0.0079, "R@5": 0.0185,
-            "R@10": 0.0259, "mrr": 0.0126}
+REF_DIGR = {"loss": 11.2431, "R@1": 0.007924, "R@10": 0.025940,
+            "R@100": 0.075094, "R@1000": 0.216003, "R@10000": 0.497691,
+            "mrr": 0.01258}
 REF_DIGR_NDCG10 = 0.0157
 
 BANNER_WIDTH = 78
@@ -559,9 +564,10 @@ def build_coclick(layout: SplitLayout, vocab: Dict[str, Any],
 
 def top_from_coclick(table: CoClickTable, query_items: np.ndarray,
                      query_valid: np.ndarray, history_decay: float,
-                     popularity_order: np.ndarray, kmax: int = KMAX
+                     popularity_order: np.ndarray, kmax: Optional[int] = None
                      ) -> np.ndarray:
     """Top-kmax items for one query, count-weighted over the history window."""
+    kmax = KMAX if kmax is None else int(kmax)
     cand_parts: List[np.ndarray] = []
     cnt_parts: List[np.ndarray] = []
     for t in range(len(query_items)):
@@ -617,13 +623,14 @@ def empty_metrics() -> Dict[str, float]:
 
 
 def accumulate(metrics: Dict[str, float], top: np.ndarray, target: int,
-               kmax: int = KMAX) -> None:
+               kmax: Optional[int] = None) -> None:
     """Add one query. A miss gets rank kmax + 1, never rank 0.
 
     Rank 0 would pass every `rank <= k` test and turn 1/log2(rank+1) into a
     division by zero, which is the bug that made an earlier DiGR run report
     infinite nDCG.
     """
+    kmax = KMAX if kmax is None else int(kmax)
     hit = np.flatnonzero(top == target)
     rank = int(hit[0]) + 1 if hit.size else kmax + 1
     metrics["n"] += 1.0
@@ -668,9 +675,9 @@ def _chunk_range(args: Tuple[int, int]) -> Dict[str, float]:
         else:
             top = top_from_coclick(
                 g["coclick"], g["query_items"][i], g["query_valid"][i],
-                g["history_decay"], g["popularity_order"],
+                g["history_decay"], g["popularity_order"], kmax=KMAX,
             )
-        accumulate(metrics, top, target)
+        accumulate(metrics, top, target, kmax=KMAX)
     return metrics
 
 
@@ -705,6 +712,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--data_dir", type=str, required=True,
                    help="preprocessed digr_data directory")
     p.add_argument("--eval_split", type=str, default="val")
+    p.add_argument("--ks", type=str, default=",".join(str(k) for k in EVAL_KS),
+                   help="comma-separated cut-offs. Raising the maximum costs one "
+                        "argpartition per query, so 10000 is affordable")
     p.add_argument("--train_split", type=str, default="train")
     p.add_argument("--baselines", type=str,
                    default="popularity,coclick",
@@ -731,8 +741,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    global EVAL_KS, KMAX
+
     args = build_parser().parse_args(argv)
     logger = setup_logger()
+
+    ks = tuple(sorted({int(x) for x in args.ks.split(",") if x.strip()}))
+    if not ks or ks[0] < 1:
+        raise SystemExit(f"--ks must be positive integers, got {args.ks!r}")
+    EVAL_KS = ks
+    KMAX = max(ks)
 
     if args.history_window < 1:
         raise SystemExit("--history_window must be >= 1")
@@ -756,6 +774,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raise SystemExit(f"catalog code out of range at level {level}")
     logger.info(f"  + catalog {human_int(n_items)} items x {catalog_codes.shape[1]} levels")
     logger.info(f"  + SID sizes {sizes}")
+    logger.info(f"  + cut-offs {list(EVAL_KS)} (topk {KMAX}, MRR@{MRR_K})")
 
     train_targets = load_targets(args.data_dir, args.train_split)
     val_targets = load_targets(args.data_dir, args.eval_split)
@@ -873,23 +892,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         results[kind] = metrics
         logger.info(
             f"  rows {human_int(int(metrics['n']))}   "
-            f"R@1 {metrics['recall@1'] * 100:.4f}%   "
-            f"R@10 {metrics['recall@10'] * 100:.4f}%   "
-            f"R@100 {metrics['recall@100'] * 100:.4f}%   "
-            f"R@1000 {metrics['recall@1000'] * 100:.4f}%   "
-            f"nDCG@10 {metrics['ndcg@10']:.5f}   "
-            f"MRR {metrics['mrr']:.5f}   ({time.time() - start:.0f}s)"
+            + "   ".join(f"R@{k} {metrics[f'recall@{k}'] * 100:.4f}%"
+                         for k in EVAL_KS)
+            + f"   nDCG@10 {metrics['ndcg@10']:.5f}"
+              f"   MRR {metrics['mrr']:.5f}   ({time.time() - start:.0f}s)"
         )
 
     logger.info("")
     banner(logger, "summary, full catalog")
     for kind, metrics in results.items():
         logger.info(
-            f"  {kind:<16} R@1 {metrics['recall@1'] * 100:7.4f}%  "
-            f"R@10 {metrics['recall@10'] * 100:7.4f}%  "
-            f"R@100 {metrics['recall@100'] * 100:7.4f}%  "
-            f"R@1000 {metrics['recall@1000'] * 100:7.4f}%  "
-            f"nDCG@10 {metrics['ndcg@10']:.5f}  MRR {metrics['mrr']:.5f}"
+            f"  {kind:<16} "
+            + "  ".join(f"R@{k} {metrics[f'recall@{k}'] * 100:7.4f}%"
+                        for k in EVAL_KS)
+            + f"  nDCG@10 {metrics['ndcg@10']:.5f}  MRR {metrics['mrr']:.5f}"
         )
     if "popularity" not in results:
         logger.info(

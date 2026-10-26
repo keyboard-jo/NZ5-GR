@@ -37,7 +37,7 @@ python eval_full_catalog.py \
   --checkpoint "${RUN_DIR}/final" \
   --data_dir "${DATA_DIR}" \
   --split val \
-  --ks 1,5,10,100,1000 \
+  --ks 1,10,100,1000,10000 \
   --batch_size 128 \
   --local_files_only \
-  --out_json "${RUN_DIR}/full_catalog_metrics_k1000.json"
+  --out_json "${RUN_DIR}/full_catalog_metrics_k10k.json"

@@ -49,8 +49,14 @@ import train_digr as T  # noqa: E402
 # baselines_digr.py): R@10 1.3438%, not the 0.9644% an earlier ad-hoc run
 # reported -- that run's R@1 matched but its ranks 2-10 did not.
 REF_POPULARITY_R1 = 0.00439453125          # 0.4395%
-REF_POPULARITY_R10 = 0.013427734375        # 1.3438%
-REF_COCLICK_R10 = 0.025248                 # 2.5248%, 6 s of co-click counting
+REF_POPULARITY_R10 = 0.01343798828125      # 1.3438%
+# co-click kNN at --history_window 5, the strongest form measured. Window 1 ties
+# at R@10 but loses everywhere above it, so window 5 is the bar to quote.
+REF_COCLICK = {1: 0.007853, 10: 0.036011, 100: 0.104492,
+               1000: 0.236176, 10000: 0.441905}
+REF_COCLICK_R10 = REF_COCLICK[10]
+REF_POPULARITY = {1: 0.00439453125, 10: 0.01343798828125, 100: 0.047862,
+                  1000: 0.147288, 10000: 0.368215}
 REF_SUBSET_R1 = 0.0083                     # 0.83%, clicked run over 504,404
 REF_SUBSET_R10 = 0.0327                    # 3.27%, clicked run over 504,404
 REF_SUBSET_LOSS = 9.7457
@@ -171,24 +177,34 @@ def main() -> int:
                     f"{rec / uni:7.1f}x uniform")
     logger.info(f"  MRR@{T.MRR_K:<5d}{m['mrr']:.5f}")
     logger.info("-" * 78)
-    logger.info("  reference, same val split:")
-    logger.info(f"    popularity, full catalog   R@1 {100 * REF_POPULARITY_R1:.4f}%  "
-                f"R@10 {100 * REF_POPULARITY_R10:.4f}%")
-    logger.info(f"    co-click kNN, 6 s of counting  R@10 {100 * REF_COCLICK_R10:.4f}%"
-                f"   <- the baseline to beat, not popularity")
+    logger.info("  DiGR / co-click(window 5) / popularity, same rows and cut-offs:")
+    logger.info(f"    {'k':>6}  {'DiGR':>9}  {'co-click':>9}  {'pop':>9}  "
+                f"{'vs co-click':>11}")
+    for k in ks:
+        rec = m[f"recall@{k}"]
+        cc = REF_COCLICK.get(k)
+        pop = REF_POPULARITY.get(k)
+        logger.info(
+            f"    {k:>6}  {100 * rec:8.4f}%  "
+            + (f"{100 * cc:8.4f}%  " if cc else f"{'':>9}  ")
+            + (f"{100 * pop:8.4f}%  " if pop else f"{'':>9}  ")
+            + (f"{rec / cc:10.2f}x" if cc else "")
+        )
     logger.info(f"    this ckpt, 504,404 subset  R@1 {100 * REF_SUBSET_R1:.4f}%  "
-                f"R@10 {100 * REF_SUBSET_R10:.4f}%  loss {REF_SUBSET_LOSS:.4f}")
-    logger.info(f"    (subset numbers came from the training log and are NOT "
-                f"comparable; the lines above are)")
+                f"R@10 {100 * REF_SUBSET_R10:.4f}%  loss {REF_SUBSET_LOSS:.4f}  "
+                f"(NOT comparable, from the training log)")
     logger.info("-" * 78)
     lift1 = m["recall@1"] / REF_POPULARITY_R1
     lift10 = m["recall@10"] / REF_POPULARITY_R10
-    vs_coclick = m["recall@10"] / REF_COCLICK_R10
-    verdict = "BEATS popularity" if lift10 > 1.0 else "does NOT beat popularity"
-    logger.info(f"  lift over popularity: R@1 {lift1:.2f}x  R@10 {lift10:.2f}x  -> {verdict}")
-    logger.info(f"  lift over co-click kNN (R@10 {100 * REF_COCLICK_R10:.4f}%): "
-                f"{vs_coclick:.2f}x  "
-                f"{'-> the LLM encoder adds real signal' if vs_coclick > 1.15 else '-> within noise of a 6 s count table'}")
+    beats = [k for k in ks if REF_COCLICK.get(k) and m[f"recall@{k}"] > REF_COCLICK[k]]
+    loses = [k for k in ks if REF_COCLICK.get(k) and m[f"recall@{k}"] <= REF_COCLICK[k]]
+    logger.info(f"  lift over popularity: R@1 {lift1:.2f}x  R@10 {lift10:.2f}x")
+    logger.info(f"  beats co-click(window 5) at k={beats or 'none'}; "
+                f"loses at k={loses or 'none'}")
+    logger.info(f"  best band: "
+                + ", ".join(
+                    f"R@{k} {m[f'recall@{k}'] / REF_COCLICK[k]:.2f}x"
+                    for k in ks if REF_COCLICK.get(k)))
     logger.info(f"  elapsed {elapsed / 60:.1f} min")
 
     if cli.out_json:
