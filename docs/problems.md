@@ -11,7 +11,7 @@ deliberately about decisions, not about code.
 The DiGR implementation works end to end. It trains a 0.6B LLM backbone over
 RQ-VAE Semantic IDs, scores the full 4.78M catalog, and beats a popularity
 baseline. It also loses to a 46-second co-click count table at every cut-off
-except rank 10,000. That single comparison is why the plan changed. The current
+from rank 10 to rank 1,000, winning only at rank 1 (7 rows) and rank 10,000. That single comparison is why the plan changed. The current
 plan is to stop tuning DiGR, keep it as the frozen reference, and test whether
 the *objective* was the ceiling by running TIGER on the identical backbone, data,
 SIDs, features and evaluator. Before that, the SID itself needs to be
@@ -30,8 +30,8 @@ measured it properly.
 | full labels, 3 epochs, 300k negatives | best DiGR: R@10 2.5940%, 4.6 GPU-h. Val loss bottomed at epoch 2 (11.2342) and rose at epoch 3 (11.2431) while train loss kept falling to 10.9344, a 0.31-nat gap. More epochs is dead |
 | popularity re-measured | the recorded R@10 of 0.9644% was wrong, the correct value is 1.3438%. Every "lift over popularity" claim was 39% too generous at R@10 |
 | B3 SID transition | 18x worse than popularity at R@1. A first-order table over 256-way codebooks has 519 observations per cell, which is not enough for a conditional to beat a marginal. Dropped |
-| B4 co-click, window sweep | window 5 wins: R@10 3.6011%, R@100 10.4492%, in 46 s of CPU. It beats DiGR at R@1, R@10, R@100, R@1000, nDCG@10 and MRR |
-| DiGR at R@10,000 | 49.7691% against co-click's 44.1905%. DiGR's only remaining win is the far tail, at 4,100x the compute |
+| B4 co-click, window sweep | window 5 wins: R@10 3.6011%, R@100 10.4492%, in 46 s of CPU. It beats DiGR at R@10, R@100, R@1000, nDCG@10 and MRR (DiGR edges R@1 by 7 rows) |
+| DiGR at R@10,000 | 49.7691% against co-click's 44.1905%. DiGR's wins are R@1 (7 rows) and the far tail, at 4,100x the compute |
 | TIGER chosen as the next run | the one experiment that changes the objective while holding everything else fixed |
 
 ---
@@ -50,8 +50,8 @@ Same 98,304 val rows, same targets, same 4,783,154-item catalog.
 Read plainly: a table of which items were clicked after which other items, built
 in 46 seconds from the same training rows, recovers more relevant items in the
 top 1,000 than a 0.6B language model that was trained for four and a half GPU
-hours. The model only wins past rank 1,000, and there its advantage is 5.6
-points, which is roughly what you get from having a smoother score function over
+hours. The model wins only at rank 1 (by 7 rows) and past rank 1,000, and at
+rank 10,000 its advantage is 5.6 points, which is roughly what you get from having a smoother score function over
 the 3.2M never-clicked items rather than a hard count table.
 
 Two honest caveats, both of which cut against the model and not for it:

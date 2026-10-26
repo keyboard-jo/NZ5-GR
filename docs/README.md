@@ -12,5 +12,5 @@ Index only. Each file stands alone.
 | `tasks.md` | what is left to do, in order, with the reason each item exists |
 
 Current state in one line: a four-second co-click count table beats the 4.6
-GPU-hour DiGR model at every cut-off below 1,000, and DiGR only wins the far tail.
+GPU-hour DiGR model at every cut-off from rank 10 to rank 1,000, and DiGR wins only rank 1 (7 rows) and the far tail.
 Read `results.md` for the numbers and `problems.md` for what that implies.

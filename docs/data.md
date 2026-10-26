@@ -95,7 +95,7 @@ was left unset, so level 5 grew to the largest four-code group (731 items).
 ```
 manifest.json            paths, max_seq_len, preprocessing flags
 vocab.json               token ids and offsets
-catalog_item_ids.npy     (4,783,154,)  business item_id per catalog row
+catalog_item_ids.npy     (4,783,154,)  canonical catalog index (1..N) per catalog row
 catalog_sid_codes.npy    (4,783,154, 5) int32, codes without the vocab offset
 catalog_meta.json        sizes, collision stats
 users.npy                user ids over the harvested rows

@@ -170,7 +170,7 @@ a single-variable ablation of the objective.
 
 - [ ] **5.1 Decide the claim before writing the prose.** Current evidence says a
       four-second co-click count table beats a 4.6-GPU-hour model at every cut-off
-      below 1,000. The defensible claims that survive are: catalog-wide ranking
+      from rank 10 to rank 1,000 (DiGR edges R@1 by 7 rows). The defensible claims that survive are: catalog-wide ranking
       with a long tail, cold-start handling, and user-feature conditioning. The
       indefensible claim is "beats the baselines". Write to the first list.
 - [ ] **5.2 `results.md` gets the honest table**, with compute cost next to every
