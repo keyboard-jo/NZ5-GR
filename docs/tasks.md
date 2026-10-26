@@ -99,43 +99,78 @@ These are small, cheap, and they decide whether TIGER's numbers mean anything.
 
 ---
 
-## Phase 3b: regenerate the SID from behaviour (next, before TIGER)
+## Phase 3b: enriched SID (content + behavioural), second arm after TIGER
 
-Why: the current SID is RQ-VAE over the itemDNN content embeddings. Those were
-trained in tandem with HSTU for next click, but they measured behaviourally weak:
-effective rank 24.8, and pooled-history kNN over them loses to popularity at every
-cut-off. The additive DiGR score is only as good as the equivalence structure the
-codes impose, and "shares a code" currently means "content-similar", not
-"behaviourally similar". The co-click matrix (25.7M distinct pairs, 3.71% R@10)
-is the behavioural signal to re-cluster around. Agreed by the user (m03201).
+Content and behavioural are not competitors; they answer different questions, and
+the design uses both. Content stays the base because it covers every item and is
+orthogonal to the clicks being predicted. Behavioural meaning is added by
+concatenating a behavioural vector onto the content vector before RQ-VAE, not by
+replacing content. Every item still gets a full five-code SID; the behavioural
+component is zero-filled for the 67% never-clicked, so the hybrid lives inside
+the embedding, not in the tokenisation.
 
-- [ ] 3b.1 Build a behavioural item embedding from the **train-split** co-click
-      matrix. Cheapest defensible first pass: truncated SVD of the log-count
-      item-item matrix, rows L2-normalised, dim 256 to match the existing
-      pipeline. No new dependency, minutes of CPU.
-- [ ] 3b.2 Run the existing RQ-VAE over the behavioural vectors to get a new
-      `catalog_sid_codes.npy`. Same codebook sizes (4x256 + 731) unless the
-      utilisation measurement says otherwise. No "more codes": the content
-      codebook already collapses (3.46M prefixes used of 4.29B capacity), so
-      extra levels would just add empty rows.
-- [ ] 3b.3 Gate. Score the new code buckets against the val targets, reusing the
-      prefix scorer in `Model Training/baselines_digr.py`, and compare to the
-      content SID's 18.3156% at depth 1 and 2.5167% at depth 2. If behavioural
-      depth 1 does not clearly beat 18.3%, stop: re-clustering is not worth a
-      retrain, and go straight to TIGER on the old SID.
-- [ ] 3b.4 If the gate passes, re-train DiGR over the new SID (same flags as the
-      frozen run; only `catalog_sid_codes.npy` changes) and score against the same
-      bar: R@10 3.7069% and R@100 10.9873%.
-- [ ] 3b.5 Feed the same new SID to TIGER in Phase 4, so DiGR and TIGER are
-      compared on the same codes.
+Two arms, in order:
+- content SID (current): the pure measurement of whether the backbone can learn
+  retrieval from a content tokenisation alone.
+- content + behavioural SID: the enriched measurement of whether behavioural
+  meaning in the codes buys anything.
+
+- [ ] 3b.1 (after TIGER is measured on the content SID) Build the behavioural
+      component from the train co-click matrix (truncated SVD, dim 256, rows
+      L2-normalised), zero-fill for never-clicked items, concatenate with the
+      content vector, run the existing RQ-VAE over the combined 512-d input.
+- [ ] 3b.2 Gate the new code buckets against the content depth-1 recall of
+      18.3156% before retraining anything.
+- [ ] 3b.3 If the gate passes, re-train DiGR and TIGER over the enriched SID and
+      report both arms side by side.
+- [ ] 3b.4 Retrain arm (the alternative to 3b.1). Re-run Stage 1 with the
+      `docs/embedding_weakness.md` section 4 fixes: a larger HSTU, untied or
+      dual-path ItemDNN, more negatives (cross-GPU or a memory bank), a higher
+      learning rate, a gentler LogQ. Re-export and re-quantise. Higher ceiling,
+      more expensive, and gated on the Phase 3c probe proving the behaviour is
+      in the tower.
+
+---
+
+## Phase 3c: validate the HSTU tower
+
+The item side is behaviourally weak (effective rank 24.8, kNN loses to
+popularity). `docs/embedding_weakness.md` section 3 says the behaviour went into
+the HSTU user encoder, not the item vectors. Prove that before spending anything
+on regenerating the embedding: score the trained user vector on the same 98,304
+val rows and see whether it beats the pooled-history kNN query, and ideally
+popularity and co-click.
+
+- [ ] 3c.1 New script `Model Training/probe_hstu.py`. It is a model probe, not a
+      change to `embedding_knn_nextclick.py`, which stays model-free. It loads
+      `stage1_rec_model.pt`, rebuilds ItemDNN, HSTU, action embedding and input
+      norm from the state dicts, and rebuilds the feature store from
+      `canonical_items.parquet` with the checkpoint's saved args (the store is a
+      non-persistent buffer, so it is not in the checkpoint).
+- [ ] 3c.2 Query = `encode_user(history_items, history_actions, mask)`;
+      candidates = the full 4,783,154 item vectors; score = cosine, since both
+      sides are already L2-normalised and temperature is a scalar that does not
+      change ranking. Report R@1/10/100/1000 and MRR@10 on the exact val rows.
+- [ ] 3c.3 The input-format gap is the real work. DiGR tokens carry SID codes and
+      temporal tokens, not item ids or actions. Item ids are recoverable (SID to
+      catalog to item id, already in the kNN probe), but actions are not in the
+      DiGR tokens. Two paths: (a) a cheap smoke test on the Stage-1 val parquet
+      if it exists, which validates the tower but on a different row set; (b) the
+      comparable run that reconstructs history items and actions for the exact
+      val rows, re-reading `seq.parquet` for the action types. Only (b) goes into
+      `docs/results.md`.
+- [ ] 3c.4 Read the answer against the existing bands: HSTU R@10 above 2% means
+      the behaviour is in the tower and regeneration is the fix; below 2% means
+      the Stage-1 model has no behaviour anywhere, and retraining the model
+      itself (3b.4) is the prerequisite, not the embedding.
 
 ---
 
 ## Phase 4: build TIGER
 
 Design is settled: **direct SID input**, user feature block carried, temporal
-tokens carried, same backbone. Uses the SID from Phase 3b when the gate passes,
-the current SID otherwise. The input format does not change, so
+tokens carried, same backbone, and the existing content SID. The input format
+does not change, so
 `tokens.npy`, `offsets.npy`, `targets.npy`, `LengthBucketBatchSampler`,
 mid-epoch checkpointing and `catalog_sid_codes.npy` are all reused as they are.
 
@@ -204,13 +239,13 @@ of them can be declared a success.
 
 ## Next step
 
-Phase 3b. The bar is fixed at R@10 3.7069% and R@100 10.9873%, and the codes are
-now the suspected failure rather than the objective. So before TIGER, regenerate
-the SID from the co-click matrix (3b.1 to 3b.3). The gate at 3b.3 is the cheapest
-decision point in the project: a few minutes of CPU says whether a behavioural SID
-is worth a 4.6h DiGR retrain, or whether we go straight to TIGER on the current
-codes.
+Phase 3c: validate the HSTU tower. Score the trained user encoder against the
+same 98,304 val rows. If it clears the pooled-history kNN query (and ideally the
+2% band), the behaviour is in the tower and Phase 3b regeneration (concat or
+retrain) is the fix. If it does not, the Stage-1 model has no behaviour anywhere,
+and 3b.4 retraining the model becomes the prerequisite for any embedding change.
 
-The trie and beam work (3.2 to 3.4) stay on the list because TIGER needs them
-either way, but they are not on the critical path until the SID question is
-answered.
+TIGER (Phase 4) is unchanged: it runs on the existing content SID, and its bar is
+R@10 3.7069% and R@100 10.9873% (co-click window 20). The probe and the TIGER
+build are independent, so run the probe while the trie and beam work (3.2 to 3.4)
+is in flight.

@@ -10,9 +10,11 @@ Index only. Each file stands alone.
 | `results.md` | the measured table, every method on the same 98,304 rows, with compute cost |
 | `problems.md` | what those results mean for the direction of the project, including what went wrong |
 | `tasks.md` | what is left to do, in order, with the reason each item exists |
+| `embedding_weakness.md` | why the Stage 1 item embeddings are behaviourally weak, and what OnePiece does differently |
 | `recap_supervisor.md` | a self-contained status snapshot for the co-supervisor, current as of 2026-10-26 |
 
 Current state in one line: a 47-second co-click count table beats the 4.6
 GPU-hour DiGR model at every cut-off except rank 10,000, and the next step is to
-regenerate the SID from behaviour instead of content.
+build TIGER on the existing content SID, since the binding constraint is DiGR's
+additive head, not the tokenisation.
 Read `results.md` for the numbers and `problems.md` for what that implies.
