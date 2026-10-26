@@ -15,7 +15,7 @@ cluster scratch   /scratch/mscbdtspod2026/jksulaiman/data/
 cluster archive   $HOME/NZ5/train_model/archive/
                     2026-10-23-preprocess-01/digr_data  same split, used by the CPU baselines
 local             C:/Users/justin/Documents/GitHub/NZ5-GR/
-                    Model Training/data_snapshot.md      raw-file sample
+                    Model Training/notebooks/data_snapshot.md   raw-file sample
                     SID Generation/                     RQ-VAE
 ```
 
@@ -236,6 +236,12 @@ sample, so candidate counts are about 1/96 of the true catalog) reported, for
 | 2 | 16.828% | 2,104x | 4.13 | 21.7% |
 | 3 | 2.626% | 2,626x | 0.31 | 84.0% |
 | 4 | 0.346% | - | 0.036 | 97.24% |
+
+**These are self-graded and were later superseded.** The probe's "target" is the
+embedding's own nearest neighbour, so the table measures bucket purity of the
+geometry, not next-click. Scored against the real val targets the same buckets give
+**18.3156%** at depth 1 and **2.5167%** at depth 2. See `docs/results.md` section 8.
+Do not quote the numbers in this table as retrieval recall.
 
 Read as a retrieval table, this says the coarsest code carries most of the
 signal: depth 1 alone agrees 71% of the time against a 0.39% base rate. Read as

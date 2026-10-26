@@ -183,14 +183,32 @@ HSTU sequence tower. Whether that leaves pairwise item similarity predictive of 
 next click is unmeasured, and it is the question that decides whether the SID is
 worth defending.
 
-Concretely missing:
+Concretely missing, as of when this file was written:
 
-- raw-embedding kNN scored against the real val targets, on the 98,304 val rows,
-  for comparison with co-click at R@10 3.6011% and DiGR at 2.5940%
-- the prefix buckets scored against the same real targets, which de-circularises
-  the 71% table
 - anything about behaviour at all, since notebook sections 7 to 10 (mm_emb probe,
   adjacent-history pairs, item_id leakage, clustering) were skipped
+
+### 9a. Measured since (2026-10-25)
+
+`Model Training/embedding_knn_nextclick.py`, log `logs/digr_emb_nextclick_715249.out`,
+98,304 val rows, ground truth is the real next click rather than the embedding's own
+neighbours:
+
+| probe | result against the real target |
+|---|---|
+| embedding kNN, mean of last 1 clicked | R@1 0.0173%  R@10 0.5636%  R@100 2.4638%  R@1000 8.1807% |
+| embedding kNN, mean of last 5 clicked | R@1 0.0539%  R@10 0.3174%  R@100 2.0742%  R@1000 9.6965% |
+| depth-1 bucket | 18.3156% candidate recall, 19,308 mean candidates |
+| depth-2 bucket | 2.5167% candidate recall, 345.9 mean candidates |
+
+So the 71.158% in section 7 becomes **18.3156%** once the ground truth is what the
+user clicks next, and 16.828% becomes **2.5167%**. Both stay far above a random
+bucket (45x and 348x), so the codes are a faithful compression of the geometry. The
+geometry is the problem: the raw embedding loses to a popularity count at every
+cut-off, and a depth-1 bucket at 19,308 candidates lands where the embedding's own
+kNN curve says it should, so nothing is being lost in the quantiser.
+
+Full comparison table in `docs/results.md` section 8.
 
 ---
 

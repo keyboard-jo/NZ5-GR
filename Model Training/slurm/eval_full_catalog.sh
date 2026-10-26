@@ -9,6 +9,10 @@
 #SBATCH --partition=normal
 #SBATCH --gpus-per-node=1
 
+# Run from the parent dir so `logs/` and `python *.py` keep resolving the way
+# they did when this script lived next to the code. `sbatch slurm/<name>.sh`.
+cd "$(dirname "$0")/.." || exit 1
+
 module purge
 module load Anaconda3/2023.09-0
 module load cuda12.2/toolkit/12.2.2

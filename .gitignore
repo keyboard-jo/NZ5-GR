@@ -57,3 +57,7 @@ current_fix.md
 prompt.md
 
 local
+# --- Python caches ---
+__pycache__/
+.pytest_cache/
+*.pyc

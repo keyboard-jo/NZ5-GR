@@ -16,6 +16,9 @@ recall coincide. `MRR` is truncated at rank 10 everywhere.
 | B4 co-click kNN, window 3, decay 0.5 | 4 s + 46 s CPU | 0.7355% | 3.3783% | 9.6130% | 21.9757% | 42.3777% | 0.01865 | 0.01405 |
 | **B4 co-click kNN, window 5, decay 0.5** | **4 s + 46 s CPU** | **0.7853%** | **3.6011%** | **10.4492%** | **23.6176%** | **44.1905%** | **0.01989** | **0.01499** |
 | DiGR 0.6B, 3 epochs, 300k sampled negatives | 4.6 GPU-h + 3.2 min eval | 0.7924% | 2.5940% | 7.5094% | 21.6003% | 49.7691% | 0.01570 | 0.01258 |
+| item-embedding kNN, mean of last 1 clicked | 9 min GPU | 0.0173% | 0.5636% | 2.4638% | 8.1807% | - | - | 0.00151 |
+| item-embedding kNN, mean of last 3 clicked | 9 min GPU | 0.0376% | 0.3560% | 2.2156% | 9.7646% | - | - | 0.00112 |
+| item-embedding kNN, mean of last 5 clicked | 9 min GPU | 0.0539% | 0.3174% | 2.0742% | 9.6965% | - | - | 0.00110 |
 
 DiGR is frozen at `digr_0p6b_e3_full_sampled300k/final`. Epoch 2 wrote a lower
 val loss (11.2342 against 11.2431) but epoch 3 ranks better at every cut-off, so
@@ -160,3 +163,54 @@ beam 100 is the headline metric.
 - Not yet spent: more exposure (3 anchors/record = 2.48M rows instead of 1.72M),
   a larger backbone, or TIGER. TIGER first, because it tests the hypothesis that
   the additive score is the problem.
+- The one embedding probe not yet run: the Stage 1 HSTU **query** vector instead
+  of a pooled history. Section 8 tests the item tower's content geometry, which is
+  not what the served retriever queries with. If the HSTU query also fails, the
+  two-tower model is the thing to fix; if it succeeds, only the probe was wrong and
+  the catalog vectors stay usable.
+
+---
+
+## 8. The embedding does not predict the next click
+
+`Model Training/embedding_knn_nextclick.py`, 9 min on one H800, exact cosine over
+the full 4,783,154 x 256 matrix, scored against the same val targets as everything
+else. The query is the mean of the last k clicked item vectors, re-normalised.
+
+| cut-off | popularity | embedding (last 1) | ratio |
+|---|---|---|---|
+| R@1 | 0.4395% | 0.0173% | 25x worse |
+| R@10 | 1.3438% | 0.5636% | 2.4x worse |
+| R@100 | 4.7862% | 2.4638% | 1.9x worse |
+| R@1000 | 14.7288% | 8.1807% | 1.8x worse |
+
+The item embedding loses to a frequency count at every cut-off. It is not noise,
+it is the wrong quantity. 37.43% of the w1 top-10 slots are items that appear as a
+train target somewhere, against a 10.22% base rate, so the embedding does retrieve
+clickable items; it retrieves someone's clickable item, not this row's. R@1 of
+0.0173% is 17 rows out of 98,304, because the nearest neighbour of the last clicked
+item is usually a near-duplicate of that item.
+
+Longer history helps deep cut-offs and hurts the top. w1 to w5 moves R@1000 from
+8.18% to 9.70% and R@10 from 0.5636% to 0.3174%: mean pooling over more items blurs
+the query into a genre centroid, which is the popularity smoother the R@1 column
+says it is.
+
+Two facts that make this a measurement rather than a bug: the target is already in
+the row's own history for only 0.05% of rows, and the last clicked item is missing
+from the catalog for 0.0000% of rows.
+
+The SID is not the culprit, which is the point of `docs/sid_results.md`. Against the
+same real targets, a depth-1 bucket holds 19,308 items and contains the target
+18.3156% of the time (45x lift over 0.40% of the catalog); a depth-2 bucket holds
+345.9 items and contains it 2.5167% of the time (348x lift over 0.0072%). The
+depth-1 bucket at 19,308 candidates sits inside the range the embedding's own kNN
+curve predicts for that budget (about 16% to 20%, log-linear extrapolation of
+0.5636% at 10, 2.4638% at 100, 8.1807% at 1,000), so the code faithfully compresses
+the geometry and loses nothing. The geometry itself is weak.
+
+The deployment reading: the behaviour is not in the item vectors. A 25.7M-pair
+co-occurrence count built in 4 seconds reaches 23.6176% at 1,000 candidates; the
+codes need 19,308 candidates to reach 18.3156%, and 8.1807% is all the raw vectors
+manage at 1,000. That gap is why DiGR, which reads the codes, cannot outrun a count
+table.
