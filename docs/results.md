@@ -1,5 +1,9 @@
 # DiGR vs baselines: consolidated results
 
+Companion files: `docs/math.md` (the formulas and why each baseline behaves as it
+does), `docs/data.md` (what the numbers are), `docs/problems.md` (what this table
+means for the direction of the project).
+
 All numbers are on the **same 98,304 val rows**, the **same val targets**, and the
 **same full catalog of 4,783,154 items**. One target per row, so hit rate and
 recall coincide. `MRR` is truncated at rank 10 everywhere.
@@ -12,6 +16,11 @@ recall coincide. `MRR` is truncated at rank 10 everywhere.
 | B4 co-click kNN, window 3, decay 0.5 | 4 s + 46 s CPU | 0.7355% | 3.3783% | 9.6130% | 21.9757% | 42.3777% | 0.01865 | 0.01405 |
 | **B4 co-click kNN, window 5, decay 0.5** | **4 s + 46 s CPU** | **0.7853%** | **3.6011%** | **10.4492%** | **23.6176%** | **44.1905%** | **0.01989** | **0.01499** |
 | DiGR 0.6B, 3 epochs, 300k sampled negatives | 4.6 GPU-h + 3.2 min eval | 0.7924% | 2.5940% | 7.5094% | 21.6003% | 49.7691% | 0.01570 | 0.01258 |
+
+DiGR is frozen at `digr_0p6b_e3_full_sampled300k/final`. Epoch 2 wrote a lower
+val loss (11.2342 against 11.2431) but epoch 3 ranks better at every cut-off, so
+`final` is the checkpoint behind the row above and no further DiGR runs are
+planned.
 
 co-click (window 5) over DiGR: R@1 **0.99x**, R@10 **1.39x**, R@100 **1.39x**,
 R@1000 **1.09x**, R@10000 0.89x, nDCG@10 1.27x, MRR 1.19x.
@@ -148,8 +157,6 @@ beam 100 is the headline metric.
   do, both methods benefit but co-click benefits more directly from exact pair
   memorisation, which weakens the headline. Cheap to check, worth doing before
   anything is claimed publicly.
-- `REF_POPULARITY_R10` is off by one row (1.3428% recorded vs 1.3438% measured);
-  correct the constant.
 - Not yet spent: more exposure (3 anchors/record = 2.48M rows instead of 1.72M),
   a larger backbone, or TIGER. TIGER first, because it tests the hypothesis that
   the additive score is the problem.

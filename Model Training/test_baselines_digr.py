@@ -429,8 +429,10 @@ def test_make_ranges_covers_every_row_once():
 def test_reference_constants_are_the_measured_baselines():
     assert B.REF_POPULARITY_R1 == pytest.approx(0.00439453125)
     # Re-measured by this script; an earlier ad-hoc run's 0.9644% did not
-    # reproduce because it used a different frequency vector.
-    assert B.REF_POPULARITY_R10 == pytest.approx(1321 / 98304)
+    # reproduce because it used a different frequency vector.  Exact, not
+    # approx: the two modules used to disagree in the 8th digit, and every
+    # lift ratio in the reports divides by this number.
+    assert B.REF_POPULARITY_R10 == 1321 / 98304
     assert B.REF_DIGR["R@1"] > B.REF_POPULARITY_R1
     # The headline of the whole exercise: at the strongest window the count
     # table wins at R@10 and R@100, and DiGR only holds the far tail. Encode
@@ -440,6 +442,15 @@ def test_reference_constants_are_the_measured_baselines():
     assert B.REF_DIGR["R@10000"] > B.REF_COCLICK["R@10000"]
     # R@1 is a tie: 7 rows out of 98,304
     assert abs(B.REF_DIGR["R@1"] - B.REF_COCLICK["R@1"]) < 1e-4
+
+
+def test_both_modules_quote_the_same_popularity_r10():
+    """eval_full_catalog.py carries its own copy; keep the copies identical."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import eval_full_catalog as E
+
+    assert E.REF_POPULARITY_R10 == B.REF_POPULARITY_R10
+    assert E.REF_POPULARITY[10] == B.REF_POPULARITY_R10
 
 
 # ---------------------------------------------------------------------------

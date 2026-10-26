@@ -80,7 +80,9 @@ TIE_EPS = 1e-6
 # popularity run reported R@10 0.9644%; its R@1 matched to 8 digits but ranks
 # 2-10 did not, so that run used a different frequency vector and is retired.
 REF_POPULARITY_R1 = 0.00439453125          # 0.4395%
-REF_POPULARITY_R10 = 0.013437906901041666      # 1321/98304, measured twice
+# 1321 hits out of 98,304 rows. Kept as a fraction so the value stays exact; a
+# rounded decimal shifts every lift ratio printed from it.
+REF_POPULARITY_R10 = 1321 / 98304          # 1.3438%
 REF_POPULARITY_R100 = 0.047862             # 4.7862%
 REF_POPULARITY_R1000 = 0.147288            # 14.7288%
 REF_POPULARITY_R10000 = 0.368215           # 36.8215%

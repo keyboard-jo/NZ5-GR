@@ -49,13 +49,16 @@ import train_digr as T  # noqa: E402
 # baselines_digr.py): R@10 1.3438%, not the 0.9644% an earlier ad-hoc run
 # reported -- that run's R@1 matched but its ranks 2-10 did not.
 REF_POPULARITY_R1 = 0.00439453125          # 0.4395%
-REF_POPULARITY_R10 = 0.01343798828125      # 1.3438%
+# Written as a fraction on purpose: 1321 rows out of 98,304. A printed decimal
+# of this value silently loses the last digit, and every lift ratio here divides
+# by it.
+REF_POPULARITY_R10 = 1321 / 98304          # 0.0134379069, i.e. 1.3438%
 # co-click kNN at --history_window 5, the strongest form measured. Window 1 ties
 # at R@10 but loses everywhere above it, so window 5 is the bar to quote.
 REF_COCLICK = {1: 0.007853, 10: 0.036011, 100: 0.104492,
                1000: 0.236176, 10000: 0.441905}
 REF_COCLICK_R10 = REF_COCLICK[10]
-REF_POPULARITY = {1: 0.00439453125, 10: 0.01343798828125, 100: 0.047862,
+REF_POPULARITY = {1: 0.00439453125, 10: 1321 / 98304, 100: 0.047862,
                   1000: 0.147288, 10000: 0.368215}
 REF_SUBSET_R1 = 0.0083                     # 0.83%, clicked run over 504,404
 REF_SUBSET_R10 = 0.0327                    # 3.27%, clicked run over 504,404
