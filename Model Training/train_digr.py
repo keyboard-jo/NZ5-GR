@@ -209,6 +209,9 @@ DEFAULT_LOGIT_CHUNK = 500_000
 DEFAULT_NUM_NEGATIVES = 100_000
 DEFAULT_SAVE_STEPS = 1000        # mid-epoch checkpoint interval; 0 disables
 EVAL_KS = (1, 5, 10)                   # ranking cut-offs reported by evaluate()
+MRR_K = 10                             # MRR is always truncated here.  A
+# recall@N curve needs EVAL_KS widened (eval_full_catalog.py --ks), but MRR@1000
+# is a different number from MRR@10 and would silently inflate the comparison.
 
 BANNER_WIDTH = 88
 
@@ -908,8 +911,9 @@ def evaluate(model: DiGRRetriever, loader: DataLoader, device: torch.device,
 
     Every row carries exactly one target, so hit rate and recall coincide and
     the returned keys say `recall@k`. `ndcg@k = 1/log2(rank+1)` for rank <= k
-    (IDCG = 1), and `mrr` is truncated at `max(EVAL_KS)`.  A row whose target
-    misses the top `kmax` is scored as rank `kmax + 1`, so it is a miss at
+    (IDCG = 1), and `mrr` is truncated at `MRR_K` regardless of how wide
+    `EVAL_KS` is set, so a recall@1000 run still reports MRR@10.  A row whose
+    target misses the top `kmax` is scored as rank `kmax + 1`, so it is a miss at
     every `k` and adds zero gain (rank 0 would pass every test).
     """
 
@@ -952,16 +956,18 @@ def evaluate(model: DiGRRetriever, loader: DataLoader, device: torch.device,
                 torch.where(hit, 1.0 / torch.log2(rank + 1.0),
                             torch.zeros_like(rank)).sum().item()
             )
+        # MRR stays at MRR_K even when EVAL_KS is widened for a recall@N curve,
+        # otherwise a rank-500 hit would leak into MRR and inflate it.
         rr += float(
-            torch.where(found, 1.0 / rank.clamp(min=1.0),
+            torch.where(rank <= MRR_K, 1.0 / rank.clamp(min=1.0),
                         torch.zeros_like(rank)).sum().item()
         )
 
     n = max(1, total_n)
     out: Dict[str, float] = {
         "loss": total_loss / n,
-        "acc@1": hits[1] / n,
-        "acc@5": hits[5] / n,
+        "acc@1": hits.get(1, 0) / n,
+        "acc@5": hits.get(5, 0) / n,
         "n": total_n,
     }
     for k in EVAL_KS:

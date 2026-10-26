@@ -289,3 +289,24 @@ def test_evaluate_ndcg_is_finite_when_every_row_misses():
     assert out["ndcg@10"] == 0.0
     assert out["mrr"] == 0.0
     assert math.isfinite(out["loss"])
+
+
+def test_widening_eval_ks_does_not_inflate_mrr(monkeypatch):
+    # A recall@N curve needs EVAL_KS widened to 100/1000.  MRR must stay at
+    # MRR_K, otherwise a rank-60 hit silently turns into a large MRR gain and
+    # the widened run reports a "better" MRR than the @10 run it is compared to.
+    monkeypatch.setattr(td, "EVAL_KS", (1, 5, 10, 100))
+    logits = torch.zeros(1, 120)
+    logits[0, 0] = 1.0            # target, weak score
+    logits[0, 1:60] = 2.0         # 59 items outrank it
+    logits[0, 60:] = 0.0          # the rest do not
+
+    out = td.evaluate(_FakeScorer(logits), _loader([0], 1),
+                      torch.device("cpu"), torch.float32, False)
+
+    assert out["recall@1"] == 0.0
+    assert out["recall@10"] == 0.0
+    assert out["recall@100"] == 1.0            # rank 60 is inside the wide cut-off
+    assert out["ndcg@100"] == pytest.approx(1 / math.log2(61))
+    assert out["mrr"] == 0.0                   # ... but outside MRR_K
+    assert "recall@5" in out and "ndcg@1000" not in out

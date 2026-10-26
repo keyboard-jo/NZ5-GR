@@ -18,9 +18,13 @@ and as a ``--label_subset full`` run.
 Usage
 -----
     python eval_full_catalog.py \
-      --checkpoint /scratch/.../digr_resume_20261025_113432/best \
+      --checkpoint /scratch/.../digr_0p6b_e3_full_sampled300k/final \
       --data_dir   /scratch/.../digr_data \
       --local_files_only
+
+`--ks` defaults to `1,5,10,100,1000`.  The 100/1000 cut-offs are the ones that
+say whether DiGR works as a candidate generator (4.78M -> some smaller pool that
+a cheap reranker can handle) rather than as a standalone top-10 retriever.
 """
 from __future__ import annotations
 
@@ -40,9 +44,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import train_digr as T  # noqa: E402
 
 # Reference numbers measured on the same val split, quoted so the comparison is
-# in one place.  These are inputs, not results of this script.
-REF_POPULARITY_R1 = 0.00439453125          # 0.4394%, popularity over 4,783,154
-REF_POPULARITY_R10 = 0.0096435546875       # 0.9644%, popularity over 4,783,154
+# in one place.  These are inputs, not results of this script.  Popularity was
+# re-measured with the same metric code as everything else (see
+# baselines_digr.py): R@10 1.3438%, not the 0.9644% an earlier ad-hoc run
+# reported -- that run's R@1 matched but its ranks 2-10 did not.
+REF_POPULARITY_R1 = 0.00439453125          # 0.4395%
+REF_POPULARITY_R10 = 0.013427734375        # 1.3438%
+REF_COCLICK_R10 = 0.025248                 # 2.5248%, 6 s of co-click counting
 REF_SUBSET_R1 = 0.0083                     # 0.83%, clicked run over 504,404
 REF_SUBSET_R10 = 0.0327                    # 3.27%, clicked run over 504,404
 REF_SUBSET_LOSS = 9.7457
@@ -65,10 +73,17 @@ def parse_cli() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--checkpoint", required=True,
-                   help="checkpoint dir with head_config.json + weights (use 'best')")
+                   help="checkpoint dir with head_config.json + weights. Use the "
+                        "`final` dir: the val-loss-best epoch is not necessarily "
+                        "the best-ranking one")
     p.add_argument("--data_dir", required=True,
                    help="preprocessed dir from preprocess_digr.py")
     p.add_argument("--split", default="val", choices=["val", "train", "infer"])
+    p.add_argument("--ks", default="1,5,10,100,1000",
+                   help="comma-separated ranking cut-offs. 100 and 1000 answer a "
+                        "different question from @10: not \"is the answer on the "
+                        "first page\" but \"is it cheap to rerank from here\", i.e. "
+                        "whether this model is usable as a candidate generator")
     p.add_argument("--batch_size", type=int, default=128,
                    help="eval batch; the [B, |I|] fp32 logit tensor is "
                         "B * 4.78M * 4 bytes (128 -> ~2.4 GB)")
@@ -94,6 +109,13 @@ def parse_cli() -> argparse.Namespace:
 def main() -> int:
     args, cli = parse_cli()
     logger = build_logger()
+
+    # evaluate() reads the module global at call time, so widening it here is the
+    # whole change: same fp32 item_logits path, same conventions, wider topk.
+    ks = tuple(sorted({int(x) for x in cli.ks.split(",") if x.strip()}))
+    if not ks or ks[0] < 1:
+        raise ValueError(f"--ks must be positive integers, got {cli.ks!r}")
+    T.EVAL_KS = ks
 
     t0 = time.time()
     meta, retriever, device, amp_dtype, use_amp = T.load_for_inference(args, logger)
@@ -131,6 +153,7 @@ def main() -> int:
     logger.info(f"  catalog      : {full_catalog:,} items  "
                 f"(uniform CE = ln K = {math.log(full_catalog):.3f})")
     logger.info(f"  batch / dev  : {args.eval_batch_size} / {device}")
+    logger.info(f"  cut-offs     : {list(ks)}  (topk {max(ks)}, MRR@{T.MRR_K})")
     logger.info("  scoring full-catalog logits per row (no candidate list) ...")
 
     m = T.evaluate(retriever, loader, device, amp_dtype, use_amp)
@@ -139,15 +162,20 @@ def main() -> int:
     uniform = math.log(full_catalog)
     logger.info("-" * 78)
     logger.info(f"  rows {int(m['n']):,}   loss {m['loss']:.4f}   "
-                f"({uniform / m['loss']:.3f}x better than uniform)")
-    logger.info(f"  R@1    {100 * m['recall@1']:.4f}%      nDCG@1  {m['ndcg@1']:.5f}")
-    logger.info(f"  R@5    {100 * m['recall@5']:.4f}%      nDCG@5  {m['ndcg@5']:.5f}")
-    logger.info(f"  R@10   {100 * m['recall@10']:.4f}%     nDCG@10 {m['ndcg@10']:.5f}")
-    logger.info(f"  MRR    {m['mrr']:.5f}")
+                f"({uniform / m['loss']:.3f}x better than uniform CE)")
+    for k in ks:
+        rec = m[f"recall@{k}"]
+        uni = k / full_catalog          # what a uniform guess would score
+        logger.info(f"  R@{k:<5d} {100 * rec:8.4f}%   "
+                    f"nDCG@{k:<5d} {m[f'ndcg@{k}']:.5f}   "
+                    f"{rec / uni:7.1f}x uniform")
+    logger.info(f"  MRR@{T.MRR_K:<5d}{m['mrr']:.5f}")
     logger.info("-" * 78)
     logger.info("  reference, same val split:")
     logger.info(f"    popularity, full catalog   R@1 {100 * REF_POPULARITY_R1:.4f}%  "
                 f"R@10 {100 * REF_POPULARITY_R10:.4f}%")
+    logger.info(f"    co-click kNN, 6 s of counting  R@10 {100 * REF_COCLICK_R10:.4f}%"
+                f"   <- the baseline to beat, not popularity")
     logger.info(f"    this ckpt, 504,404 subset  R@1 {100 * REF_SUBSET_R1:.4f}%  "
                 f"R@10 {100 * REF_SUBSET_R10:.4f}%  loss {REF_SUBSET_LOSS:.4f}")
     logger.info(f"    (subset numbers came from the training log and are NOT "
@@ -155,8 +183,12 @@ def main() -> int:
     logger.info("-" * 78)
     lift1 = m["recall@1"] / REF_POPULARITY_R1
     lift10 = m["recall@10"] / REF_POPULARITY_R10
+    vs_coclick = m["recall@10"] / REF_COCLICK_R10
     verdict = "BEATS popularity" if lift10 > 1.0 else "does NOT beat popularity"
     logger.info(f"  lift over popularity: R@1 {lift1:.2f}x  R@10 {lift10:.2f}x  -> {verdict}")
+    logger.info(f"  lift over co-click kNN (R@10 {100 * REF_COCLICK_R10:.4f}%): "
+                f"{vs_coclick:.2f}x  "
+                f"{'-> the LLM encoder adds real signal' if vs_coclick > 1.15 else '-> within noise of a 6 s count table'}")
     logger.info(f"  elapsed {elapsed / 60:.1f} min")
 
     if cli.out_json:
@@ -166,8 +198,11 @@ def main() -> int:
                 "checkpoint": args.checkpoint,
                 "split": cli.split,
                 "catalog_size": full_catalog,
+                "ks": list(ks),
+                "mrr_k": T.MRR_K,
                 "lift_r1_vs_popularity": lift1,
                 "lift_r10_vs_popularity": lift10,
+                "lift_r10_vs_coclick": vs_coclick,
             }
         )
         os.makedirs(os.path.dirname(os.path.abspath(cli.out_json)), exist_ok=True)
