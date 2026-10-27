@@ -142,11 +142,26 @@ except ImportError as exc:  # pragma: no cover
 
 # The preprocessing phase owns the token layout; import the shared data types
 # (and the on-disk split format) from it instead of duplicating them.
+#
+# Two layouts to satisfy. Locally the script lives in "Model Training/" and the v2
+# data types live in "Plan 2/", a sibling directory. On the cluster every Plan 2
+# file is copied into ~/NZ5/plan2/, so they sit next to this script. Same directory
+# first, then the sibling: `_SIBLING_DATA_DIR` is inserted first and `_HERE` after
+# it, which puts `_HERE` at the front of sys.path, so a same-dir copy always wins.
 _HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+_SIBLING_DATA_DIR = os.path.join(os.path.dirname(_HERE), "Plan 2")
+for _dir in (_SIBLING_DATA_DIR, _HERE):
+    if os.path.isdir(_dir) and _dir not in sys.path:
+        sys.path.insert(0, _dir)
+
+# preprocess_digr_v2.py is the superset: with n_action = 0 and n_clock = 0 its
+# Vocab computes exactly the v1 numbers, so preferring it is safe for v1 data and
+# required for v2 data. The module that wrote vocab.json owns the token layout,
+# and a v1 Vocab reading a v2 file drops the action block from total_size (152
+# instead of 155 on the test fixture), which puts real token ids out of range.
+# `_check_vocab_matches_manifest` catches that case even if this import fell back.
 try:
-    from preprocess_digr import (  # noqa: E402  (path fix above)
+    from preprocess_digr_v2 import (  # noqa: E402  (path fix above)
         MANIFEST_NAME,
         ItemCatalog,
         TokenizedSplit,
@@ -155,10 +170,22 @@ try:
         load_split,
         split_exists,
     )
-except ImportError as exc:  # pragma: no cover
-    raise SystemExit(
-        "preprocess_digr.py must live next to train_digr.py (shared data types)."
-    ) from exc
+except ImportError:  # pragma: no cover
+    try:
+        from preprocess_digr import (  # noqa: E402
+            MANIFEST_NAME,
+            ItemCatalog,
+            TokenizedSplit,
+            UserMap,
+            Vocab,
+            load_split,
+            split_exists,
+        )
+    except ImportError as exc:
+        raise SystemExit(
+            "preprocess_digr_v2.py (or preprocess_digr.py) must be importable; it "
+            "lives in Plan 2/, a sibling of this script's directory."
+        ) from exc
 
 try:
     from transformers import AutoModel
@@ -806,12 +833,33 @@ def _read_manifest(data_dir: str) -> Dict[str, Any]:
         return json.load(f)
 
 
+def _check_vocab_matches_manifest(vocab: "Vocab", manifest: Dict[str, Any]) -> None:
+    """The class reading vocab.json must reproduce the size the writer recorded.
+
+    `vocab.json` stores `total_size` as the writing module computed it, and the
+    Vocab class recomputes it from sid_sizes + n_temporal + feature_sizes. An older
+    reader silently drops the token ranges it does not know about, so every id
+    above the recomputed size is out of range for the embedding table. Fail here
+    with both numbers rather than at step 1 with an index error.
+    """
+    written = int(manifest.get("vocab_size") or 0)
+    if written and written != int(vocab.total_size):
+        raise SystemExit(
+            f"vocab.json records {human_int(written)} tokens but the Vocab class in "
+            f"use recomputes {human_int(int(vocab.total_size))}. The reader does not "
+            "understand this token layout, which happens when a v2 file with an "
+            "action block is read by preprocess_digr.py. train_digr.py imports "
+            "preprocess_digr_v2.py from Plan 2/ for exactly this reason."
+        )
+
+
 def _load_static_meta(data_dir: str, logger: logging.Logger
                       ) -> Tuple[Vocab, ItemCatalog, UserMap, np.ndarray, Dict[str, Any]]:
     """Read the vocabulary / catalog / user map / gap edges written by preprocess_digr."""
     manifest = _read_manifest(data_dir)
     with open(os.path.join(data_dir, "vocab.json"), "r", encoding="utf-8") as f:
         vocab = Vocab.from_dict(json.load(f))
+    _check_vocab_matches_manifest(vocab, manifest)
     catalog = ItemCatalog.load(data_dir)
     user_map = UserMap.load(data_dir)
     gap_edges = np.load(os.path.join(data_dir, "gap_edges.npy"))

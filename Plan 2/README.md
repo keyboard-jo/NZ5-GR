@@ -251,6 +251,20 @@ than the JSON's own order, that a missing item, ragged lengths and negative code
 raise, that the width comes from the observed maximum rather than a declared
 codebook size, and the CLI round trip.
 
+## train_digr_v2.sh
+
+One command for S4, the training half. It points at `digr_data/` from the
+preprocessor and at `runs/`, keeps the frozen run's config, and takes any flag on
+the command line, so the smoke test needs no edit:
+
+    sbatch train_digr_v2.sh --max_steps 30 --run_name smoke_v2
+
+`--temperature 0.175` is the only value that differs from the frozen run. The
+score is `1/(L * temperature)` and `L` falls from 5 to 2, so leaving 0.07 would
+multiply every logit by 2.5 for no reason connected to the data. Holding `1/(L*T)`
+at 2.857 keeps the score scale identical, which leaves the SID and the event
+stream as the only two things that changed.
+
 ## test_sid_diagnose.py
 
 `pytest "Plan 2" -q` runs 33 tests on mock data. They pin the packing convention

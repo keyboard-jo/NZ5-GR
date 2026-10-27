@@ -310,3 +310,39 @@ def test_widening_eval_ks_does_not_inflate_mrr(monkeypatch):
     assert out["ndcg@100"] == pytest.approx(1 / math.log2(61))
     assert out["mrr"] == 0.0                   # ... but outside MRR_K
     assert "recall@5" in out and "ndcg@1000" not in out
+
+
+def test_vocab_reads_the_action_block_from_a_v2_vocab_file():
+    """A v2 vocab.json must round-trip, action tokens included.
+
+    The v2 preprocessor writes total_size = 2 + sum(sid_sizes) + n_temporal +
+    n_action + sum(feature_sizes). The v1 class knows nothing about n_action, so
+    reading a v2 file with it shortens the embedding table by three rows and every
+    id in the action block goes out of range (152 instead of 155 on the fixture
+    below). This pins that train_digr imports the module that understands it.
+    """
+    payload = {
+        "sid_sizes": [4, 4, 4, 4, 2],
+        "n_temporal": 8,
+        "n_action": 3,
+        "feature_sizes": [5, 2],
+        "total_size": 2 + 18 + 8 + 3 + 7,  # 38
+    }
+    vocab = td.Vocab.from_dict(payload)
+    assert vocab.n_action == 3
+    assert vocab.total_size == 38
+    assert vocab.event_width == 1 + 1 + 5  # gap, action, five SID levels
+    assert td.Vocab.__module__ in ("preprocess_digr_v2", "preprocess_digr")
+
+
+def test_vocab_manifest_mismatch_is_fatal():
+    """Reading a v2 file with a reader that drops the action block must fail loudly."""
+    vocab = td.Vocab.from_dict({
+        "sid_sizes": [4, 4], "n_temporal": 8, "feature_sizes": [],
+    })
+    td._check_vocab_matches_manifest(vocab, {"vocab_size": int(vocab.total_size)})
+    with pytest.raises(SystemExit) as err:
+        td._check_vocab_matches_manifest(vocab, {"vocab_size": int(vocab.total_size) + 3})
+    assert "token layout" in str(err.value)
+    # A v1 manifest has no vocab_size and must not be rejected.
+    td._check_vocab_matches_manifest(vocab, {})

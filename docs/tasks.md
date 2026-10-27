@@ -378,8 +378,15 @@ SIDs, so S1 is now about how far that curve runs rather than whether it moves.
       users in seconds before the tokeniser starts, then the val users, the
       catalogue and the val targets after the pass. That decision is mandatory, so
       a run must either reproduce an archived split or pass `--allow_new_split`. 14 tests in `Plan 2/test_preprocess_digr_v2.py`.
-- [ ] S4 **DiGR on the new data.** Frozen config, 300k negatives, three epochs, same
-      evaluator. Two axes move together here on purpose.
+- [ ] S4 **DiGR on the new data.** `Plan 2/train_digr_v2.sh`, frozen config, 300k
+      negatives, three epochs, same evaluator, about 3h10m because the stream is
+      153,461,256 tokens against 221,500,536. Two axes move together on purpose.
+      One flag is not the frozen value: `--temperature 0.175` instead of 0.07,
+      because the score carries `1/(L * temperature)` and L drops from 5 to 2, so
+      0.07 would make the logits 2.5x sharper for a reason that has nothing to do
+      with the data. Holding `1/(L*T)` at 2.857 keeps the score scale where the
+      frozen run tuned it, leaving the SID and the stream as the only changes.
+      Smoke it first with `--max_steps 30 --run_name smoke_v2`.
 - [ ] S5 **Baselines on the new data.** Popularity and co-click need no SID, so they
       are control rows and must reproduce to the digit. `sid_transition` is the one
       baseline that can move.
