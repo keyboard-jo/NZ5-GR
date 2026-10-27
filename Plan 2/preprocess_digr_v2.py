@@ -148,12 +148,23 @@ Token layout written per row (one slot per interaction):
 The training script never re-tokenises; it loads these arrays.  This file needs
 only numpy + pyarrow (no torch, no transformers, no GPU).
 
+The val split is a per-user hash of (user id, --val_ratio), so a wrong ratio
+produces a well formed but different val set that nothing downstream can detect.
+A run therefore has to say what its split is: `--expect_val_split <archived
+digr_data>` holds it to that split (val users checked before the tokeniser runs,
+val users / catalogue / targets after the pass), or `--allow_new_split` declares a
+new one. Passing neither is an error.
+
 QUICK START
 -----------
-  python preprocess_digr.py \
+  python preprocess_digr_v2.py \
       --sequence_path data/seq.parquet \
       --catalog_path data/index_rqvae_prod.json \
-      --output_dir digr_data
+      --output_dir digr_data \
+      --allow_new_split
+
+  # to reproduce a previous build instead of declaring a new split
+  python preprocess_digr_v2.py ... --expect_val_split old_digr_data
 
   # then
   python train_digr.py --mode train --data_dir digr_data --batch_size 32 --compile
@@ -1487,6 +1498,100 @@ def _val_row_mask(users: np.ndarray, n_rows: int, val_ratio: float,
     return mask
 
 
+def _require_split_decision(args) -> None:
+    """Refuse to start until the run has said what its val split is.
+
+    A build that quietly invents its own split still looks like a valid run, and
+    every number measured on it would be incomparable to the archived tables
+    without anything raising.  So one of two answers is mandatory: hold this run
+    to an archived split, or state that it defines a new one.
+    """
+    if args.expect_val_split or args.allow_new_split:
+        return
+    raise SystemExit(
+        "--expect_val_split <archived digr_data> is required, or pass\n"
+        "  --allow_new_split   to declare that this build defines a new split.\n"
+        "The split is a per-user hash, so a wrong --val_ratio produces a valid "
+        "but different val set that nothing else can detect."
+    )
+
+
+def _check_val_users(got: np.ndarray, ref_dir: str, n_records: int,
+                     logger: logging.Logger) -> None:
+    """Fail fast when this run's val membership is not the reference split.
+
+    Membership is a pure function of (user id, --val_ratio), so it is checkable
+    in seconds and before any tokenisation.  Targets are not: they come from the
+    anchor logic, so they can only be verified after the full pass.  This covers
+    the half that a wrong setting changes while raising nothing.
+    """
+    path = os.path.join(ref_dir, "val", "users.npy")
+    if not os.path.exists(path):
+        raise SystemExit(f"--expect_val_split: {path} does not exist")
+    ref = {str(v) for v in np.load(path, allow_pickle=True).tolist()}
+    have = {str(v) for v in np.asarray(got, dtype=object).tolist()}
+    if ref == have:
+        logger.info(f"  + val users match {ref_dir} ({human_int(len(ref))} users)")
+        return
+    implied = len(ref) / n_records if n_records else 0.0
+    raise SystemExit(
+        f"val users do not match {ref_dir}: {human_int(len(ref & have))} of "
+        f"{human_int(len(ref))} shared, {human_int(len(ref - have))} missing, "
+        f"{human_int(len(have - ref))} unexpected. The reference holds "
+        f"{human_int(len(ref))} of {human_int(n_records)} records ({implied:.2%}), "
+        f"so --val_ratio is probably not the archived value"
+    )
+
+
+def _check_val_split(split: "TokenizedSplit", catalog: "ItemCatalog",
+                     ref_dir: str, logger: logging.Logger) -> None:
+    """After the pass: the saved val split must be the reference one.
+
+    Three checks in order, because each one is a precondition for the next. The
+    users are the key, so they come first. Targets are 0-based catalogue rows, so
+    the catalogue has to be the same list of item ids in the same order before a
+    target comparison means anything. Which click of a record becomes the val row
+    depends on the anchor logic, so this is the half that `_check_val_users`
+    cannot predict before the pass.
+    """
+    val_dir = os.path.join(ref_dir, "val")
+    for name in ("/users.npy", "/targets.npy"):
+        if not os.path.exists(val_dir + name):
+            raise SystemExit(f"--expect_val_split: {val_dir + name} does not exist")
+
+    ref_users = np.load(val_dir + "/users.npy", allow_pickle=True).tolist()
+    have_users = np.asarray(split.users, dtype=object).tolist()
+    ref_set = {str(u) for u in ref_users}
+    have_set = {str(u) for u in have_users}
+    if ref_set != have_set:
+        raise SystemExit(
+            f"val users do not match {ref_dir}: {human_int(len(have_users))} rows "
+            f"against {human_int(len(ref_users))}, {human_int(len(ref_set & have_set))} "
+            f"shared, {human_int(len(ref_set - have_set))} missing, "
+            f"{human_int(len(have_set - ref_set))} unexpected"
+        )
+
+    ref_ids = np.load(os.path.join(ref_dir, "catalog_item_ids.npy"), allow_pickle=True)
+    if ref_ids.shape != catalog.item_ids.shape or not np.array_equal(
+            ref_ids, catalog.item_ids):
+        raise SystemExit(
+            f"catalog_item_ids differ from {ref_dir}; targets are row indices, so "
+            "they cannot be compared across two catalogues"
+        )
+
+    ref = {str(u): int(t) for u, t in zip(ref_users, np.load(val_dir + "/targets.npy").tolist())}
+    have = {str(u): int(t) for u, t in zip(have_users, split.targets.tolist())}
+    diff = [(u, ref[u], have[u]) for u in ref if ref[u] != have[u]]
+    if diff:
+        raise SystemExit(
+            f"val targets do not match {ref_dir}: {human_int(len(diff))} of "
+            f"{human_int(len(ref))} different, first {diff[:3]}"
+        )
+    logger.info(
+        f"  + val split matches {ref_dir} ({human_int(len(ref))} users and targets)"
+    )
+
+
 def _iter_flat_chunks(
     pf: pq.ParquetFile,
     schema: SequenceSchema,
@@ -2371,6 +2476,7 @@ def _check_output_dir(out_dir: str, overwrite: bool) -> None:
 
 def preprocess(args, logger: logging.Logger) -> Dict[str, Any]:
     t_all = time.time()
+    _require_split_decision(args)
     out_dir = args.output_dir
     _check_output_dir(out_dir, args.overwrite)
     os.makedirs(out_dir, exist_ok=True)
@@ -2493,6 +2599,10 @@ def preprocess(args, logger: logging.Logger) -> Dict[str, Any]:
         val_mask = _val_row_mask(
             users_for_split, total_rows, float(args.val_ratio), int(args.seed)
         )
+        if args.expect_val_split:
+            _check_val_users(
+                users_for_split[val_mask], args.expect_val_split, total_rows, logger
+            )
         del users_for_split
         n_val = int(val_mask.sum())
         logger.info(
@@ -2511,6 +2621,8 @@ def preprocess(args, logger: logging.Logger) -> Dict[str, Any]:
 
     save_split(train_split, os.path.join(out_dir, "train"))
     save_split(val_split, os.path.join(out_dir, "val"))
+    if args.expect_val_split:
+        _check_val_split(val_split, catalog, args.expect_val_split, logger)
     splits["train"] = int(len(train_split))
     splits["val"] = int(len(val_split))
     stats["train"] = train_split.stats
@@ -2573,6 +2685,8 @@ def preprocess(args, logger: logging.Logger) -> Dict[str, Any]:
         "min_history": int(args.min_history),
         "max_gap_seconds": float(args.max_gap_seconds),
         "val_ratio": float(args.val_ratio),
+        "expect_val_split": args.expect_val_split,
+        "allow_new_split": bool(args.allow_new_split),
         "seed": int(args.seed),
         "elapsed_seconds": round(time.time() - t_all, 1),
     }
@@ -2714,6 +2828,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="max slots one LIST feature column may use (0 = the longest "
                         "list actually seen); longer lists are truncated")
     p.add_argument("--val_ratio", type=float, default=DEFAULT_VAL_RATIO)
+    p.add_argument("--expect_val_split", type=str, default=None,
+                   help="an archived <output_dir> this run must reproduce: its "
+                        "val users are checked before any tokenisation and its "
+                        "val targets after the pass. One of this or "
+                        "--allow_new_split is mandatory")
+    p.add_argument("--allow_new_split", action="store_true",
+                   help="declare that this build defines a new val split instead "
+                        "of reproducing an archived one")
     p.add_argument("--read_batch_size", type=int, default=DEFAULT_READ_BATCH_SIZE)
     p.add_argument("--seed", type=int, default=SEED)
 
@@ -2778,6 +2900,8 @@ def _validate_paths(args) -> None:
 
 def main(argv: Optional[Sequence[str]] = None):
     args = parse_args(argv)
+    # First, before any path or output makes it look like the run is starting.
+    _require_split_decision(args)
     _validate_paths(args)
     if args.overwrite:
         _wipe_output_dir(args.output_dir)

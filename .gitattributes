@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# Slurm and shell scripts must be LF: sbatch rejects CRLF with
+# "Batch script contains DOS line breaks". core.autocrlf is on for this
+# checkout, so the attribute has to win over it.
+*.sh text eol=lf

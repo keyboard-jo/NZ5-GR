@@ -174,10 +174,14 @@ clock, `S` the SID codes. Everything else, including the feature block, the
 anchors, the val split and the file names, is unchanged.
 
 ```bash
-# SID v2: two levels, action token, 128 gap bins, no clock
+# on the cluster: one shell wrapper sits beside this file and is a single call
+sbatch "Plan 2/preprocess_digr_v2.sh"              # default build
+sbatch "Plan 2/preprocess_digr_v2.sh" --add_clock  # clock arm
+
+# locally, SID v2: two levels, action token, 128 gap bins, no clock
 python "Plan 2/preprocess_digr_v2.py" \
     --sequence_path data/seq.parquet \
-    --catalog_path local/2026-27-10-1-rq/test_output/index_rqvae_2x8192.json \
+    --catalog_path local/2026-27-10-2-rq/test_output/index_rqvae_3x1024.json \
     --num_sid_levels 2 \
     --user_feat_path data/user_feat.parquet \
     --output_dir digr_data_v2
@@ -193,6 +197,18 @@ indistinguishable from clicks in the sequence. The slot order is published in
 `vocab.json` as `action_token_order`, so nothing downstream has to guess it, and
 the SID block stays last inside the slot, so `train_digr.py`'s "the last L tokens
 of a row are the last event's codes" needs no change.
+
+The split decision is mandatory: `--expect_val_split <previous digr_data>` or `--allow_new_split`, and passing neither is an error, because a build that invents its own split looks exactly like one that reproduced the archived split. `--expect_val_split` is the comparability guard. Val membership
+is `crc32(user_id) % 10000 < round(val_ratio * 10000)` inside `_val_row_mask`, so it
+is a pure function of the user column and `--val_ratio`, and the flag checks it in
+seconds, right after the hash, before the tokeniser runs. Targets cannot be
+predicted that cheaply because the anchor logic decides which click becomes the val
+row, so the flag checks them the other way: `_check_val_targets` compares the saved
+val split against the reference as a user to target map once the pass has finished,
+after confirming `catalog_item_ids.npy` is the same list, since a target is a row
+index. The archived split used `--val_ratio 0.1` while this script defaults to 0.02, and 0.02 raises nothing while
+producing a 19.6k-row val set, so the guard is what makes a run comparable rather
+than merely self-consistent.
 
 Per-row cost, at the measured 19.79 events per row and 9.11 feature tokens:
 

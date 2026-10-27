@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import gc
 import json
+import logging
 import os
 import shutil
 import sys
@@ -133,7 +134,7 @@ def _run(paths, module=v2, extra=(), out_name="out"):
         "--output_dir", out_dir,
         "--overwrite",
         "--min_history", "2",
-    ] + list(extra)
+    ] + (["--allow_new_split"] if hasattr(module, "_require_split_decision") else [])       + list(extra)
     args = module.parse_args(argv)
     log = module.setup_logger()
     try:
@@ -355,3 +356,109 @@ def test_manifest_records_the_new_tokens(workspace):
     assert manifest["event_width"] == 1 + 1 + NUM_LEVELS
     assert manifest["action_token_order"] == ["exposure", "click", "unknown"]
     assert manifest["catalog_collisions"]["items_sharing_a_sid"] == 0
+
+
+def test_expect_val_split_flag_parses():
+    args = v2.parse_args(["--sequence_path", "s.parquet",
+                          "--catalog_path", "c.json",
+                          "--expect_val_split", "/tmp/ref"])
+    assert args.expect_val_split == "/tmp/ref"
+    assert v2.parse_args(["--sequence_path", "s", "--catalog_path", "c"]).expect_val_split is None
+
+
+def test_expect_val_split_accepts_the_same_users_in_any_order(tmp_path):
+    ref = tmp_path / "ref" / "val"
+    ref.mkdir(parents=True)
+    np.save(ref / "users.npy", np.asarray([7, 8, 9], dtype=object))
+    logger = logging.getLogger("test")
+    for got in ([7, 8, 9], [9, 7, 8]):
+        v2._check_val_users(np.asarray(got, dtype=object), str(tmp_path / "ref"), 30, logger)
+
+
+def test_expect_val_split_rejects_a_different_membership(tmp_path):
+    ref = tmp_path / "ref" / "val"
+    ref.mkdir(parents=True)
+    np.save(ref / "users.npy", np.asarray([7, 8, 9], dtype=object))
+    logger = logging.getLogger("test")
+    with pytest.raises(SystemExit) as exc:
+        v2._check_val_users(np.asarray([7, 8, 10], dtype=object),
+                            str(tmp_path / "ref"), 30, logger)
+    msg = str(exc.value)
+    assert "2 of 3 shared" in msg
+    assert "--val_ratio" in msg
+    assert "10.00%" in msg          # 3 of 30 records
+
+
+def test_expect_val_split_requires_the_reference_file(tmp_path):
+    logger = logging.getLogger("test")
+    with pytest.raises(SystemExit) as exc:
+        v2._check_val_users(np.asarray([1], dtype=object), str(tmp_path), 10, logger)
+    assert "--expect_val_split" in str(exc.value)
+
+
+def test_expect_val_split_checks_the_saved_split(tmp_path):
+    ref = tmp_path / "ref"
+    (ref / "val").mkdir(parents=True)
+    np.save(ref / "val" / "users.npy", np.asarray([7, 8, 9], dtype=object))
+    np.save(ref / "val" / "targets.npy", np.asarray([100, 101, 102], dtype=np.int64))
+    ids = np.asarray([10, 11, 12], dtype=np.int64)
+    np.save(ref / "catalog_item_ids.npy", ids)
+    catalog = v2.ItemCatalog(ids, True, np.zeros((3, 2), dtype=np.int32))
+    logger = logging.getLogger("test")
+
+    class Split:
+        users = np.asarray([9, 8, 7], dtype=object)
+        targets = np.asarray([102, 101, 100], dtype=np.int64)
+
+    v2._check_val_split(Split(), catalog, str(ref), logger)     # order is free
+
+    Split.targets = np.asarray([102, 101, 99], dtype=np.int64)
+    with pytest.raises(SystemExit) as exc:
+        v2._check_val_split(Split(), catalog, str(ref), logger)
+    assert "1 of 3 different" in str(exc.value)
+
+    Split.targets = np.asarray([102, 101, 100], dtype=np.int64)
+    Split.users = np.asarray([9, 8, 6], dtype=object)
+    with pytest.raises(SystemExit) as exc:
+        v2._check_val_split(Split(), catalog, str(ref), logger)
+    assert "1 missing, 1 unexpected" in str(exc.value)
+
+    Split.users = np.asarray([9, 8, 7], dtype=object)
+    other = v2.ItemCatalog(np.asarray([10, 11, 13], dtype=np.int64), True,
+                           np.zeros((3, 2), dtype=np.int32))
+    with pytest.raises(SystemExit) as exc:
+        v2._check_val_split(Split(), other, str(ref), logger)
+    assert "catalog_item_ids differ" in str(exc.value)
+
+
+def test_split_decision_is_mandatory():
+    base = ["--sequence_path", "s.parquet", "--catalog_path", "c.json"]
+    with pytest.raises(SystemExit) as exc:
+        v2._require_split_decision(v2.parse_args(base))
+    assert "--allow_new_split" in str(exc.value)
+    assert "--expect_val_split" in str(exc.value)
+    v2._require_split_decision(v2.parse_args(base + ["--allow_new_split"]))
+    v2._require_split_decision(v2.parse_args(base + ["--expect_val_split", "d"]))
+
+
+def test_mismatched_reference_stops_before_tokenising(workspace):
+    paths = workspace
+    ref = os.path.join(DATA_ROOT, "ref")
+    os.makedirs(os.path.join(ref, "val"), exist_ok=True)
+    np.save(os.path.join(ref, "val", "users.npy"), np.asarray([1, 2, 3], dtype=object))
+    np.save(os.path.join(ref, "val", "targets.npy"), np.asarray([0, 0, 0], dtype=np.int64))
+    args = v2.parse_args([
+        "--sequence_path", paths["train"], "--val_sequence_path", paths["val"],
+        "--catalog_path", paths["catalog"],
+        "--output_dir", os.path.join(DATA_ROOT, "refout"),
+        "--overwrite", "--min_history", "2", "--expect_val_split", ref,
+    ])
+    log = v2.setup_logger()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            v2.preprocess(args, log)
+    finally:
+        for handler in list(log.handlers):
+            handler.close()
+            log.removeHandler(handler)
+    assert "val users do not match" in str(exc.value)

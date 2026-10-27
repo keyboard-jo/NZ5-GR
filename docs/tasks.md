@@ -369,10 +369,15 @@ SIDs, so S1 is now about how far that curve runs rather than whether it moves.
       so they can be ablated. Default build is 4 tokens per event and 153.5M train
       tokens, against 221.5M today; with the flag on it is 5 and 187.5M. No session
       token, the gap already encodes the boundary. The script exists and is tested:
-      `Plan 2/preprocess_digr_v2.py`, 9 tests in `Plan 2/test_preprocess_digr_v2.py`,
-      `--num_sid_levels 2 --add_action` for the default build and
-      `--no-add_action --n_temporal_bins 64` reproducing the v1 stream token for
-      token.
+      `Plan 2/preprocess_digr_v2.py` with one shell wrapper beside it,
+      `Plan 2/preprocess_digr_v2.sh`, which is a single python call plus `"$@"` so
+      every arm is a flag rather than an edit. `--num_sid_levels 2 --add_action`
+      builds the default stream, `--add_clock` adds the clock arm, `--no-add_action
+      --n_temporal_bins 64` reproduces the v1 stream token for token, and
+      `--expect_val_split DIR` holds the run to an archived split: it checks the val
+      users in seconds before the tokeniser starts, then the val users, the
+      catalogue and the val targets after the pass. That decision is mandatory, so
+      a run must either reproduce an archived split or pass `--allow_new_split`. 14 tests in `Plan 2/test_preprocess_digr_v2.py`.
 - [ ] S4 **DiGR on the new data.** Frozen config, 300k negatives, three epochs, same
       evaluator. Two axes move together here on purpose.
 - [ ] S5 **Baselines on the new data.** Popularity and co-click need no SID, so they
