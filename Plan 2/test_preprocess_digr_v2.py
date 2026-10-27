@@ -462,3 +462,40 @@ def test_mismatched_reference_stops_before_tokenising(workspace):
             handler.close()
             log.removeHandler(handler)
     assert "val users do not match" in str(exc.value)
+
+
+def test_expect_val_split_accepts_the_records_the_anchor_logic_will_drop(tmp_path):
+    """The reference holds kept rows, the run counts selected records.
+
+    Archived val: 100,350 records selected by the hash, 98,304 kept after the
+    anchor filters. Comparing raw against kept flagged a correct build, so the
+    archived read/kept pair from the reference's meta is what gets compared.
+    """
+    root = tmp_path / "ref"
+    (root / "val").mkdir(parents=True)
+    kept = list(range(10))
+    np.save(root / "val" / "users.npy", np.asarray(kept, dtype=object))
+    (root / "preprocess_meta.json").write_text(
+        json.dumps({"split_stats": {"val": {"rows_read": 12, "rows_kept": 10}}}),
+        encoding="utf-8")
+    logger = logging.getLogger("test")
+
+    v2._check_val_users(np.asarray(list(range(12)), dtype=object), str(root), 120, logger)
+
+    with pytest.raises(SystemExit) as exc:
+        v2._check_val_users(np.asarray(list(range(24)), dtype=object), str(root), 240, logger)
+    assert "14 unexpected" in str(exc.value)
+    assert "of 12 selected" in str(exc.value)
+
+
+def test_expect_val_split_without_meta_tolerates_a_small_surplus(tmp_path):
+    root = tmp_path / "ref"
+    (root / "val").mkdir(parents=True)
+    np.save(root / "val" / "users.npy", np.asarray(list(range(10)), dtype=object))
+    logger = logging.getLogger("test")
+
+    v2._check_val_users(np.asarray(list(range(11)), dtype=object), str(root), 110, logger)
+
+    with pytest.raises(SystemExit) as exc:
+        v2._check_val_users(np.asarray(list(range(100)), dtype=object), str(root), 1000, logger)
+    assert "90 unexpected" in str(exc.value)

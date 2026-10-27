@@ -1516,30 +1516,79 @@ def _require_split_decision(args) -> None:
     )
 
 
+def _archived_val_counts(ref_dir: str):
+    """The reference split's own record counts, if it recorded them.
+
+    `rows_read` is how many records the per-user hash selected and `rows_kept`
+    is how many survived the anchor logic. The gap between them is real and
+    expected, so a pre-flight comparison needs both numbers to be exact.
+    """
+    path = os.path.join(ref_dir, "preprocess_meta.json")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            stats = json.load(handle)["split_stats"]["val"]
+        return int(stats["rows_read"]), int(stats["rows_kept"])
+    except (OSError, KeyError, TypeError, ValueError):
+        return None
+
+
 def _check_val_users(got: np.ndarray, ref_dir: str, n_records: int,
                      logger: logging.Logger) -> None:
     """Fail fast when this run's val membership is not the reference split.
 
     Membership is a pure function of (user id, --val_ratio), so it is checkable
-    in seconds and before any tokenisation.  Targets are not: they come from the
-    anchor logic, so they can only be verified after the full pass.  This covers
-    the half that a wrong setting changes while raising nothing.
+    in seconds, before any tokenisation. Targets are not: they come from the
+    anchor logic, so `_check_val_split` verifies those after the pass.
+
+    The two sets are not equal by construction. `val/users.npy` holds only the
+    records that survived the anchor filters, so the hashed selection is a
+    strict superset: the archived build read 100,350 records and kept 98,304,
+    dropping 1,723 without a click and 323 with too little history. Comparing
+    raw against kept would flag a correct build, which is exactly what happened
+    the first time this check ran. So the test is the archived read/kept pair,
+    read from the reference's own meta file when it is there.
     """
     path = os.path.join(ref_dir, "val", "users.npy")
     if not os.path.exists(path):
         raise SystemExit(f"--expect_val_split: {path} does not exist")
     ref = {str(v) for v in np.load(path, allow_pickle=True).tolist()}
     have = {str(v) for v in np.asarray(got, dtype=object).tolist()}
-    if ref == have:
+    missing = ref - have
+    extra = have - ref
+
+    if not missing and not extra:
         logger.info(f"  + val users match {ref_dir} ({human_int(len(ref))} users)")
         return
+
+    counts = _archived_val_counts(ref_dir)
+    if not missing and counts is not None:
+        rows_read, rows_kept = counts
+        if len(have) == rows_read and len(ref) == rows_kept:
+            logger.info(
+                f"  + val records match {ref_dir} ({human_int(rows_read)} selected "
+                f"by the hash, {human_int(rows_kept)} kept after filtering, "
+                f"{human_int(len(extra))} still to be dropped by the anchor logic)"
+            )
+            return
+
     implied = len(ref) / n_records if n_records else 0.0
+    surplus = len(extra)
+    if not missing and counts is None and surplus <= max(64, len(ref) // 20):
+        logger.info(
+            f"  + val users match {ref_dir} ({human_int(len(ref))} of "
+            f"{human_int(len(have))} records; {human_int(surplus)} extra are "
+            "candidates the anchor logic may drop, no archived meta to confirm)"
+        )
+        return
     raise SystemExit(
         f"val users do not match {ref_dir}: {human_int(len(ref & have))} of "
-        f"{human_int(len(ref))} shared, {human_int(len(ref - have))} missing, "
-        f"{human_int(len(have - ref))} unexpected. The reference holds "
-        f"{human_int(len(ref))} of {human_int(n_records)} records ({implied:.2%}), "
-        f"so --val_ratio is probably not the archived value"
+        f"{human_int(len(ref))} shared, {human_int(len(missing))} missing, "
+        f"{human_int(surplus)} unexpected. This run selected "
+        f"{human_int(len(have))} records from {human_int(n_records)}; the "
+        f"reference holds {human_int(len(ref))} kept rows"
+        + (f" of {human_int(counts[0])} selected" if counts else "")
+        + f" ({implied:.2%} of records), so --val_ratio is probably not the "
+        "archived value"
     )
 
 
@@ -2605,9 +2654,16 @@ def preprocess(args, logger: logging.Logger) -> Dict[str, Any]:
             )
         del users_for_split
         n_val = int(val_mask.sum())
+        realised = n_val / max(total_rows, 1)
         logger.info(
             f"  + random split by user: {human_int(total_rows - n_val)} train / "
-            f"{human_int(n_val)} val rows ({args.val_ratio:.1%})"
+            f"{human_int(n_val)} val records ({realised:.2%} of "
+            f"{human_int(total_rows)}, asked for {args.val_ratio:.1%})"
+        )
+        logger.info(
+            "    records, not rows: each train record yields up to "
+            f"{human_int(args.anchors_per_record)} anchors and each val record "
+            "one, so the row counts printed below are larger"
         )
         train_split = build(args.sequence_path, seq_schema, None, args.max_rows,
                             keep_rows=~val_mask, dir_name="train")

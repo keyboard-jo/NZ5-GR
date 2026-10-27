@@ -198,7 +198,12 @@ indistinguishable from clicks in the sequence. The slot order is published in
 the SID block stays last inside the slot, so `train_digr.py`'s "the last L tokens
 of a row are the last event's codes" needs no change.
 
-The split decision is mandatory: `--expect_val_split <previous digr_data>` or `--allow_new_split`, and passing neither is an error, because a build that invents its own split looks exactly like one that reproduced the archived split. `--expect_val_split` is the comparability guard. Val membership
+The split decision is mandatory: `--expect_val_split <previous digr_data>` or `--allow_new_split`, and passing neither is an error, because a build that invents its own split looks exactly like one that reproduced the archived split. `--expect_val_split` is the comparability guard. It compares two different
+populations on purpose: `val/users.npy` in the reference holds only the rows that
+survived the anchor filters (98,304 of the 100,350 records the hash selected), so the
+pre-flight check reads the reference `preprocess_meta.json` for both numbers and
+requires the run to select the same 100,350. Strict equality on users, catalogue and
+targets follows after the pass. Val membership
 is `crc32(user_id) % 10000 < round(val_ratio * 10000)` inside `_val_row_mask`, so it
 is a pure function of the user column and `--val_ratio`, and the flag checks it in
 seconds, right after the hash, before the tokeniser runs. Targets cannot be
