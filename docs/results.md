@@ -18,6 +18,7 @@ recall coincide. `MRR` is truncated at rank 10 everywhere.
 | B4 co-click kNN, window 10, decay 0.5 | 4 s + 44 s CPU | 0.7985% | 3.6794% | 10.8531% | 24.8311% | 46.2148% | 0.02030 | 0.01529 |
 | **B4 co-click kNN, window 20, decay 0.5** | **4 s + 43 s CPU** | **0.8057%** | **3.7069%** | **10.9873%** | **25.3021%** | **46.8882%** | **0.02044** | **0.01539** |
 | DiGR 0.6B, 3 epochs, 300k sampled negatives | 4.6 GPU-h + 3.2 min eval | 0.7924% | 2.5940% | 7.5094% | 21.6003% | 49.7691% | 0.01570 | 0.01258 |
+| HSTU tower (window 20, approximate actions) | 20 s GPU + 41 min I/O | 0.0458% | 0.4354% | 2.9063% | 13.5122% | - | 0.00201 | 0.00131 |
 | item-embedding kNN, mean of last 1 clicked | 9 min GPU | 0.0173% | 0.5636% | 2.4638% | 8.1807% | - | - | 0.00151 |
 | item-embedding kNN, mean of last 3 clicked | 9 min GPU | 0.0376% | 0.3560% | 2.2156% | 9.7646% | - | - | 0.00112 |
 | item-embedding kNN, mean of last 5 clicked | 9 min GPU | 0.0539% | 0.3174% | 2.0742% | 9.6965% | - | - | 0.00110 |
@@ -232,3 +233,128 @@ co-occurrence count built in 4 seconds reaches 23.6176% at 1,000 candidates; the
 codes need 19,308 candidates to reach 18.3156%, and 8.1807% is all the raw vectors
 manage at 1,000. That gap is why DiGR, which reads the codes, cannot outrun a count
 table.
+
+---
+
+## 9. The Stage 1 sequence tower is below popularity too
+
+`Model Training/probe_hstu.py` asks the other half of the same question. Stage 1
+exports item vectors from `ItemDNN` alone, so section 8 measures the item side. The
+HSTU sequence encoder is where the behaviour was actually trained, and the probe
+scores its user vector against the same full catalog on the same val rows.
+
+Window 20 events, approximate actions, `bfloat16`, 98,304 rows, 12,716,408 tokens.
+Cosine against a 4,783,154 x 256 item matrix.
+
+| method | R@1 | R@10 | R@100 | R@1000 | nDCG@10 |
+|---|---|---|---|---|---|
+| HSTU tower | 0.0458% | 0.4354% | 2.9063% | 13.5122% | 0.2008% |
+| popularity | 0.4395% | 1.3438% | 4.7862% | 14.7288% | 0.8090% |
+| DiGR | 0.7924% | 2.5940% | 7.5094% | 21.6003% | 1.5700% |
+| co-click, window 20 | 0.8057% | 3.7069% | 10.9873% | 25.3021% | 2.0440% |
+
+The sequence tower loses to a frequency count at every cut-off. R@1 is 9.6x below
+popularity and even R@1000 is 8% short, so this is not a badly calibrated good
+model, it is a model with very little user-specific signal.
+
+The shape inside the head says the same thing. HSTU keeps 3.2% of its top 1,000
+inside its top 10, against 9.1% for popularity and 12.0% for DiGR. A flat head on
+top of a collapsed R@1 is the signature of a broad popularity direction plus
+noise, not of a sharp per-user ranking.
+
+One bug was found and fixed before this number was recorded.
+`HSTUSequenceEncoder` reads `x[:, lengths - 1]` as the query, training left-aligns
+the sequence, and the first version of the probe right-aligned it, so padded rows
+read a padding position. The fix (`to_chronological`) was uploaded and the run
+reported here is the patched one, confirmed byte-identical to
+`Model Training/probe_hstu.py`:
+
+| | right-aligned | chronological | change |
+|---|---|---|---|
+| R@1 | 0.0458% | 0.0458% | none |
+| R@10 | 0.4283% | 0.4354% | +1.66% relative |
+| R@100 | 2.8798% | 2.9063% | +0.92% relative |
+| R@1000 | 13.3931% | 13.5122% | +0.89% relative |
+
+The bug cost about 1.7% relative at R@10 and nothing at R@1, because the pooled
+state at a padding position still aggregates the valid prefix through attention,
+and only rows with fewer than 20 events were affected. The value of the rerun is
+not the delta. It is that the weakness can no longer be attributed to the probe.
+
+Two independent probes now agree. Item vector as the query gives 0.5636% R@10.
+User vector as the query gives 0.4354%. Both are below the uninformative baseline
+of 1.3438%, on the same geometry that `docs/sid_results.md` shows the quantiser
+reproduces faithfully (depth-1 bucket recall 18.3156% matches the raw kNN curve).
+So the weakness is upstream of the SID, and it is in both towers.
+
+Diagnostics from the same run: 0.0000% unmapped history events, so the history
+decoding is clean, and 0.1455% of rows already contain the target inside their
+20-event window, which is the trivially recoverable repeat case.
+
+---
+
+## 10. The official candidate pool, and why it is not the evaluation space
+
+The TencentGR dataset paper describes the competition protocol. Evaluation uses a
+single global candidate set of 660,000 de-duplicated ads, shared by every user.
+Every ground-truth target is guaranteed to be in it, and non-target items are
+sampled so that about 40% of the pool appears as a target for at least one user.
+The metrics are HitRate@10 and NDCG@10, and the leaderboard score is
+`0.31 * HitRate@10 + 0.69 * NDCG@10`. K=100 was tried and dropped for giving less
+separation. The 10M track uses a 3,637,720-ad pool and weighted metrics with a
+conversion weight of 2.5.
+
+`data/candidate.parquet` is that pool: 660,000 rows, 660,000 unique `item_id`,
+660,000 unique `retrieval_id`, and `retrieval_id` runs 0 to 659,999 with no gaps,
+so it is a dense enumeration of the pool and nothing more. It carries no labels.
+
+Measured against our own artefacts:
+
+| quantity | value |
+|---|---|
+| pool items that map into `data/exported_indexer/i.json` | 511,029 (77.43%) |
+| pool items with no entry in `i.json` or `item_feat.parquet` | 148,971 (22.57%) |
+| of those, present in `data/mm_emb_82_1024.parquet` | 148,947 (99.98%) |
+| val targets inside the pool | 79,064 of 98,304 (80.43%) |
+| train targets inside the pool | 1,298,907 of 1,719,430 (75.54%) |
+
+The unmapped 149k are not unembeddable. `mm_emb_82_1024.parquet` has 4,896,667
+rows, a superset of the 4,783,154 in the index. They have no SID because `i.json`
+and `item_feat.parquet` were both built from the items that appear in at least one
+sequence in `seq.parquet`, and these are ads that were never shown to these 1M
+users.
+
+We do not evaluate on the pool, for three reasons.
+
+1. The ceiling is 80.43%. Only 79,064 of our 98,304 val targets are inside it, and
+   all of those are mappable, since val targets are catalog items by construction.
+   A perfect method would score at most 80.43% HitRate@10, which turns a ranking
+   comparison into a statement about pool coverage.
+2. It measures coverage as well as ranking. 22.57% of the pool cannot be produced
+   by any method built on our index universe, so the three arms would be scored
+   partly on how much of the pool they can represent.
+3. It would not be comparable anyway. We do not have their test users or their
+   labels, so a pool score of ours would not sit next to the published numbers.
+   Our val split is a split of the provided training users.
+
+What we do take from the protocol is the reporting convention, since it costs
+nothing and it is the one thing that is comparable in definition. The combined
+score on our full-catalog space:
+
+| method | HR@10 | NDCG@10 | 0.31*HR + 0.69*NDCG |
+|---|---|---|---|
+| co-click, window 20 | 3.7069% | 2.0440% | 0.0256 |
+| co-click, window 5 | 3.6011% | 1.9890% | 0.0249 |
+| DiGR | 2.5940% | 1.5700% | 0.0189 |
+| popularity | 1.3438% | 0.8090% | 0.0097 |
+| HSTU tower | 0.4354% | 0.2008% | 0.0027 |
+
+K=10 stays the headline, which is what we already lead with. The cut-offs at 100,
+1,000 and 10,000 stay as diagnostics and are labelled as non-standard.
+
+If a leaderboard-comparable number is ever wanted, the route is to assign codes to
+the 148,971 missing pool items with the frozen Stage 1 tower and the frozen
+RQ-VAE. Existing SIDs would not change, because code assignment is per item and
+the codebooks are already fitted, and DiGR scores an item through its codes alone,
+so the frozen checkpoint would apply with no retraining. That is recorded as
+deferred, not planned.

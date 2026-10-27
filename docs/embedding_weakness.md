@@ -137,12 +137,16 @@ lift the target above ~1023 batchmates, most of which are unrelated. Fine-graine
 behaviour never has to be learned, so the item vector settles into a coarse
 content-plus-residual shape.
 
-### 4.4 LogQ at full weight removes the one signal a small model can learn
+### 4.4 LogQ is configured at full weight but is inert
 
-LogQ subtracts popularity from the logits. For a weak model, popularity is the
-easiest and largest behavioural signal. Removing it entirely leaves a residual
-that the 2M-parameter model cannot fit, so the item side falls back on content,
-which is the only structure left in its inputs.
+LogQ is meant to subtract popularity from the logits. For a weak model, popularity
+is the easiest and largest behavioural signal, so the intent of a full LogQ weight
+was to force the model past it. **In this run it does nothing at all**, because
+`main()` never populates a real sampling distribution and `log_q` stays the zero
+tensor from `__init__` (section 8.5). So the model is trained with no popularity
+correction, and the exported item vectors keep whatever popularity component the
+content and category frequencies put into them. This is a wiring defect, not a
+trade-off.
 
 ### 4.5 Content dominates the input
 
@@ -202,9 +206,11 @@ There are two ways to get behaviour into the SID, and they are complementary.
    vector was strong enough to push it there.
 
 2. Enrich the item embedding before RQ-VAE. Concatenate the content vector with a
-   behavioural vector (truncated SVD of the co-click matrix, zero-filled for
-   cold items) and quantise the 512-d result. This is the Phase 3b enriched arm,
-   and it injects behaviour directly rather than waiting for Stage 1 to learn it.
+   behavioural vector (truncated SVD of the co-click matrix, zero-filled for cold
+   items) and quantise the 512-d result. This is task 3b.2, and it injects
+   behaviour directly rather than waiting for Stage 1 to learn it. It is now the
+   first embedding experiment, because the probe showed the Stage 1 half of the
+   premise (a strong user vector) does not hold.
 
 There is a third, already-deferred option that this analysis puts back on the
 table as the honest conclusion: the behaviour already exists in the trained HSTU
@@ -216,18 +222,183 @@ inside a new backbone, a signal that Stage 1 already computed and threw away.
 
 ---
 
-## 7. Concrete next checks, cheapest first
+## 7. Status of the probe: answered, bottom band
 
-- Confirm the actual Stage 1 hyperparameters. The defaults above (batch 1024,
-  lr 1e-3, 3 blocks, temperature 0.05, LogQ 1.0) are what the code ships with; the
-  real run's values are saved in `output_dir/stage1_rec_model.pt` under `args`.
-- Score the trained HSTU user vector against the item embeddings, not the pooled
-  history. This is a ~10-line variant of the kNN probe and it is the one test
-  that would confirm section 3 directly: if the HSTU query beats popularity while
-  the pooled-history query does not, the behaviour is proven to be in the user
-  tower.
-- If that confirms it, the cheapest behavioural SID is the Phase 3b enrichment
-  (co-click SVD), because it does not require retraining Stage 1.
-- Fixing Stage 1 (bigger model, dual-path, more negatives) is the higher-ceiling
-  but more expensive option, and it belongs after TIGER is measured, per the
-  order in `docs/tasks.md`.
+`Model Training/probe_hstu.py` tests section 3 directly: it rebuilds the ItemDNN
+and HSTU from `stage1_rec_model.pt` and scores the user vector against the full
+catalog on the exact val rows. It has run, and the answer is the worst of the
+three bands in `docs/tasks.md` 3c.7.
+
+| method | R@1 | R@10 | R@100 | R@1000 | nDCG@10 |
+|---|---|---|---|---|---|
+| HSTU tower, window 20 | 0.0458% | 0.4354% | 2.9063% | 13.5122% | 0.2008% |
+| item embedding, last 1 clicked | 0.0173% | 0.5636% | 2.4638% | 8.1807% | - |
+| popularity | 0.4395% | 1.3438% | 4.7862% | 14.7288% | 0.8090% |
+
+One bug was found on the first run and fixed. `HSTUSequenceEncoder` reads
+`x[:, lengths - 1]` as the query, training left-aligns the sequence and the probe
+right-aligned it, so padded rows read a padding position. The fix was
+`to_chronological`. The rerun used that fix and the file on the cluster was
+confirmed byte-identical to `Model Training/probe_hstu.py`
+(`a4d53ca4db811d22387e595647076911`). R@1 was unchanged at 0.0458%, R@10 moved
+from 0.4283% to 0.4354% (+1.66% relative), R@100 from 2.8798% to 2.9063%, R@1000
+from 13.3931% to 13.5122%. The bug cost about 1.7% relative at R@10 and nothing at
+R@1, because a padding position still aggregates the valid prefix through
+attention, and only rows with fewer than 20 events were affected.
+
+Actions are approximated to a constant click action, because DiGR tokens carry
+codes and a temporal token but not action types. That biases the query down, so it
+cannot manufacture a good result.
+
+So section 3 is settled in the negative, not the way it was written. The behaviour
+is not in the user encoder either. Both towers of Stage 1 score below a frequency
+count, on the same content geometry, and the conclusion is the fourth option: Stage
+1 did not learn usable behaviour anywhere. A rebuild of the item side alone would
+be rebuilding the wrong half.
+
+---
+
+## 8. Why behaviour never reached the item vector
+
+Six mechanisms. The first is structural, the rest are severity.
+
+**8.1 The export path has no access to behaviour.** `export_catalog_embeddings`
+calls `get_item_embeddings(i)`, which is `ItemDNN(sem_i, has_mm_i, cats_i)`. No
+history, no user, no action. Everything the HSTU learned lives in `seq_encoder`
+and `action_emb`, and neither is touched when the item vectors are written. The
+exported vectors are a pure function of content, by construction.
+
+**8.2 There are no per-item parameters anywhere.** `ItemDNN` is content to vector:
+one shared MLP, 13 category embedding tables, and a projection of the 1024-d
+multimodal vector. No item index ever enters it. Two items with identical content
+get identical vectors, so the item side cannot store "item 123 follows item 456".
+
+**8.3 The only behavioural supervision is an averaged gradient.** InfoNCE does
+reach `ItemDNN`, but each item is a negative for most users and a positive for a
+few. The gradient on item `j` pulls it toward the average of the user vectors of
+its clickers. Since user vectors are dominated by their last clicked item's
+content, that average is a content cluster centroid. That is exactly the measured
+result: the tower's R@10 is 0.43%, sitting on the content geometry.
+
+**8.4 In-batch negatives, B = 1024.** The model was only ever asked to rank 1024
+items against each other. Catalog R@10 over 4.78M was never the objective, so
+in-batch recall looked healthy while catalog ranking collapsed. First place in the
+competition used large negative banks; third place scaled negatives to 380K. This
+run used 1024.
+
+**8.5 `log_q` is silently inert.** `SequentialRecModel.__init__` defaults
+`log_q = None` to `torch.zeros(...)`. `main()` passes `use_log_q` and
+`log_q_weight` but never a real sampling distribution, so the popularity
+correction contributes exactly zero. An intended component is switched off and
+nothing complains.
+
+**8.6 Action conditioning is additive and weak.**
+`hist_input = input_layer_norm(item_reps + act_reps)` mixes an unnormalised action
+vector into a unit-norm item vector, over a 4-token vocabulary. All three leading
+write-ups use per-position gated fusion, FiLM, or attention biasing. This is the
+weakest form of the thing they all treat as central.
+
+Summary: the model was not undertrained. There was nowhere for behaviour to be
+stored.
+
+---
+
+## 9. Is this the bottleneck? Not first
+
+The evidence makes the embedding a suspect, not a proven cause.
+
+| method | R@1 | R@10 | what carries the signal |
+| --- | --- | --- | --- |
+| HSTU tower, window 20 | 0.046% | 0.44% | content geometry |
+| content kNN, pooled history | 0.017% | 0.56% | content geometry |
+| popularity | 0.44% | 1.34% | frequency |
+| DiGR on our content SID | 0.79% | 2.59% | learned history to code |
+| co-click, window 20 | 0.81% | 3.71% | counts |
+
+DiGR recovers **4.6x more R@10 than the embedding it was built from**. A
+generative retriever does not need a behaviour-rich embedding. It needs an
+injective, well-spread vocabulary and enough label signal to fit the transition
+distribution. The SID is injective and near maximum entropy, so it qualifies.
+
+What an embedding rebuild also cannot fix: 27.67% of items share a 4-code prefix,
+so exact-identity R@1 is limited by how the codes partition the space, not only by
+how good the vectors are.
+
+But the embedding is not off the hook, and the reason is sharper than "the vectors
+are weak". The DiGR head reads an item through shared rows: `E_l[c_il]` is one of
+256 rows at each of the first four levels, and 18,684 items read the same level 0
+row on average. Every gradient step on that row averages over all of those items.
+With content codes, the averaged-over set is content-similar but behaviourally
+arbitrary, so the shared row learns a blur. With behaviour-aware codes, the
+averaged-over set is behaviourally alike and the same row becomes meaningful. The
+head is weak because the codes are content codes. That is the mechanism, and it
+says a behavioural code is not a nice-to-have for the SID route, it is the fix for
+the head's central weakness.
+
+What it does not say is that Stage 1 is the right instrument. The cheapest way to
+test the mechanism is to quantise a behaviour-derived vector, which needs no
+retraining of either tower and no new negatives, because the co-click matrix
+already exists and its own recall is already measured at 3.7069% R@10. That is D3,
+and it belongs before any Stage 1 retrain.
+
+---
+
+## 10. If the embedding is rebuilt, what to inject
+
+Always the same shape: item vector = content prior + behavioural evidence, with
+behaviour only where it exists (1.58M ever-clicked items, 67% cold). A pure
+per-item id table is not available, because 3.2M rows would never see a positive.
+
+- **D6, centroid distillation. Dropped.** Take the trained HSTU, compute for
+  every item the mean of its clickers' user vectors, then blend
+  `normalize((1 - a) * e_i + a * centroid_i)`. This was going to be the cheap gate.
+  The probe closed it instead: the user vectors being averaged score 0.4354% R@10,
+  below a frequency count, so averaging them cannot produce a strong item vector.
+  The gate it was meant to test is already answered, and running it would spend an
+  hour confirming an arithmetic impossibility.
+- **D3, behaviour-derived input. Next, and cheap.** Item2vec or truncated SVD over
+  the co-occurrence matrix, then `e_i = normalize(MLP(content_i) + W b_i)`, with
+  `b_i = 0` for the 67% cold items, then quantise the combined space. Second place
+  used exactly this. It tests the mechanism above directly, and it needs no Stage 1
+  retraining, so the frozen content SID stays intact and the three-arm comparison
+  is unaffected until that arm is switched on deliberately.
+- **D1, per-item behavioural residual.** `e_i = normalize(MLP(content_i) + r_i)`,
+with `r_i` a free 256-d row initialised to zero and updated only for interacted
+items, so cold items keep the pure content prior. About 2.4 GB in bf16. This is
+what gives the item side real resolution.
+- **D2, catalogue-scale objective.** Replace the B x B diagonal with sampled
+softmax over 100k to 380k catalog negatives, and populate `log_q` with the true
+sampling distribution. The same trick as `--sampled_softmax` in DiGR. Two dozen
+lines, and the highest expected value per line in this list.
+- **D5, real action gating.** Per-position FiLM or gated fusion instead of
+addition, plus true action types.
+- **D3, behaviour-derived input.** Item2vec or truncated SVD over the
+co-occurrence matrix, then `e_i = normalize(MLP(content_i) + W b_i)`, with
+`b_i = 0` for cold items. Second place used exactly this.
+- **D4, two vectors.** A content vector for coverage and a behavioural vector for
+warm items, with the SID taken from the behavioural space and a content fallback.
+More faithful to production, twice the pipeline.
+
+Constraints that survive every option: the SID exists for all 4,783,154 items and
+stays injective, cold items keep a content prior, the headline metric is exact item
+identity, and the vocabulary stays inside the 1,966 LLM tokens.
+
+---
+
+## 11. Order of work
+
+The goal is "which SID retrieval method is best", so at most one thing may move
+per comparison.
+
+1. TIGER on the frozen content SID. It changes the head and nothing else, so it
+   isolates the head. Its bar is co-click window 20, R@10 3.7069%.
+2. The behaviour-SID arm (D3), same head, same backbone, same evaluator, one
+   changed axis: the codes. This isolates the geometry, and it is the only
+   experiment that can tell whether the mechanism above is real.
+3. Only if both point at the item representation as the limit, open the Stage 1
+   rebuild (D2 first, then D1 and D5). It is the most expensive instrument and it
+   bundles several unknowns, so it goes last.
+
+D6 is dropped. A Stage 1 retrain is not on the path to answering the current
+question, it is on the path to a better embedding, and those are different
+projects.
