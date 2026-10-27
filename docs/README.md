@@ -10,11 +10,14 @@ Index only. Each file stands alone.
 | `results.md` | the measured table, every method on the same 98,304 rows, with compute cost |
 | `problems.md` | what those results mean for the direction of the project, including what went wrong |
 | `tasks.md` | what is left to do, in order, with the reason each item exists |
+| `plan_v2.md` | the next SID release and the richer event stream: what a wider codebook buys, what the event stream is throwing away, and the predictions in advance |
 | `embedding_weakness.md` | why the Stage 1 item embeddings are behaviourally weak, and what OnePiece does differently |
 | `recap_supervisor.md` | a self-contained status snapshot for the co-supervisor, current as of 2026-10-26 |
+| `../Plan 2/README.md` | the SID diagnostic script, how to read bucket lift, and the content SID measured |
 
 Current state in one line: a 47-second co-click count table beats the 4.6
-GPU-hour DiGR model at every cut-off except rank 10,000, and the next step is to
-build TIGER on the existing content SID, since the binding constraint is DiGR's
-additive head, not the tokenisation.
-Read `results.md` for the numbers and `problems.md` for what that implies.
+GPU-hour DiGR model at every cut-off except rank 10,000, and the next release is a
+wider SID plus an event stream that can tell an exposure from a click, since 89.4%
+of history events are exposures the model currently cannot distinguish.
+Read `results.md` for the numbers, `problems.md` for what they imply, and
+`plan_v2.md` for what is being changed next and what it is expected to buy.

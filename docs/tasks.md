@@ -13,10 +13,13 @@ section for why they are out of this table.
 
 State as of 2026-10-26.
 
-Two rules govern the order below.
+Three rules govern the order below.
 
 - **One axis moves at a time.** The SID set is frozen before the three-arm table
   is measured, so a method comparison is never confounded by an embedding change.
+- **A SID release is a release, not an edit.** New codes invalidate every number in
+  the table at once, so a new SID ships as a complete table or it does not ship.
+  `docs/plan_v2.md` is the current release plan.
 - **The embedding is not assumed to be the blocker.** DiGR already scores 4.6x the
   R@10 of the embedding it was built from, so the item side is a suspect, not a
   proven cause. See `docs/embedding_weakness.md` section 9.
@@ -107,45 +110,108 @@ These are small, cheap, and they decide whether TIGER's numbers mean anything.
 
 ---
 
-## Phase 3b: inject behaviour into the item side
+## Phase 3b: rebuild the item representation
 
-Read `docs/embedding_weakness.md` sections 8 to 11 first. Content stays the base
-because it covers every item. Behaviour is added on top, never instead, and the
-67% never-clicked items keep the pure content prior. Every item still gets a full
-five-code SID, so the hybrid lives inside the embedding and not in the
-tokenisation.
+The invariant that decides every choice here: **one code space, defined for every
+item, and comparable across items.** A code for a never-clicked item has to sit in
+the same geometry as a code for a popular one, or the level-0 prefix stops meaning
+one thing and the trie and the per-level head inherit a split vocabulary.
 
-- [x] 3b.1 **Centroid distillation (D6). Dropped, not deferred.** The plan was to
-      average the user vectors of each item's clickers into that item's vector, as
-      an hour-long gate on whether behaviour in the item space helps at all. 3c.5
-      answered the gate without running it: the vectors that would be averaged
-      score 0.4354% R@10, below the 1.3438% of a frequency count, so averaging them
-      cannot produce a strong item vector. See `docs/embedding_weakness.md`
-      section 7.
-- [ ] 3b.2 **Behavioural SID arm (D3). The real embedding experiment.** Truncated
-      SVD of the train co-click matrix, dim 256, rows L2-normalised, zero-filled
-      for the 67% never-clicked items, then
-      `e_i = normalize(MLP(content_i) + W * b_i)` and quantise the combined space
-      with a fresh RQ-VAE. Same DiGR head, same backbone, same evaluator, one axis
-      changed: the codes. The matrix it starts from already scores 3.7069% R@10 on
-      its own, so the question is what survives quantisation. Run it after TIGER,
-      so the head is measured on a SID that stayed frozen for both.
-- [ ] 3b.3 **Watch injectivity.** A behaviour-clustered space concentrates popular
-      items into few 4-code prefixes, and level 5 has only 731 codes to
-      disambiguate inside a prefix. Check the largest 4-prefix bucket before
-      training. If it exceeds 731 the SID is no longer injective and needs more
-      tail capacity or a collision resolver, which is the mechanism the
-      competition's Technical Innovation winner built for its second level.
-- [ ] 3b.4 **Gate it.** Same 98,304 val rows, same cut-offs, same catalog. If the
-      behaviour SID does not beat 2.5940% R@10 under the DiGR head, content codes
-      are not the binding constraint and the head is. Stop there.
-- [ ] 3b.5 Stage 1 retrain, the high-ceiling arm (D2, D1, D5). Sampled softmax over
-      100k to 380k catalog negatives instead of in-batch 1024, a real `log_q`
-      sampling distribution, a per-item behavioural residual `r_i` initialised to
-      zero so cold items keep the content prior, and gated (FiLM) action fusion
-      instead of addition. Re-export, re-quantise, then re-run DiGR and TIGER.
-      Only open this after TIGER and 3b.2 have both landed. It is the most
-      expensive instrument and it bundles several unknowns, so it goes last.
+1,580,961 items (33.0%) have behaviour and 3,202,193 (67.0%) have features but no
+interaction. This is therefore not a cold-start problem about missing data. Every
+item has a content vector. What two thirds of the catalogue lacks is clicks.
+
+That leaves exactly one distinction that matters.
+
+- Behaviour as an **input**. The code becomes a function of interactions, so items
+  without interactions are handled by a different rule. This is where the cold
+  start objection bites.
+- Behaviour as a **teacher**. The item vector stays a function of content for every
+  item, and behaviour shapes the mapping only during training. Cold items are
+  covered by construction, warm items inherit behaviour-shaped geometry, and there
+  is one code space.
+
+Prefer the teacher. It preserves the property the current SID has: identical content
+gives identical codes. Asymmetry in how *accurate* the behaviour estimate is for an
+item is fine. Asymmetry in the *geometry* is not.
+
+The whole question then reduces to a number that costs no GPU: how much of a
+behavioural vector is predictable from a content vector.
+
+Two directions remain, and they are multiplicative rather than additive. A wider
+head trained on content codes cannot show its capacity, and better codes read
+through 1,755 rows stay under-used, so each run in isolation returns a false
+negative. They also share the one expensive step, the RQ-VAE refit.
+
+- **A, post-hoc fusion.** Concatenate the content vector with a co-click SVD vector
+  and re-quantise. No training.
+- **B, retrain Stage 1 so behaviour infuses correctly.** D2 sampled softmax with a
+  real `log_q`, D1 per-item residual, behaviour as a teacher or an input (B2), then
+  re-export and re-quantise.
+
+- [ ] 3b.0 **Gate: is behaviour predictable from content?** The deciding
+      measurement. Take the 1,580,961 items that have both a content vector and a
+      behavioural vector, hold out 10%, fit ridge regression and a two layer MLP
+      from `c_i` to `b_i`, and report held-out cosine. Then quantise the predicted
+      vectors and measure depth-1 bucket recall against real val targets. High
+      cosine means distillation works and the cold start objection disappears. Low
+      cosine means a content-only code cannot carry behaviour, the SID stays
+      content, and behaviour belongs in the head and the reranker instead. Half a
+      day of CPU, and either answer redirects the phase.
+- [ ] 3b.1 **Build the behavioural vector.** Co-click counts at window 20 give
+      25,669,281 distinct pairs, about 16 successors for each of the 1,580,961
+      clicked items. Form the pair matrix, normalise so degree does not dominate
+      (PPMI, or the symmetric `D^-1/2 A D^-1/2` form, both standard for
+      co-occurrence embeddings), truncated SVD at rank 256, rows L2-normalised.
+      Shrink low counts so an item with one successor does not get a confident
+      direction. Undefined for never-clicked items, which is the point.
+- [ ] 3b.2 **Gate the vector on its own, before any quantiser.** Score it against
+      real val targets with `embedding_knn_nextclick.py`. The content vector scores
+      0.5636% R@10 and raw co-click scores 3.7069%. If the SVD vector cannot beat
+      0.5636% it is a popularity artefact and the whole branch dies for half a day
+      of CPU. Also inspect the correlation between vector norm and click count, and
+      the top-1 neighbour of sampled popular, mid-tail and cold items.
+- [ ] 3b.3 **Choose the fusion mode, in this order of preference.**
+      (i) Distil: `e_i = normalize(MLP(c_i) + W * pred_b(c_i))`, where `pred_b` is
+      the 3b.0 map. Every item is defined, cold items included, and the code stays
+      a pure function of content. Warm items may blend actual behaviour with the
+      prediction, since both are estimates of the same quantity.
+      (ii) Learn the fusion: `e_i = normalize(MLP([c_i ; b_i]))` with `b_i = 0` for
+      cold items, trained against the retrieval loss so the zero slice is
+      in-distribution rather than incidental.
+      (iii) Post-hoc concat with zero fill. Cheapest and weakest, because after unit
+      normalisation cold items sit on a face of the sphere where half the
+      coordinates are zero, so the quantiser spends codes on the fact that two
+      populations exist, and two items with identical content but different
+      interaction status get different codes.
+- [ ] 3b.4 **Re-quantise.** Same experiment as S1 in Phase 6, so run it there and
+      read the result here. `--input_dim 512` must be passed explicitly, the default
+      is 1024. The item side is 1,797,120 parameters for 4,783,154 items today; 4 x
+      1,024 takes it to about 4.5M and depth-1 buckets from 18,684 items to about
+      4,671.
+- [ ] 3b.5 **Gate the codes, CPU only.** Depth-1 and depth-2 bucket recall against
+      real val targets, the same method that produced 18.3156% at 18,684
+      candidates. The bar is the same **lift**, 46.9x, which at 4,671 candidates per
+      bucket is 4.579% recall. Comparing raw recall across releases is the trap in
+      `docs/plan_v2.md`. Check
+      injectivity (all 4,783,154 five-code tuples still distinct) and concentration
+      (largest 4-prefix bucket against level 5 capacity, and where never-clicked
+      items land, since they now carry a predicted behaviour rather than a zero).
+- [ ] 3b.6 **Gate D2 in parallel.** Sampled softmax over 100k to 380k catalogue
+      negatives plus a real `log_q` distribution, nothing else changed. The
+      deviation that took DiGR from popularity-level to 2.5940%, and the only Stage
+      1 fix with published evidence behind it. Gate with
+      `embedding_knn_nextclick.py` as in 3b.2: if the retrained item tower does not
+      beat popularity's 1.3438% R@10 against real next clicks, do not quantise it.
+- [ ] 3b.7 **Combine (B2), only if 3b.5 and 3b.6 both pass.** Retrain Stage 1 with
+      D2, D1 (`r_i` per-item residual, zero for cold items) and behaviour as the
+      teacher from 3b.3(i). Re-export, re-quantise at the 3b.4 config, then one
+      DiGR run. Compare against the frozen 2.5940% R@10 and co-click 3.7069%.
+
+Widening is not a separate experiment: bigger codebooks and new vectors both live
+inside the same re-quantisation, so they travel together and 3b.5 judges the
+combined result. Centroid distillation (D6) stays dropped, since the vectors it
+would average score 0.4354% R@10, below a frequency count.
 
 ---
 
@@ -190,7 +256,14 @@ either tower.
 
 ---
 
-## Phase 4: build TIGER
+## Phase 4: build TIGER (back burner)
+
+**Deferred by decision.** TIGER is engineering rather than exploration: the design
+is settled and the outcomes are predictable, a per-level head at or above DiGR's
+2.5940%. It is worth one run eventually, but it is not where the information is, and
+measuring a head on codes we already know are content-only understates what the head
+can do. Phase 3b comes first. The frozen content SID numbers stay as the historical
+reference for the table.
 
 Design is settled: **direct SID input**, user feature block carried, temporal
 tokens carried, same backbone, and the existing content SID. The input format
@@ -240,6 +313,41 @@ mid-epoch checkpointing and `catalog_sid_codes.npy` are all reused as they are.
 
 ---
 
+## Phase 6: SID v2 and a richer event stream
+
+Reasoning, arithmetic and the falsifiable predictions are in `docs/plan_v2.md`.
+Two claims to hold it to. A wider codebook is a capacity win for the head, 0.376
+to 0.88 parameters per item, and not a resolution win, because the geometry already
+sits at its packing bound. And the event stream is discarding the
+exposure-versus-click distinction on 89.4% of all events.
+
+The measured occupancy it builds on, 4,783,154 items: depth 1 is 256 tuples of
+18,684.20 items, depth 2 is 57,122 of 83.74, depth 3 is 1,506,041 of 3.18, depth 4
+is 3,459,854 of 1.38, depth 5 is injective. All codebooks are at 7.87 to 7.98 bits
+of 8, so nothing is collapsed.
+
+- [ ] S0 **Instrument.** Depth occupancy, collision count and bucket lift at depths
+      1 and 2, for any SID directory, against the same 98,304 val rows. Without
+      this there is no denominator for S1, and the release cannot be compared.
+- [ ] S1 **Width sweep, about one GPU hour.** 4 x 256 as the control, 4 x 1,024, and
+      2 x 16,384 to match OnePiece's resolution. Nothing else changes. Report
+      occupancy, collisions and lift.
+- [ ] S2 **Verdict, no compute.** Flat lift means the capacity argument is the
+      reason to adopt a wider SID and `docs/embedding_weakness.md` section 9 stands.
+      A moving lift means section 9 is wrong and gets rewritten.
+- [ ] S3 **Event stream, one preprocess pass.** Action token (exposure, click,
+      unknown), gap bins 64 to 128, drop the fifth level only if S1 reports under
+      0.1% collisions, absolute time behind a flag so it can be ablated. Target is
+      6 tokens per event and the same 221.5M train tokens as today.
+- [ ] S4 **DiGR on the new data.** Frozen config, 300k negatives, three epochs, same
+      evaluator. Two axes move together here on purpose.
+- [ ] S5 **Baselines on the new data.** Popularity and co-click need no SID, so they
+      are control rows and must reproduce to the digit. `sid_transition` is the one
+      baseline that can move.
+- [ ] S6 **TIGER on the SID that S1 and S4 endorse**, once, then the three-arm table.
+
+---
+
 ## Deferred: continuous-vector retrieval and ANN
 
 The design that won both competitions, and the only one with per-item resolution.
@@ -263,21 +371,17 @@ of them can be declared a success.
 
 ## Next step
 
-TIGER is unchanged and stays first in the queue. It runs on the existing content
-SID, and its bar is R@10 3.7069% and R@100 10.9873% (co-click window 20). Nothing
-in the embedding work moves that bar.
+Phase 6, in order, and the first three steps are cheap.
 
-Two things run in parallel, both cheap, neither of them a retrain.
+1. S0, the instrument. Occupancy plus bucket lift in one script, so any SID can be
+   scored in minutes instead of an afternoon.
+2. S1, the width sweep. One GPU hour and half a day of CPU. It answers whether the
+   geometry is the binding constraint or the head is, and both answers are useful.
+3. S3, the event stream. The action token is the highest-value single change
+   available: 89.4% of events in a history are exposures and the model cannot tell
+   them from clicks.
 
-- 3.2 to 3.4, the trie, the decode-cost measurement and the sliced-evaluator note,
-  which TIGER needs anyway.
-- The write-up of what the probes closed: the item side and the user side are both
-  below popularity, D6 is dropped, and the behavioural SID (3b.2) is the next
-  embedding experiment rather than a Stage 1 retrain.
-
-After TIGER, run 3b.2 on a SID derived from the co-click matrix. That is the
-cheapest test of whether codes can carry behaviour, and it reuses the head TIGER
-leaves behind.
-
-Do not open 3b.5 (the Stage 1 retrain) until TIGER and 3b.2 have both landed, and do
-not change the SID set between the DiGR and TIGER numbers.
+Phase 3b waits behind S1, because if the width sweep confirms the geometry is
+saturated then 3b.0 is the only change that can move it. The frozen content SID
+stays untouched while Phase 6 is in flight, so the DiGR and baseline rows remain
+valid as the reference. `docs/plan_v2.md` states both predictions before the runs.
