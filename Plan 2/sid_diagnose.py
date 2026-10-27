@@ -26,6 +26,11 @@ Usage
   python "Plan 2/sid_diagnose.py" --data_dir a/digr_data --json a.json
   python "Plan 2/sid_diagnose.py" --data_dir b/digr_data --json b.json
 
+  # score a new SID against a split tokenised with an older one
+  python "Plan 2/sid_diagnose.py" --data_dir a/digr_data \
+      --codes new_codes.npy --vocab new_vocab.json \
+      --query_codes a/digr_data/catalog_sid_codes.npy
+
 Only numpy is needed. The catalogue does not have to be the one the val split was
 built from, as long as `catalog_sid_codes.npy` and `vocab.json` describe the same
 item ordering as `catalog_item_ids.npy`.
@@ -217,6 +222,23 @@ def occupancy_report(codes: np.ndarray, sizes: np.ndarray) -> list:
     return rows
 
 
+def build_identity(codes_path: str, vocab_path: str) -> tuple:
+    """Reverse map from an old SID back to a catalogue row index.
+
+    A val split carries the codes of whichever SID it was tokenised with. To bucket a
+    query under a *different* SID, the decoded tuple has to become an item id first and
+    then be re-read in the new vocabulary. Only the tokenised SID can do that step.
+
+    Returns (sorted_keys, order) such that `order[searchsorted(keys, k)]` is the row.
+    """
+    codes = load_codes(codes_path)
+    vocab = load_json(vocab_path)
+    sizes = load_sizes(vocab, codes.shape[1], vocab_path)
+    keys = pack_keys(codes, sizes)
+    order = np.argsort(keys, kind="stable")
+    return keys[order], order
+
+
 def last_event_codes(tokens: np.ndarray, offsets: np.ndarray, vocab: dict) -> tuple:
     """SID codes of the final event in each row.
 
@@ -238,7 +260,8 @@ def last_event_codes(tokens: np.ndarray, offsets: np.ndarray, vocab: dict) -> tu
     return codes, inside, rows
 
 
-def lift_report(codes, sizes, vocab, split_dir, max_rows=None) -> dict:
+def lift_report(codes, sizes, vocab, split_dir, max_rows=None, query_vocab=None,
+                identity=None) -> dict:
     tokens_path = os.path.join(split_dir, "tokens.npy")
     offsets_path = os.path.join(split_dir, "offsets.npy")
     targets_path = os.path.join(split_dir, "targets.npy")
@@ -249,7 +272,23 @@ def lift_report(codes, sizes, vocab, split_dir, max_rows=None) -> dict:
     tokens = np.load(tokens_path)
     offsets = np.load(offsets_path)
     targets = np.asarray(np.load(targets_path), dtype=np.int64).ravel()
-    query, inside, rows = last_event_codes(tokens, offsets, vocab)
+    stream_vocab = vocab if query_vocab is None else query_vocab
+    query, inside, rows = last_event_codes(tokens, offsets, stream_vocab)
+
+    if identity is not None:
+        # The decoded tuple names an item only under the SID the split was tokenised
+        # with. Resolve it to a row, then take the query codes from the bucket SID, so
+        # the query and the buckets come from the same vocabulary.
+        stream_sizes = np.asarray(
+            [int(v) for v in stream_vocab["sid_sizes"]], dtype=np.int64
+        )[: query.shape[1]]
+        keys, order = identity
+        query_keys = pack_keys(np.where(inside[:, None], query, 0), stream_sizes)
+        pos = np.clip(np.searchsorted(keys, query_keys), 0, keys.size - 1)
+        resolved = keys[pos] == query_keys
+        item = order[pos]
+        inside = inside & resolved
+        query = np.asarray(codes, dtype=np.int64)[np.where(inside, item, 0)]
 
     if targets.size != rows:
         raise SystemExit(
@@ -436,8 +475,17 @@ def build_report(args) -> dict:
     }
 
     if args.split_dir and not args.no_lift:
+        identity = None
+        query_vocab = None
+        if args.query_codes:
+            query_vocab_path = args.query_vocab or os.path.join(args.data_dir, VOCAB_NAME)
+            query_vocab = load_json(query_vocab_path)
+            identity = build_identity(args.query_codes, query_vocab_path)
+            report["inputs"]["query_codes"] = args.query_codes
+            report["inputs"]["query_vocab"] = query_vocab_path
         report["lift"] = lift_report(
-            codes, sizes, vocab, args.split_dir, max_rows=args.max_rows
+            codes, sizes, vocab, args.split_dir, max_rows=args.max_rows,
+            query_vocab=query_vocab, identity=identity,
         )
     return report
 
@@ -457,6 +505,17 @@ def main(argv=None) -> int:
         "defaults to <data_dir>/val when data_dir is given",
     )
     parser.add_argument("--max_rows", type=int, default=None, help="subsample the split")
+    parser.add_argument(
+        "--query_codes",
+        default=None,
+        help="catalogue codes of the SID the split was tokenised with; needed when "
+        "--codes is a different SID, because the query item must be resolved first",
+    )
+    parser.add_argument(
+        "--query_vocab",
+        default=None,
+        help="vocab holding sid_offsets for the token stream; defaults to --vocab",
+    )
     parser.add_argument("--no_lift", action="store_true", help="skip the split entirely")
     parser.add_argument("--json", default=None, help="write the full report as JSON")
     args = parser.parse_args(argv)

@@ -31,8 +31,12 @@ md5sum /scratch/mscbdtspod2026/jksulaiman/data/digr_data/catalog_sid_codes.npy
 ```
 
 The fifth level is not a codebook. It is the collision suffix from
-`--add_unique_id`, which grew to 731 values because `--unique_id_bound` was never
-set. Read it as bookkeeping, not as a semantic level.
+`--add_unique_id`, and it reached 731 values because the run disabled clipping with
+`--no-clip-suffix`. The default path is different and worth knowing: with
+`--unique_id_bound` unset the bound falls back to `--codebook_size`, so clipping
+would have capped this level at 256 values and any group larger than 256 would have
+collapsed onto its last suffix. Read the level as bookkeeping either way, not as a
+semantic level.
 
 ## Method
 

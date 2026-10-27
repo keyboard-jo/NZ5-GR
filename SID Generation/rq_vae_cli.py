@@ -239,35 +239,45 @@ class RQVAE(nn.Module):
     """
     def __init__(
         self,
-        input_dim=256,
-        hidden_dim=64,
-        beta=0.25,
-        codebook_sizes=[256, 256, 256, 256],
+        input_dim=DEFAULT_INPUT_DIM,
+        hidden_dim=DEFAULT_HIDDEN_DIM,
+        beta=DEFAULT_BETA,
+        codebook_sizes=None,
         temperature=1.0,
         # Trap B: with unit-sphere latents (||z||^2 ~= 1.0) the stage-3 residual norm^2 is ~2.5e-4,
         # so jitter std 0.01 would contribute E[||jitter||^2] = 64 * 1e-4 = 6.4e-3 (~25x the true
         # residual): stages 2-3 would just be quantizing noise. Keep this at 0.0 to 0.001.
-        jitter=0.0,
-        entropy_loss_weight=0.05,
+        jitter=DEFAULT_JITTER,
+        entropy_loss_weight=DEFAULT_ENTROPY_LOSS_WEIGHT,
         stage_weights=None,
         is_run_baseline: bool = False,
     ):
         super().__init__()
         self.is_run_baseline = is_run_baseline
         self.beta = beta
-        self.codebook_sizes = codebook_sizes
+        self.codebook_sizes = (
+            list(codebook_sizes) if codebook_sizes is not None
+            else [DEFAULT_CODEBOOK_SIZE] * DEFAULT_NUM_CODEBOOKS
+        )
         self.hidden_dim = hidden_dim
-        self.num_stages = len(codebook_sizes)
+        self.num_stages = len(self.codebook_sizes)
 
         # Baseline disables the additional mechanisms.
         self.temperature = temperature
         self.jitter = 0.0 if is_run_baseline else jitter
         self.entropy_loss_weight = 0.0 if is_run_baseline else entropy_loss_weight
-        self.stage_weights = (
-            [1.0] * self.num_stages
-            if is_run_baseline
-            else (stage_weights if stage_weights is not None else [1.0] * self.num_stages)
-        )
+        if is_run_baseline:
+            self.stage_weights = [1.0] * self.num_stages
+        else:
+            weights = list(stage_weights) if stage_weights is not None else [1.0] * self.num_stages
+            # Exactly one weight per stage. forward() zips the codebooks against this list and
+            # divides the entropy term by its sum, so a longer list inflates the divisor without
+            # error (DEFAULT_STAGE_WEIGHTS has four entries, so --num_codebooks 3 scaled the whole
+            # regulariser by 1/5.5 instead of 1/4.5, about 18% weaker) and a shorter list drops the
+            # tail stages silently. Trim or pad, never rescale by accident.
+            weights = weights[: self.num_stages]
+            weights += [1.0] * (self.num_stages - len(weights))
+            self.stage_weights = weights
 
         # Encoder: 256 -> 256 -> 128 -> 128 -> 64
         self.encoder = nn.Sequential(
@@ -306,7 +316,7 @@ class RQVAE(nn.Module):
 
         # Codebooks: Unconstrained in magnitude to allow multi-scale residual decay
         self.codebooks = nn.ParameterList()
-        for codebook_size in codebook_sizes:
+        for codebook_size in self.codebook_sizes:
             cb = nn.Parameter(torch.FloatTensor(codebook_size, hidden_dim))
             with torch.no_grad():
                 nn.init.trunc_normal_(cb, std=TRUNC_NORMAL_STD, a=-TRUNC_NORMAL_BOUND, b=TRUNC_NORMAL_BOUND)
@@ -821,6 +831,16 @@ def main():
     parser.add_argument('--save_interval', type=int, default=DEFAULT_SAVE_INTERVAL, help='Epoch frequency to save periodic checkpoints')
 
     args = parser.parse_args()
+
+    # Same reason as RQVAE.__init__: the card below should report the weights actually applied.
+    if len(args.stage_weights) != args.num_codebooks:
+        weights = list(args.stage_weights[: args.num_codebooks])
+        weights += [1.0] * (args.num_codebooks - len(weights))
+        print(
+            f"[stage_weights] {len(args.stage_weights)} entries given for "
+            f"{args.num_codebooks} codebooks; using {weights}"
+        )
+        args.stage_weights = weights
 
     # Reproducibility Seeds
     torch.manual_seed(RANDOM_SEED)
