@@ -16,8 +16,10 @@ Index only. Each file stands alone.
 | `../Plan 2/README.md` | the SID diagnostic script, how to read bucket lift, and the content SID measured |
 
 Current state in one line: a 47-second co-click count table beats the 4.6
-GPU-hour DiGR model at every cut-off except rank 10,000, and the next release is a
-wider SID plus an event stream that can tell an exposure from a click, since 89.4%
-of history events are exposures the model currently cannot distinguish.
+GPU-hour DiGR model at every cut-off except rank 10,000, the DiGR head reads an item
+through a code shared by 18,684 items, and widening the codebook from 256 to 1,024
+rows made the bucket 2.7x more label-pure on the same embedding, so the next release
+is a 16,384-wide SID plus an event stream that can tell an exposure from a click,
+since 89.4% of history events are exposures the model currently cannot distinguish.
 Read `results.md` for the numbers, `problems.md` for what they imply, and
 `plan_v2.md` for what is being changed next and what it is expected to buy.

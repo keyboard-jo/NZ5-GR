@@ -358,3 +358,60 @@ RQ-VAE. Existing SIDs would not change, because code assignment is per item and
 the codebooks are already fitted, and DiGR scores an item through its codes alone,
 so the frozen checkpoint would apply with no retraining. That is recorded as
 deferred, not planned.
+
+---
+
+## 11. A wider codebook makes buckets sharper, and that was not expected
+
+The SID release plan (`docs/plan_v2.md`) was built on a prediction: a wider codebook
+would raise the head's parameter count while leaving bucket quality flat, because the
+embedding geometry already sits at its packing bound. The prediction was testable and
+`Plan 2/sid_diagnose.py` tested it. It was wrong.
+
+Same 98,304 val rows, same 4,783,154-item catalogue, same instrument. Only the
+quantiser changes, from 4 x 256 plus the collision suffix to 3 x 1,024, both fitted
+on the same frozen 256-d Stage 1 embedding.
+
+| depth | 4 x 256 + 731 | 3 x 1,024 |
+|---|---|---|
+| bucket size | 18,684.20 | 4,671.05 |
+| recall | 18.3156% | 12.3840% |
+| lift over its own base rate | 46.9x | 126.8x |
+| depth-2 bucket size | 345.9 | 67.22 |
+| depth-2 recall | 2.5167% | 1.1190% |
+| depth-2 lift | 1,437.6x | 5,968.8x |
+| depth-3 recall | 0.5483% | 0.19836% |
+| depth-3 lift | 8,257.6x | 6,732.1x |
+
+Raw recall falls because the bucket shrank 3.44x. Lift is size-normalised, so it is
+the comparable column, and it rises 2.7x at depth 1 and 4.2x at depth 2. The finer
+partition puts the true next item in a much smaller and much more label-pure cell.
+
+Both quantisers are healthy, so this is not a codebook-collapse artefact. The frozen
+4 x 256 SID runs at 7.87 to 7.98 bits of 8 with all four codebooks 100% utilised. The
+3 x 1,024 SID runs at 9.8544, 9.8285 and 9.9085 bits of 10, also all 100% utilised.
+Its occupancy is 1,024 tuples of 4,671.05 items at depth 1, 533,417 of 8.97 at depth
+2, and 3,393,796 of 1.41 at depth 3, where 29.05% of items share a tuple but the
+largest tuple holds 372 items, so a fourth 1,024-wide level cannot collide at all.
+
+The reasoning error is worth recording because it shaped the whole plan. The packing
+bound limits how well cells separate points in the embedding's own metric. It says
+nothing about how well they separate the click. A k-means partition with four times
+as many cells tracks the density modes more closely, so cells get more label-pure
+even when the points inside them are no better separated. The plan reasoned about the
+wrong quantity and then presented the conclusion as arithmetic.
+
+The token budget is a side effect worth noting. The largest depth-3 tuple holds 372
+items, well under 1,024, so a fourth 1,024-wide level cannot collide and the five
+level SID that exists only because 256-wide codes collide at depth 4 is unnecessary.
+At three codes an item is 3 tokens instead of 5 and an event is 4 tokens instead of
+6, so 221,500,536 train tokens fall to about 153.5M at the same event count, which
+leaves room for the per-event action and gap tokens.
+
+What this points at is items per code, which is the number that has to match the
+DiGR paper for its accuracy to be reachable. The paper's own catalogues sit at 39 to
+195 items per level-0 code. Ours started at 18,684, and 3 x 1,024 only takes that to
+4,671. Two codebooks of 16,384 take it to 292, which is the regime the paper was
+evaluated in and the configuration OnePiece ran on this data, so that is the next SID
+rather than another 1,024-wide variant.
+

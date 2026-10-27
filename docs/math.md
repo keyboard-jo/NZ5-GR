@@ -298,6 +298,56 @@ table has 25,669,281 non-zero entries, which is 14.3x the head's parameter count
 So the comparison "DiGR versus a count table" is a comparison between 1.8M and
 25.7M learned numbers on the same data.
 
+### 5.5.1 Items per code is the number that matters, and the paper names it
+
+The paper is not vague about this being the design rather than a compromise:
+
+> The embeddings are shared across items, and mean pooling introduces no additional
+> composition parameters and no item-specific information.
+
+That trade is cheap at the scale the paper tests, where the catalogues are three
+Amazon categories of roughly 10k, 28k and 50k items. With 256 codes per level it is
+39, 109 and 195 items per level-0 code. The same design on 4,783,154 items gives
+18,684 per level-0 code and 6,543 per level-4 code, which is 96 to 479 times coarser.
+
+The mechanism is direct. `v_i` is a sum of `L` shared vectors, so two items whose
+codes agree at levels 0 to `L-1` differ only by `(1/L) * (e_L(a) - e_L(b))`. The
+resolution of that difference is the number of items sharing the last code. When 195
+items share it, an item is nearly identified by its tuple. When 6,543 share it, and
+the code is a collision rank with no semantics, nothing identifies the item.
+
+Two consequences the score cannot avoid, both structural:
+
+- The `1/L` in the mean forces every level to carry equal weight. The model cannot
+  learn that the level-0 code matters more than the level-4 code, because the
+  weights are fixed by the pooling operator, not learned.
+- Raising the row count raises resolution only by adding rows. At `3 x 1,024` the
+  items per level-0 code is 4,671, still 24x the paper's largest dataset. At
+  `2 x 16,384` it is 292, which is the paper's regime and exactly the configuration
+  OnePiece used on this same data family. The item side then costs 32,768 rows of
+  1,024, which is 33,554,432 parameters, 7.02 per item, and 67 MB in bf16.
+
+A wide vocabulary is affordable here for a reason specific to this paper's design:
+DiGR never generates SID tokens, so there is no trie, no beam and no per-level softmax
+to prune. The vocabulary is a lookup table and `V` is precomputed. A method that
+generates the codes cannot take the same width cheaply.
+
+Items per code, at `4 x 256 + 731` and at candidate widths:
+
+| SID | rows | params | params/item | items per level-0 code |
+|---|---|---|---|---|
+| 4 x 256 + 731 | 1,755 | 1,797,120 | 0.376 | 18,684 |
+| 3 x 1,024 | 3,072 | 3,145,728 | 0.658 | 4,671 |
+| 4 x 1,024 | 4,096 | 4,194,304 | 0.877 | 4,671 |
+| 2 x 16,384 | 32,768 | 33,554,432 | 7.02 | 292 |
+| 3 x 16,384 | 49,152 | 50,331,648 | 10.52 | 292 |
+| 2 x 32,768 | 65,536 | 67,108,864 | 14.03 | 146 |
+
+Rows and parameters are the easy axis. What costs is codes per item, because every
+code is a token in every event: two codes at 16,384 is 32,768 rows and two tokens,
+three codes at 16,384 is 49,152 rows and three tokens, and the token is worth more
+than the rows since each removed per-event token cuts train compute by 15.4%.
+
 Inside the model there is no cross-level interaction, and
 `evaluate()`'s `rank` inherits that limitation exactly.
 

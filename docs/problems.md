@@ -90,22 +90,38 @@ If the target is already inside the top 1,000, how often does it reach the top 1
 | item-embedding kNN | 6.89% |
 
 Four point six GPU-hours of a 0.6B language model moved that number from 9.12% to
-12.01%. That is the whole return.
+12.01%. That is the whole return, and it is what sent the project looking for a
+different cause.
 
-The reason is arithmetic. DiGR's item side is five levels of 256, 256, 256, 256 and
-731 code rows, 1,755 rows of 1,024 dimensions, which is 1,797,120 free parameters
-to separate 4,783,154 items. That is **0.376 degrees of freedom per item**. Each
-row is shared: levels 0 to 3 group 18,684 items each, and even level 4 groups
-6,543. Two items cannot be scored apart except through a row that thousands of
-other items also use.
+The cause is not the encoder, the sequence length, the number of epochs or the loss.
+The score is `z = V h / tau` with `v_i` a mean over the item's five shared code
+vectors, and the DiGR paper describes the consequence as a feature: the embeddings
+"are shared across items, and mean pooling introduces no additional composition
+parameters and no item-specific information". Nothing is misimplemented. The design
+buys inductive generalisation by giving up per-item detail, and that trade is cheap
+when a catalogue is small.
+
+It is not cheap at 4,783,154 items. DiGR's item side is five levels of 256, 256, 256,
+256 and 731 code rows, 1,755 rows of 1,024 dimensions, which is 1,797,120 free
+parameters. Levels 0 to 3 group 18,684 items each, and even level 4 groups 6,543,
+which is **0.376 degrees of freedom per item**. Two items cannot be scored apart
+except through a row that thousands of other items also use. The paper's own
+catalogues sit at 39 to 195 items per level-0 code, 96 to 479 times finer, so its
+reported accuracy is not reachable from here without changing the resolution.
 
 The count table has the opposite shape. 25,669,281 distinct pairs, 5.37 successors
 per item. Its top 10 for a query is roughly those 5.37 known next items plus
 popularity padding, and that beats the model. The model sees the same pairs during
 training and cannot store one of them.
 
-So the ceiling is not the encoder, the sequence length, the number of epochs or the
-loss. It is the resolution of the score.
+So the ceiling is set by the resolution of the score, which is a setting rather than a
+property, and it has already been measured once. Holding everything else fixed and
+quantising the same 256-d vectors at 3 x 1,024 instead of 4 x 256 plus a collision
+suffix moved depth-1 bucket lift from 46.9x to 126.8x, so the partition became 2.7x
+more label-pure. That also falsified the earlier prediction in `docs/plan_v2.md` that
+width could only help capacity. The next point on that curve has a known arithmetic
+answer: 16,384 wide puts level 0 at 292 items per code, which is where the paper
+sits.
 
 ---
 

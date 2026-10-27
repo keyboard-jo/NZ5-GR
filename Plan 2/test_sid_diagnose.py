@@ -365,3 +365,40 @@ def test_resolve_paths_prefers_explicit_overrides(tmp_path):
     resolved = sd.resolve_paths(Args)
     assert resolved["codes"].endswith("catalog_sid_codes.npy")
     assert resolved["vocab"].endswith("vocab.json")
+
+
+def test_tie_ceiling_is_one_when_every_code_is_unique():
+    sd = _load_module()
+    codes = np.array([[0, 0], [1, 0], [2, 0], [3, 0]], dtype=np.int32)
+    report = sd.tie_ceiling_report(codes, [4, 1], np.array([0, 1, 2, 3]))
+    assert report["mean_group"] == 1.0
+    assert report["ceilings"] == {1: 1.0, 10: 1.0, 100: 1.0, 1000: 1.0}
+
+
+def test_tie_ceiling_halves_repeat_accuracy_at_rank_one():
+    sd = _load_module()
+    # items 0 and 1 hold the same SID, so half the targets cannot be ranked first
+    codes = np.array([[0, 0], [0, 0], [1, 0], [2, 0]], dtype=np.int32)
+    report = sd.tie_ceiling_report(codes, [3, 1], np.array([0, 1, 2, 3]))
+    assert report["mean_group"] == 1.5
+    assert report["ceilings"][1] == pytest.approx(0.75)
+    assert report["ceilings"][10] == 1.0
+
+
+def test_tie_ceiling_drops_targets_outside_the_catalogue():
+    sd = _load_module()
+    codes = np.array([[0, 0], [1, 0]], dtype=np.int32)
+    report = sd.tie_ceiling_report(codes, [2, 1], np.array([0, 1, 9, -1]))
+    assert report["rows"] == 2
+    assert report["rows_outside_catalog"] == 2
+    assert report["mean_group"] == 1.0
+
+
+def test_tie_ceiling_reports_a_wide_group():
+    sd = _load_module()
+    # four items on one code, one on another: a target in the group of four caps at 1/4
+    codes = np.array([[0, 0]] * 4 + [[1, 0]], dtype=np.int32)
+    report = sd.tie_ceiling_report(codes, [2, 1], np.array([0, 1, 2, 3]))
+    assert report["largest_group"] == 4
+    assert report["ceilings"][1] == pytest.approx(0.25)
+    assert report["ceilings"][10] == pytest.approx(1.0)

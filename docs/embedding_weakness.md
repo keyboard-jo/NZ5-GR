@@ -320,9 +320,12 @@ generative retriever does not need a behaviour-rich embedding. It needs an
 injective, well-spread vocabulary and enough label signal to fit the transition
 distribution. The SID is injective and near maximum entropy, so it qualifies.
 
-What an embedding rebuild also cannot fix: 27.67% of items share a 4-code prefix,
-so exact-identity R@1 is limited by how the codes partition the space, not only by
-how good the vectors are.
+What an embedding rebuild also cannot fix on the frozen SID: 27.67% of items share a
+4-code prefix, so exact-identity R@1 is limited by how the codes partition the space,
+not only by how good the vectors are. Width does fix that. At 3 x 1,024 the depth-3
+collision rate is 29.05% but the largest depth-3 bucket is 372 items, so a fourth
+1,024-wide level is arithmetically guaranteed to be injective, and at 2 x 16,384
+depth 2 carries at most a 1.78% uniform-bound collision share.
 
 But the embedding is not off the hook, and the reason is sharper than "the vectors
 are weak". The DiGR head reads an item through shared rows: `E_l[c_il]` is one of
@@ -332,14 +335,26 @@ With content codes, the averaged-over set is content-similar but behaviourally
 arbitrary, so the shared row learns a blur. With behaviour-aware codes, the
 averaged-over set is behaviourally alike and the same row becomes meaningful. The
 head is weak because the codes are content codes. That is the mechanism, and it
-says a behavioural code is not a nice-to-have for the SID route, it is the fix for
+says a behavioural code is not a nice-to-have for the SID route, it is one fix for
 the head's central weakness.
+
+Width attacks the same mechanism from the other side, and that is measured now rather
+than argued. Quantising the same 256-d vectors at 3 x 1,024 instead of 4 x 256 plus a
+collision suffix cuts the averaged-over set from 18,684 items to 4,671 and moves
+depth-1 bucket lift from 46.9x to 126.8x. So the mechanism above is real and the
+number of items sharing a row is the dial. Behavioural codes make each shared set
+homogeneous; wider codes make each shared set small. Both cut the blur, and width
+needs no new data, no new negatives and no retraining of either tower, which makes it
+the cheaper first move. At 16,384 wide the shared set is 292 items, which is where
+the DiGR paper's own catalogues sit, so that is the point to aim at rather than
+1,024, and two codes of that width are enough.
 
 What it does not say is that Stage 1 is the right instrument. The cheapest way to
 test the mechanism is to quantise a behaviour-derived vector, which needs no
 retraining of either tower and no new negatives, because the co-click matrix
 already exists and its own recall is already measured at 3.7069% R@10. That is D3,
-and it belongs before any Stage 1 retrain.
+and it belongs before any Stage 1 retrain, but after the width sweep, which costs a
+GPU hour instead of a preprocessing pass.
 
 ---
 

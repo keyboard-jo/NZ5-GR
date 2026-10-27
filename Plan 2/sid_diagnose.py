@@ -338,6 +338,35 @@ def lift_report(codes, sizes, vocab, split_dir, max_rows=None, query_vocab=None,
     }
 
 
+def tie_ceiling_report(codes, sizes, targets, ks=(1, 10, 100, 1000)) -> dict:
+    """Upper bound on Recall@k set by items that hold exactly the same codes.
+
+    Two items with the same complete SID get the same score from any scorer that
+    reads the SID, because the item vector is a function of the codes. So the best
+    a ranking can do inside a tie group of size ``g`` is return the target with
+    probability ``1/g`` at rank 1, and ``min(1, k/g)`` at rank ``k``. Averaging that
+    over the targets in a split says how much accuracy a shared code costs, which is
+    the only way to tell whether a collision rate is tolerable.
+    """
+    keys = pack_keys(codes, sizes)
+    _unique, inverse, counts = np.unique(keys, return_inverse=True, return_counts=True)
+    targets = np.asarray(targets, dtype=np.int64).ravel()
+    inside = (targets >= 0) & (targets < codes.shape[0])
+    if not inside.any():
+        raise SystemExit("no split target falls inside the catalogue")
+    group = counts[inverse[np.where(inside, targets, 0)]][inside].astype(np.float64)
+    report = {
+        "rows": int(group.size),
+        "rows_outside_catalog": int((~inside).sum()),
+        "mean_group": float(group.mean()),
+        "median_group": float(np.median(group)),
+        "p90_group": float(np.percentile(group, 90)),
+        "largest_group": int(group.max()),
+        "ceilings": {int(k): float(np.mean(np.minimum(1.0, k / group))) for k in ks},
+    }
+    return report
+
+
 # ---------------------------------------------------------------------------
 # Printing
 # ---------------------------------------------------------------------------
@@ -459,6 +488,33 @@ def print_report(report: dict) -> None:
         "  and raw recall is expected to fall there because the bucket is smaller"
     )
 
+    tie = report.get("tie_ceiling")
+    if tie:
+        print("")
+        print("Tie ceiling, the price of two items holding the same codes")
+        print(
+            "  rows {} | mean tie group {:.2f} | median {} | p90 {} | largest {}".format(
+                human_int(tie["rows"]),
+                tie["mean_group"],
+                human_int(tie["median_group"]),
+                human_int(tie["p90_group"]),
+                human_int(tie["largest_group"]),
+            )
+        )
+        print(
+            "  best possible recall, if every score is ordered perfectly: "
+            + ", ".join(
+                "R@{} {:.4f}%".format(k, 100.0 * v)
+                for k, v in sorted(tie["ceilings"].items())
+            )
+        )
+        if tie.get("rows_outside_catalog"):
+            print(
+                "  target rows outside the catalogue, dropped: {}".format(
+                    human_int(tie["rows_outside_catalog"])
+                )
+            )
+
 
 def build_report(args) -> dict:
     paths = resolve_paths(args)
@@ -475,6 +531,22 @@ def build_report(args) -> dict:
     }
 
     if args.split_dir and not args.no_lift:
+        # A split was tokenised with the SID that sat in data_dir, so if --codes points
+        # somewhere else the query still has to be resolved through the original one.
+        # Doing this automatically beats a KeyError on `sid_offsets`.
+        default_codes = os.path.join(args.data_dir, CATALOG_CODES) if args.data_dir else None
+        if (
+            not args.query_codes
+            and default_codes
+            and os.path.exists(default_codes)
+            and os.path.abspath(paths["codes"]) != os.path.abspath(default_codes)
+        ):
+            args.query_codes = default_codes
+            print(
+                "  --codes is not the SID the split was tokenised with, so queries are\n"
+                "  resolved through " + default_codes,
+                file=sys.stderr,
+            )
         identity = None
         query_vocab = None
         if args.query_codes:
@@ -487,6 +559,11 @@ def build_report(args) -> dict:
             codes, sizes, vocab, args.split_dir, max_rows=args.max_rows,
             query_vocab=query_vocab, identity=identity,
         )
+        targets_path = os.path.join(args.split_dir, "targets.npy")
+        if os.path.isfile(targets_path):
+            report["tie_ceiling"] = tie_ceiling_report(
+                codes, sizes, np.load(targets_path)
+            )
     return report
 
 

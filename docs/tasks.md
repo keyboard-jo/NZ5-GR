@@ -316,29 +316,63 @@ mid-epoch checkpointing and `catalog_sid_codes.npy` are all reused as they are.
 ## Phase 6: SID v2 and a richer event stream
 
 Reasoning, arithmetic and the falsifiable predictions are in `docs/plan_v2.md`.
-Two claims to hold it to. A wider codebook is a capacity win for the head, 0.376
-to 0.88 parameters per item, and not a resolution win, because the geometry already
-sits at its packing bound. And the event stream is discarding the
-exposure-versus-click distinction on 89.4% of all events.
+Three claims to hold it to. A wider codebook buys resolution as well as capacity, and
+both are measured: depth-1 bucket lift goes 46.9x to 126.8x between 256-wide and
+1,024-wide, and items per level-0 code go 18,684 to 4,671, then to 292 at 16,384 wide,
+which is the DiGR paper's own regime. The earlier "capacity, not resolution" argument
+is dropped along with the packing-bound reasoning behind it. And the event stream is
+discarding the exposure-versus-click distinction on 89.4% of all events.
 
-The measured occupancy it builds on, 4,783,154 items: depth 1 is 256 tuples of
-18,684.20 items, depth 2 is 57,122 of 83.74, depth 3 is 1,506,041 of 3.18, depth 4
-is 3,459,854 of 1.38, depth 5 is injective. All codebooks are at 7.87 to 7.98 bits
-of 8, so nothing is collapsed.
+The measured occupancy it builds on, 4,783,154 items. On the frozen SID, depth 1 is
+256 tuples of 18,684.20 items, depth 2 is 57,122 of 83.74, depth 3 is 1,506,041 of
+3.18, depth 4 is 3,459,854 of 1.38, depth 5 is injective, and every codebook sits at
+7.87 to 7.98 bits of 8, so nothing is collapsed.
+
+On the 3 x 1,024 SID already built, depth 1 is 1,024 tuples of 4,671.05, depth 2 is
+533,417 of 8.97, depth 3 is 3,393,796 of 1.41 with the largest bucket at 372 items, so
+a fourth 1,024-wide level cannot collide at all. Its codebooks sit at 9.8544, 9.8285
+and 9.9085 bits of 10. Depth-1 bucket lift goes from 46.9x to 126.8x between the two
+SIDs, so S1 is now about how far that curve runs rather than whether it moves.
 
 - [ ] S0 **Instrument.** Depth occupancy, collision count and bucket lift at depths
       1 and 2, for any SID directory, against the same 98,304 val rows. Without
       this there is no denominator for S1, and the release cannot be compared.
-- [ ] S1 **Width sweep, about one GPU hour.** 4 x 256 as the control, 4 x 1,024, and
-      2 x 16,384 to match OnePiece's resolution. Nothing else changes. Report
-      occupancy, collisions and lift.
-- [ ] S2 **Verdict, no compute.** Flat lift means the capacity argument is the
-      reason to adopt a wider SID and `docs/embedding_weakness.md` section 9 stands.
-      A moving lift means section 9 is wrong and gets rewritten.
+- [x] S1 **Width sweep, three points done, one left.** 2 x 8,192 was cut as run
+      `local/2026-27-10-2-rq`: 16,384 rows, 3.51 parameters per item, 584 items per
+      level-0 code, both codebooks 8,192 of 8,192 active at 12.8110 and 12.7668 bits
+      of 13, perplexity 7,186.2 and 6,969.3, best val loss 0.001523, 516 s.
+      Measured on the same 98,304 val rows: depth-1 lift 463.3x at a query bucket of
+      745.28, depth-2 lift 7,880.6x at a query bucket of 6.18. Depth-1 lift went
+      46.9x, 126.8x, 463.3x across the three SIDs, and recall per 1,000 candidates
+      went 0.949, 2.204, 7.589. So width buys resolution, the curve is steepening,
+      and 2 x 8,192 is 8.0x the original at a matched candidate budget.
+- [x] S1b **Width axis closed at 2 x 8,192.** No further SID runs. The collision gate
+      written here before the measurement is withdrawn: only 62.78% of items hold a
+      two-code tuple of their own, so 2,559,616 items (53.51%) sit in a group of two
+      or more, largest 315, against a uniform bound of 7.13%. A 1% gate cannot be
+      passed at two levels at any width. The gate is now the tie ceiling that
+      `Plan 2/sid_diagnose.py` prints: identical codes score identically, so a tie
+      group of size `g` caps recall at `1/g` at rank 1. Measured ceilings are R@1
+      64.10% and R@10 94.85% for 3 x 1,024, and R@1 53.57% and R@10 93.20% for
+      2 x 8,192, against DiGR at 0.79% and 2.59%, so the ceiling is far away and the
+      2 x 8,192 tie rate is accepted. The endorsed SID is therefore 2 x 8,192, 584
+      items per level-0 code, 3.51 parameters per item, depth-1 lift 463.3x, and 8.0x
+      the original recall at a matched candidate budget. 2 x 16,384 stays unrun, and
+      the prediction that it would reach injectivity is recorded as untested.
+- [x] S2 **Verdict.** Width buys resolution: 256 to 1,024 took depth-1 lift from
+      46.9x to 126.8x and 1,024 to 8,192 took it to 463.3x, so the flat-lift hypothesis
+      is dead twice over and the first draft of Correction 2 was wrong. The width axis
+      closes at 2 x 8,192 by decision rather than by saturation, so
+      `docs/embedding_weakness.md` section 9 is rewritten around items per code.
 - [ ] S3 **Event stream, one preprocess pass.** Action token (exposure, click,
-      unknown), gap bins 64 to 128, drop the fifth level only if S1 reports under
-      0.1% collisions, absolute time behind a flag so it can be ablated. Target is
-      6 tokens per event and the same 221.5M train tokens as today.
+      unknown), gap bins 64 to 128, two code levels, hour and weekday behind a flag
+      so they can be ablated. Default build is 4 tokens per event and 153.5M train
+      tokens, against 221.5M today; with the flag on it is 5 and 187.5M. No session
+      token, the gap already encodes the boundary. The script exists and is tested:
+      `Plan 2/preprocess_digr_v2.py`, 9 tests in `Plan 2/test_preprocess_digr_v2.py`,
+      `--num_sid_levels 2 --add_action` for the default build and
+      `--no-add_action --n_temporal_bins 64` reproducing the v1 stream token for
+      token.
 - [ ] S4 **DiGR on the new data.** Frozen config, 300k negatives, three epochs, same
       evaluator. Two axes move together here on purpose.
 - [ ] S5 **Baselines on the new data.** Popularity and co-click need no SID, so they

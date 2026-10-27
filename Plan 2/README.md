@@ -74,6 +74,50 @@ The depth-1 bucket holds 18,684 items on average and catches 18.3% of targets, 4
 times chance. That is the ceiling a method reading only the first code has to work
 with, and it is the number to beat when a wider SID is compared.
 
+### Width sweep, measured
+
+Three SIDs cut from the same frozen 256-d embedding, scored against the same 98,304
+val rows. `local/2026-27-10-1-rq` holds the 3 x 1,024 run, `local/2026-27-10-2-rq`
+the 2 x 8,192 run.
+
+| SID | rows | items per level-0 code | depth-1 lift | depth-1 query bucket | peak lift |
+|---|---|---|---|---|---|
+| 4 x 256 + 731 | 1,755 | 18,684 | 46.9x | 19,308.02 | 8,257.6x at depth 3 |
+| 3 x 1,024 | 3,072 | 4,671 | 126.8x | 5,618.40 | 6,732.1x at depth 3 |
+| 2 x 8,192 | 16,384 | 584 | 463.3x | 745.28 | 7,880.6x at depth 2 |
+
+Read the whole thing at a matched candidate budget, where the comparison is fair:
+recall per 1,000 candidates is 0.949, 2.204 and 7.589, so the widest SID is 8.0x the
+original. Raw depth-1 recall falls the other way, 18.3156% to 12.3840% to 5.6559%,
+because the bucket shrank by 26x. That is the trap this section opened with.
+
+What width does not fix is collisions. Only 62.78% of items hold a two-code tuple of
+their own, so 2,559,616 items (53.51%) sit in a group of two or more, against a
+uniform birthday bound of 7.13%, because k-means cells cluster where the items are.
+So a collision share is not a gate any two-level SID can pass, and the quantity worth
+printing is the tie ceiling below. The width axis was closed here by decision: 2 x
+8,192 is the endorsed SID, and 2 x 16,384 stays unrun with its injectivity prediction
+recorded as untested.
+
+### The tie ceiling
+
+Two items with identical codes get identical scores from any scorer that reads the
+SID, because the item vector is a function of the codes. A tie group of size `g`
+therefore caps recall at `1/g` at rank 1 and `min(1, k/g)` at rank `k`, and averaging
+that over the split's targets says what a collision rate costs in accuracy rather
+than in bookkeeping.
+
+| SID | mean tie group of the target | median | p90 | largest | R@1 ceiling | R@10 ceiling |
+|---|---|---|---|---|---|---|
+| 4 x 256 + 731 | 1.00 | 1 | 1 | 1 | 100% | 100% |
+| 3 x 1,024 | 5.55 | 1 | 11 | 372 | 64.10% | 94.85% |
+| 2 x 8,192 | 6.39 | 2 | 14 | 239 | 53.57% | 93.20% |
+
+DiGR scores R@1 0.79% and R@10 2.59% on this split, so the ceiling is far away and
+not binding. It only becomes binding near 50% R@1, which is why the plan accepts the
+2 x 8,192 tie rate instead of demanding injectivity. The script prints this section
+on every run, so any future SID can be checked in one command.
+
 ### A trap worth remembering
 
 Codes live in `.npy` as `int32`. Mixed-radix packing at depth 4 reaches
@@ -84,9 +128,111 @@ this script reported depth 4 at 0.0621% recall with only 49.8% of queries findin
 bucket, and depth 5 crashed. Both were wrong. `load_codes` casts to `int64` and
 `pack_keys` refuses a radix product at or above `2**62`.
 
+## convert_rqvae_index.py
+
+`rq_vae_cli.py` writes a JSON object mapping item id to a list of codes. Every tool
+here wants a dense `int32` array indexed by catalogue row, plus a vocab saying how
+wide each level is. This converts one to the other and refuses to guess.
+
+```bash
+python "Plan 2/convert_rqvae_index.py" \
+    --index local/2026-27-10-2-rq/test_output/index_rqvae_3x1024.json \
+    --item_ids local/2026-20-10-2-pre/digr_data/catalog_item_ids.npy \
+    --output_dir local/2026-27-10-2-rq --tag 2x8192
+```
+
+Writes `codes_<tag>_aligned.npy` and `vocab_<tag>.json`, in the order of
+`--item_ids` so row `r` is item `ids[r]`. It raises on a catalogued item missing
+from the index, on ragged code lengths and on negative codes, and it derives each
+level width from the highest code present rather than from what the run was built
+with, because the index carries no such field. The `--tag` matters: `rq_vae_cli.py`
+writes file names from whatever the script said, so a 2 x 8,192 run named
+`index_rqvae_3x1024.json` is normal and the tag is what keeps the two apart.
+
+A missing item in the index is the failure to look for. The output of `rq_vae_cli.py`
+covers every row of the embedding parquet, which is a superset of the catalogue, so a
+missing catalogue item means the alignment is wrong, not the quantiser.
+
+Passing `--codes` that differs from the SID in `--data_dir` used to fail with
+`KeyError: 'sid_offsets'`, because the token stream has to be decoded with the SID it
+was tokenised with before the query can be re-read from the new one. The script now
+notices the mismatch and resolves queries through `--data_dir`'s
+`catalog_sid_codes.npy` automatically, printing which file it used.
+
+## preprocess_digr_v2.py
+
+A copy of `Model Training/preprocess_digr.py` that tokenises the event itself, not
+just its item. One line of layout changes:
+
+```
+v1  (T, S1 .. SL)              1 + L tokens per event
+v2  (T, A, [C], S1 .. SL)      1 + A + C + L tokens per event
+```
+
+`T` is the log-spaced gap to the previous event, `A` the action, `C` an optional
+clock, `S` the SID codes. Everything else, including the feature block, the
+anchors, the val split and the file names, is unchanged.
+
+```bash
+# SID v2: two levels, action token, 128 gap bins, no clock
+python "Plan 2/preprocess_digr_v2.py" \
+    --sequence_path data/seq.parquet \
+    --catalog_path local/2026-27-10-1-rq/test_output/index_rqvae_2x8192.json \
+    --num_sid_levels 2 \
+    --user_feat_path data/user_feat.parquet \
+    --output_dir digr_data_v2
+
+# the v1 stream, byte for byte, out of the same file
+python "Plan 2/preprocess_digr_v2.py" --no-add_action --n_temporal_bins 64 ...
+```
+
+`--add_action` is on by default and `--add_clock` is off. The action token is
+where v1 was throwing information away: it used `action_type` to choose anchors
+and then dropped it, so 89.4% of this dataset's events, the exposures, were
+indistinguishable from clicks in the sequence. The slot order is published in
+`vocab.json` as `action_token_order`, so nothing downstream has to guess it, and
+the SID block stays last inside the slot, so `train_digr.py`'s "the last L tokens
+of a row are the last event's codes" needs no change.
+
+Per-row cost, at the measured 19.79 events per row and 9.11 feature tokens:
+
+| stream | slot | tokens per row | train tokens | against today |
+|---|---|---|---|---|
+| v1, 5 levels, no action | 6 | 128.85 | 221.5M | - |
+| v2, 2 levels, action | 4 | 89.28 | 153.5M | -30.7% |
+| v2, 2 levels, action, clock | 5 | 109.07 | 187.5M | -15.4% |
+
+So the richer event is also the cheaper one, twice over: two codes instead of five
+buys back two tokens, and the action spends one of them.
+
+Two guards that matter more than they look. `catalog_collision_stats` now counts
+duplicates over every level kept and reports the share of the catalogue that shares
+a code, because a v2 SID has no `--add_unique_id` suffix and a shared code is a pair
+of items that can never be ranked apart; a share above 1% logs a warning. And
+`assemble_chunk` asserts that `vocab.event_width` equals 1 gap plus the enabled
+tokens plus the number of SID levels, so a vocab built from one catalogue cannot be
+run against another.
+
+## test_preprocess_digr_v2.py
+
+`pytest "Plan 2" -q` runs 9 tests for the v2 stream on mock data. They pin the row
+length at `1 + M + T * event_width`, the three action token values and their slot,
+the codes staying last in the slot, `--no-add_action --n_temporal_bins 64`
+reproducing the v1 stream token for token, the clock bucket for a known Monday and
+for a missing timestamp, the vocab round trip including a v1 `vocab.json` that has
+no action or clock keys, and the collision share on a catalogue with a duplicate
+code.
+
+## test_convert_rqvae_index.py
+
+`pytest "Plan 2" -q` runs 7 tests. They pin that alignment follows `item_ids` rather
+than the JSON's own order, that a missing item, ragged lengths and negative codes all
+raise, that the width comes from the observed maximum rather than a declared
+codebook size, and the CLI round trip.
+
 ## test_sid_diagnose.py
 
-`pytest "Plan 2" -q` runs 29 tests on mock data. They pin the packing convention
+`pytest "Plan 2" -q` runs 33 tests on mock data. They pin the packing convention
 (level 0 least significant, injective on full radix, `int32` input does not
 overflow), the prefix index (bucket numbering shared between catalogue and query,
 absent prefix flagged), the codebook report (uniform codes sit at their ceiling, a
