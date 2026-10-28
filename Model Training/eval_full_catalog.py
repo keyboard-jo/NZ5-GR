@@ -109,9 +109,83 @@ def parse_cli() -> argparse.Namespace:
     args.eval_batch_size = cli.batch_size
     args.num_workers = cli.num_workers
     args.local_files_only = cli.local_files_only
+    # `load_for_inference` does `args.model_name or meta.model_name`. Starting from
+    # train_digr's defaults makes args.model_name truthy, so the checkpoint's own
+    # model name would never be used and a mismatched backbone would be loaded over
+    # the weights. Clearing it here lets the checkpoint speak for itself.
+    args.model_name = None
     if cli.device:
         args.device = cli.device
     return args, cli
+
+
+def check_data_dir_matches_checkpoint(meta, data_dir: str) -> None:
+    """The checkpoint and `--data_dir` must describe the same dataset.
+
+    Two different files couple them and nothing else validates the coupling. The
+    token layout comes from `vocab.json` in `--data_dir`; the embedding table, the
+    SID offsets and the item vectors come from the checkpoint. Score a v2
+    checkpoint on a v1 directory and every id is in range but means something
+    else, so the model reads a plausible sequence of the wrong tokens, predicts
+    nearly the same item for every row, and reports a loss above ln K. That looks
+    like a weak model, which is the worst thing a metric can look like, so this
+    fails instead.
+
+    Confirmed on 2026-10-28: the SID v2 checkpoint scored against the frozen v1
+    `digr_data` returned R@10 0.0437% and loss 26.3504, against 3.6600% and 11.0133
+    from the same checkpoint on its own directory.
+    """
+    path = os.path.join(data_dir, "vocab.json")
+    if not os.path.isfile(path):
+        raise SystemExit(f"{data_dir} has no vocab.json, so it is not a "
+                         "preprocessed dataset directory.")
+    with open(path, "r", encoding="utf-8") as f:
+        here_vocab = T.Vocab.from_dict(json.load(f))
+
+    def layout(v):
+        return {
+            "tokens": int(v.total_size),
+            "SID sizes": list(v.sid_sizes),
+            "gap bins": int(v.n_temporal),
+            "feature blocks": len(v.feature_sizes),
+            "tokens per event": int(v.event_width),
+        }
+
+    want, got = layout(meta.vocab), layout(here_vocab)
+    differ = [k for k in want if want[k] != got[k]]
+    if differ:
+        raise SystemExit(
+            "the checkpoint and --data_dir use different token layouts, so the "
+            "model would read the wrong tokens:\n"
+            f"  checkpoint  : {want}\n"
+            f"  {data_dir}  : {got}\n"
+            f"  differing   : {', '.join(differ)}\n"
+            "Point --data_dir at the directory this checkpoint was trained on."
+        )
+
+    here = T.ItemCatalog.load(data_dir)
+    if here.size != meta.catalog.size:
+        raise SystemExit(
+            f"{data_dir} has {here.size:,} catalog items but the checkpoint was "
+            f"built over {meta.catalog.size:,}. Same items, different files."
+        )
+    if not np.array_equal(np.asarray(here.item_ids), np.asarray(meta.catalog.item_ids)):
+        same = np.asarray(here.item_ids) == np.asarray(meta.catalog.item_ids)
+        first = int(np.argmin(same)) if not bool(same.all()) else -1
+        raise SystemExit(
+            f"{data_dir} and the checkpoint disagree on catalog order "
+            f"({int((~same).sum()):,} rows differ, first at row {first}). "
+            "Targets are row indices, so this would score one catalog's labels "
+            "against another catalog's items. Point --data_dir at the directory "
+            "the checkpoint was trained on, or at one whose catalog_item_ids.npy "
+            "is identical."
+        )
+    if not np.array_equal(np.asarray(here.sid_codes), np.asarray(meta.catalog.sid_codes)):
+        raise SystemExit(
+            f"{data_dir} and the checkpoint disagree on SID codes for at least one "
+            "item. The item vector is built from the codes, so the scores would "
+            "come from a different SID than the labels were counted on."
+        )
 
 
 @torch.inference_mode()
@@ -139,6 +213,16 @@ def main() -> int:
     split = T.load_split(args.data_dir, cli.split)
     if len(split) == 0:
         raise ValueError(f"split '{cli.split}' in {args.data_dir} is empty")
+    check_data_dir_matches_checkpoint(meta, args.data_dir)
+
+    lengths = np.asarray(split.lengths)
+    empty = int((lengths == 0).sum())
+    if empty:
+        raise SystemExit(
+            f"{empty:,} of {len(lengths):,} rows in '{cli.split}' carry no tokens. "
+            "Those rows have no history for the model to read, so they score as "
+            "one fixed prediction and drag every cut-off toward uniform."
+        )
 
     indices = np.arange(len(split), dtype=np.int64)
     if cli.max_rows is not None:
@@ -158,7 +242,18 @@ def main() -> int:
     logger.info("  DiGR evaluation over the FULL catalog")
     logger.info("=" * 78)
     logger.info(f"  checkpoint   : {args.checkpoint}")
-    logger.info(f"  split        : {cli.split} ({len(indices):,} rows)")
+    logger.info(f"  data_dir     : {args.data_dir}")
+    logger.info(f"  model        : {args.model_name or meta.model_name} "
+                f"({args.dtype}, lora={meta.use_lora})")
+    logger.info(f"  vocab        : {int(meta.vocab.total_size):,} tokens, "
+                f"SID {meta.vocab.sid_sizes} at offsets {meta.vocab.sid_offsets}")
+    logger.info(f"  score scale  : 1/(L*tau) = 1/({int(meta.vocab.num_levels)} * "
+                f"{meta.temperature}) = "
+                f"{1.0 / (meta.vocab.num_levels * meta.temperature):.3f}")
+    logger.info(f"  split        : {cli.split} ({len(indices):,} rows), "
+                f"tokens/row mean {lengths[indices].mean():.2f}, "
+                f"min {int(lengths[indices].min())}, "
+                f"max {int(lengths[indices].max())}")
     logger.info(f"  catalog      : {full_catalog:,} items  "
                 f"(uniform CE = ln K = {math.log(full_catalog):.3f})")
     logger.info(f"  batch / dev  : {args.eval_batch_size} / {device}")
@@ -171,7 +266,15 @@ def main() -> int:
     uniform = math.log(full_catalog)
     logger.info("-" * 78)
     logger.info(f"  rows {int(m['n']):,}   loss {m['loss']:.4f}   "
-                f"({uniform / m['loss']:.3f}x better than uniform CE)")
+                f"uniform CE {uniform:.3f}   "
+                f"({uniform - m['loss']:+.3f} nats, lower loss is better)")
+    if m["loss"] > uniform:
+        raise SystemExit(
+            f"loss {m['loss']:.4f} is above ln K = {uniform:.3f}, so the model is "
+            "worse than a uniform guess and the checkpoint is not predicting these "
+            "rows at all. That is a broken comparison, not a weak model (see "
+            "docs/results.md section 12). Nothing has been written."
+        )
     for k in ks:
         rec = m[f"recall@{k}"]
         uni = k / full_catalog          # what a uniform guess would score
@@ -193,9 +296,10 @@ def main() -> int:
             + (f"{100 * pop:8.4f}%  " if pop else f"{'':>9}  ")
             + (f"{rec / cc:10.2f}x" if cc else "")
         )
-    logger.info(f"    this ckpt, 504,404 subset  R@1 {100 * REF_SUBSET_R1:.4f}%  "
-                f"R@10 {100 * REF_SUBSET_R10:.4f}%  loss {REF_SUBSET_LOSS:.4f}  "
-                f"(NOT comparable, from the training log)")
+    logger.info(f"    frozen v1 run on its 504,404-label subset  "
+                f"R@1 {100 * REF_SUBSET_R1:.4f}%  R@10 {100 * REF_SUBSET_R10:.4f}%  "
+                f"loss {REF_SUBSET_LOSS:.4f}  (NOT comparable, and it is a "
+                "different run's training log) ")
     logger.info("-" * 78)
     lift1 = m["recall@1"] / REF_POPULARITY_R1
     lift10 = m["recall@10"] / REF_POPULARITY_R10
@@ -211,6 +315,7 @@ def main() -> int:
     logger.info(f"  elapsed {elapsed / 60:.1f} min")
 
     if cli.out_json:
+        vs_coclick = m["recall@10"] / REF_COCLICK_R10
         payload = {k: float(v) for k, v in m.items()}
         payload.update(
             {
