@@ -346,3 +346,24 @@ def test_vocab_manifest_mismatch_is_fatal():
     assert "token layout" in str(err.value)
     # A v1 manifest has no vocab_size and must not be rejected.
     td._check_vocab_matches_manifest(vocab, {})
+
+
+def test_temperature_default_keeps_the_score_scale_fixed():
+    """1/(L*tau) is what the head sees, so the default tau has to follow L."""
+    ref = 1.0 / (td.REFERENCE_NUM_LEVELS * td.DEFAULT_TEMPERATURE)
+    for levels in (1, 2, 3, 5, 8):
+        tau = td.resolve_temperature(None, levels)
+        assert abs(1.0 / (levels * tau) - ref) < 1e-12
+    # An explicit value always wins, so a hand-tuned run is untouched.
+    assert td.resolve_temperature(0.3, 2) == 0.3
+    # The 5-level reference reproduces the frozen run exactly.
+    assert abs(td.resolve_temperature(None, 5) - 0.07) < 1e-12
+
+
+def test_event_width_falls_back_to_the_v1_slot():
+    """A v1 vocabulary has no event_width; the slot is then 1 gap + L codes."""
+    v1 = td.Vocab.from_dict({"sid_sizes": [4] * 5, "n_temporal": 8, "feature_sizes": []})
+    assert td._event_width(v1) == 6
+    v2 = td.Vocab.from_dict({"sid_sizes": [8, 8], "n_temporal": 128, "n_action": 3,
+                             "feature_sizes": []})
+    assert td._event_width(v2) == 4

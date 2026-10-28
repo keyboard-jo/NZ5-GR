@@ -36,12 +36,17 @@ file only trains / infers over the written CSR arrays.
                                       users.npy stats.json
 
 Every directory is validated before a run starts; a missing/stale one fails fast
-with the exact `preprocess_digr.py` command to re-run.
+with the exact `preprocess_digr_v2.py` command to re-run.
 
 --------------------------------------------------------------------------------
 TOKEN LAYOUT (one slot per interaction, exactly as in the plan)
 --------------------------------------------------------------------------------
-  [F_1 .. F_M, SEP, (T_1, S_1_1 .. S_1_L), ...]   len = M + 1 + T*(1+L)
+  [F_1 .. F_M, SEP, (T_1, A_1, S_1_1 .. S_1_L), ...]  len = M + 1 + T*event_width
+
+  event_width comes from vocab.json and is 1 gap + (action token if the dataset
+  has one) + (clock token if it has one) + L SID codes. The action slot is
+  present on v2 data and absent on v1 data; never derive the slot width from L
+  alone.
 
   F_j = static user-feature token = offset_features + (slot j of the user's
         feature block); M = 0 when no --user_feat_path was given, so a row
@@ -50,9 +55,9 @@ TOKEN LAYOUT (one slot per interaction, exactly as in the plan)
         branch.
   T_i = temporal token = discretised gap to the previous interaction, log-spaced
         bins over [1s, --max_gap_seconds]; the first interaction is bin 0.
-        (Hour-of-day / day-of-week tokens would need a second temporal slot; the
-        plan's layout has one, so only the gap is encoded.  Widen
-        --n_temporal_bins for finer gap resolution.)
+  A_i = action token = exposure / click / unknown. Only written by
+        preprocess_digr_v2.py; it sits between the gap and the SID codes, so the
+        SID codes stay the last tokens of the row and the item slice is unchanged.
   S_i = SID Level l token = Offset_SID_l + code_l, l = 1..L
 
 The plan's `V` uses only the SID tokens; U and T never enter the item branch.
@@ -227,7 +232,8 @@ DEFAULT_WARMUP_RATIO = 0.03
 DEFAULT_MIN_LR_RATIO = 0.1
 DEFAULT_GRAD_CLIP = 1.0
 DEFAULT_LABEL_SMOOTHING = 0.0
-DEFAULT_TEMPERATURE = 0.07
+DEFAULT_TEMPERATURE = 0.07        # the value L=5 was tuned at
+REFERENCE_NUM_LEVELS = 5          # level count that 0.07 belongs to
 
 DEFAULT_LORA_R = 16
 DEFAULT_LORA_ALPHA = 32
@@ -826,11 +832,32 @@ def _read_manifest(data_dir: str) -> Dict[str, Any]:
         raise FileNotFoundError(
             f"{data_dir} is not a preprocessed dataset directory ({MANIFEST_NAME} missing).\n"
             "run the preprocessing phase first, e.g.:\n"
-            "  python preprocess_digr.py --sequence_path data/seq.parquet "
+            "  python preprocess_digr_v2.py --sequence_path data/seq.parquet "
             "--catalog_path data/index_rqvae_prod.json --output_dir " + data_dir
         )
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _event_width(vocab: "Vocab") -> int:
+    """Tokens per interaction slot: gap, optional action, optional clock, L codes."""
+    width = int(getattr(vocab, "event_width", 0) or 0)
+    return width or (1 + max(1, int(vocab.num_levels)))
+
+
+def resolve_temperature(arg_value: Optional[float], num_levels: int) -> float:
+    """Keep the score scale `1 / (L * tau)` at the value the reference run used.
+
+    The head divides by `num_levels * temperature`, so a fixed `tau` is only
+    correct for one SID depth. The frozen reference run was L=5 at tau=0.07, i.e.
+    2.857. Running L=2 at tau=0.07 would be 7.143, 2.5x sharper, which changes the
+    loss and the gradient scale for a reason that has nothing to do with the data.
+    An explicit `--temperature` still wins, so nothing about a hand-tuned run
+    changes.
+    """
+    if arg_value is not None:
+        return float(arg_value)
+    return float(DEFAULT_TEMPERATURE) * float(REFERENCE_NUM_LEVELS) / float(max(1, int(num_levels)))
 
 
 def _check_vocab_matches_manifest(vocab: "Vocab", manifest: Dict[str, Any]) -> None:
@@ -863,11 +890,17 @@ def _load_static_meta(data_dir: str, logger: logging.Logger
     catalog = ItemCatalog.load(data_dir)
     user_map = UserMap.load(data_dir)
     gap_edges = np.load(os.path.join(data_dir, "gap_edges.npy"))
+    # The action / clock blocks and event_width only exist on v2 vocabularies, so
+    # this line is what tells a reader whether the run used the richer event stream
+    # at all: two v1 and v2 datasets over one catalogue differ only in these fields.
     logger.info(
         f"  + loaded vocabulary from {data_dir}: total={human_int(vocab.total_size)} "
         f"(SID={vocab.sid_sizes} @ {vocab.sid_offsets}, "
         f"temporal={vocab.n_temporal} @ {vocab.offset_temporal}, "
-        f"features={vocab.feature_sizes} @ {vocab.offset_features})"
+        f"features={vocab.feature_sizes} @ {vocab.offset_features}, "
+        f"event_width={_event_width(vocab)}, "
+        f"action={int(getattr(vocab, 'n_action', 0) or 0)}, "
+        f"clock={int(getattr(vocab, 'n_clock', 0) or 0)})"
     )
     logger.info(
         f"  + catalog: {human_int(catalog.size)} items x {catalog.num_levels} levels, "
@@ -896,11 +929,40 @@ def _resolve_meta(args, logger: logging.Logger) -> RunMeta:
                     f"checkpoint expects {human_int(meta.vocab.total_size)}; the data "
                     "and the checkpoint must come from the same catalog/gap bins"
                 )
+            # A matching vocab_size is not enough. The head's label matrix and its
+            # 1/(L*tau) scale are built from the level count, and the SID codes sit
+            # at a fixed offset from the end of the row, so a different slot width
+            # feeds the head the wrong tokens without changing the vocabulary much.
+            levels = int(other.get("num_levels", 0) or 0)
+            if levels and levels != int(meta.vocab.num_levels):
+                raise ValueError(
+                    f"{args.data_dir} has {levels} SID levels but the checkpoint was "
+                    f"trained with {meta.vocab.num_levels}; resume from a checkpoint "
+                    "built on the same SID, or start a fresh run"
+                )
+            width = int(other.get("event_width", 0) or 0)
+            if width and width != _event_width(meta.vocab):
+                raise ValueError(
+                    f"{args.data_dir} writes {width} tokens per event but the checkpoint "
+                    f"was built on {_event_width(meta.vocab)}; the token layout differs, "
+                    "so the SID codes are not where the head reads them"
+                )
+            # The stale-data guard in _load_splits compares the data against the
+            # recipe that produced it. Taking --window from the checkpoint would make
+            # a window-20 checkpoint resumed on window-40 data pass silently and then
+            # print "Max history: 20 events" above 40-event rows.
+            meta.max_seq_len = int(other.get("window") or other.get("max_seq_len")
+                                   or meta.max_seq_len)
         return meta
 
     vocab, catalog, user_map, gap_edges, manifest = _load_static_meta(args.data_dir, logger)
+    temperature = resolve_temperature(args.temperature, vocab.num_levels)
     logger.info(
-        f"  + temperature={args.temperature}, l2_normalize={bool(args.l2_normalize)} "
+        f"  + temperature={temperature}"
+        + ("" if args.temperature is not None else
+           f" (derived: {DEFAULT_TEMPERATURE} for {REFERENCE_NUM_LEVELS} levels, "
+           f"L={vocab.num_levels} here, so 1/(L*tau) stays 2.857)")
+        + f", l2_normalize={bool(args.l2_normalize)} "
         "(both are frozen into the checkpoint's head_config)"
     )
     return RunMeta(
@@ -909,7 +971,7 @@ def _resolve_meta(args, logger: logging.Logger) -> RunMeta:
         user_map=user_map,
         gap_edges=gap_edges,
         model_name=args.model_name or DEFAULT_MODEL_NAME,
-        temperature=float(args.temperature),
+        temperature=temperature,
         l2_normalize=bool(args.l2_normalize),
         max_seq_len=int(manifest.get("max_seq_len") or 0),
         dtype=args.dtype,
@@ -929,12 +991,16 @@ def _load_splits(args, meta: RunMeta, logger: logging.Logger
                 f"the '{name}' split in {args.data_dir} is empty; re-run preprocessing "
                 "with a lower --min_history / a wider --max_rows"
             )
-        # `lengths` counts tokens: M feature tokens + SEP + (1 temporal + L SID)
-        # per event.  M is a property of the user, not of the row, so derive the
-        # event count after removing it.
+        # `lengths` counts tokens: M feature tokens + SEP + one slot per event, and
+        # a slot is `1 + L` tokens in the v1 layout (gap, then L SID codes) or
+        # `Vocab.event_width` in the v2 layout (gap, action, [clock], L codes).
+        # M is a property of the user, not of the row, so derive the event count
+        # after removing it. Using `1 + n_levels` on v2 data reports 26 events for
+        # a 20-event row, which triggers a false stale-dataset warning.
         n_levels = max(1, meta.vocab.num_levels)
+        slot = int(getattr(meta.vocab, "event_width", 0) or 0) or (1 + n_levels)
         max_feat = int(meta.max_feat_tokens)
-        max_items = int((int(split.lengths.max()) - max_feat - 1) // (1 + n_levels))
+        max_items = int((int(split.lengths.max()) - max_feat - 1) // slot)
         if meta.max_seq_len and max_items > meta.max_seq_len:
             logger.warning(
                 f"  ! '{name}' has sequences of {max_items} events but the dataset was "
@@ -1752,7 +1818,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "custom vocab is a new SID/temporal/feature token, so the "
                         "truncated Qwen text rows carry no useful semantics)")
     p.add_argument("--l2_normalize", action=argparse.BooleanOptionalAction, default=False)
-    p.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
+    p.add_argument("--temperature", type=float, default=None,
+                   help=f"softmax temperature; default is derived from the SID depth "
+                        f"so that 1/(L*tau) stays at the {REFERENCE_NUM_LEVELS}-level "
+                        f"reference value ({DEFAULT_TEMPERATURE} -> "
+                        f"{DEFAULT_TEMPERATURE * REFERENCE_NUM_LEVELS:.3f} at L=1, "
+                        f"{DEFAULT_TEMPERATURE:.3f} at L={REFERENCE_NUM_LEVELS})")
     p.add_argument("--logit_chunk", type=int, default=DEFAULT_LOGIT_CHUNK)
     p.add_argument("--label_subset", choices=["full", "clicked"], default="full",
                    help="softmax denominator: 'full' = whole catalog; 'clicked' = only "
@@ -1832,7 +1903,7 @@ def _validate_cli_paths(args) -> None:
             raise SystemExit(
                 f"preprocessed dataset not found: {args.data_dir}\n"
                 "run the preprocessing phase first, e.g.:\n"
-                f"  python preprocess_digr.py --sequence_path data/seq.parquet "
+                f"  python preprocess_digr_v2.py --sequence_path data/seq.parquet "
                 f"--catalog_path data/index_rqvae_prod.json --output_dir {args.data_dir}"
             )
         missing = [n for n in (MANIFEST_NAME, "vocab.json", "catalog_item_ids.npy",
@@ -1841,14 +1912,14 @@ def _validate_cli_paths(args) -> None:
         if missing:
             raise SystemExit(
                 f"{args.data_dir} is incomplete (missing: {', '.join(missing)}); "
-                "re-run preprocess_digr.py"
+                "re-run preprocess_digr_v2.py"
             )
         need = ["train", "val"] if args.mode == "train" else [args.infer_split]
         for name in need:
             if not split_exists(args.data_dir, name):
                 raise SystemExit(
                     f"split directory '{name}' missing in {args.data_dir}; "
-                    "re-run preprocess_digr.py"
+                    "re-run preprocess_digr_v2.py"
                 )
 
 
