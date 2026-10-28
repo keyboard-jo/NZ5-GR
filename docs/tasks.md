@@ -284,34 +284,64 @@ carried, same backbone, same content SID, same 1,719,430 train rows and 98,304 v
 rows. `tokens.npy`, `offsets.npy`, `targets.npy`, `LengthBucketBatchSampler`,
 mid-epoch checkpointing and `catalog_sid_codes.npy` are reused unchanged.
 
-- [ ] 4.1 Head. Two per-level cross-entropies over 8,192 classes each, replacing
-      DiGR's single 4,783,154-way softmax. `logits_l = h W_l` with `W_l` of shape
-      `[1024, 8192]`. The parameter count lands at 16.8M, which is exactly DiGR's
-      code-embedding table for this SID (16,384 rows of 1,024), so the two heads
-      cost the same and differ only in how the columns are used: DiGR adds them into
-      one item score, TIGER normalises each level separately. The loss for row `j`
-      is `CE(p1, c1[target_j]) + CE(p2, c2[target_j])`.
-- [ ] 4.2 Inputs. Append `SEP, c1, c2` after the last event, so the hidden state at
-      `SEP` predicts `c1` and the hidden state at `c1` predicts `c2`. Teacher-forced
-      during training, one forward pass gives both terms. Row length goes 89 to 92.
-- [ ] 4.3 Inference. No beam, no trie, no constrained decoding: gather the two
-      log-probability columns at each item's own codes and sort. That is exact over
-      the full catalogue, so all five cut-offs up to 10,000 are reportable and the
-      number is directly comparable with the DiGR row.
-- [ ] 4.4 Reuse, do not rebuild: the training loop, the sampler, atomic
-      checkpointing, `--resume`, `--save_steps`, `--log_interval`, the CSV log and
-      the val-loss early stop all exist in `Model Training/train_digr.py`. Estimate
-      400 to 600 lines in a new `Model Training/train_tiger.py`, less than the 600
-      to 800 the five-level plan needed because the beam and the trie are gone.
-- [ ] 4.5 Budget two epochs. 92 tokens against 89, and the head is cheaper than a
-      4.78M-row gather, so expect about a DiGR epoch, 63 minutes, not the 1.3x to
-      1.6x the per-level-token plan predicted.
+- [x] 4.1 Head. One per-level cross-entropy over that level's own vocabulary,
+      replacing DiGR's single 4,783,154-way softmax. `logits_l = h W_l` with `W_l`
+      of shape `[1024, sid_sizes[l]]`, so the count is
+      `1024 * sum(sid_sizes)`: 16.8M at 2 x 8,192 and 1.8M at 4 x 256 plus the
+      731-wide fifth level. `TigerHead` at `Model Training/train_tiger.py:381`,
+      `level_cross_entropies` at `:466`.
+- [x] 4.2 Inputs. Append `SEP, c1, .., cL` after the last event and read level `l`
+      from the position of the code before it, so one teacher-forced forward pass
+      gives every term. Implemented behind `--prefix_conditioning`, default OFF:
+      with it off the codes are not in the input at all and every level reads the
+      separator state, which is what makes the exact full-catalogue score a single
+      forward pass. `TigerCollate` at `:318`.
+- [x] 4.3 Inference. `evaluate_tiger` at `:528` scores all 4,783,154 items by
+      gathering each level's log-probability column at the item's own code and
+      summing, then ranks every target. That is exact, so all five cut-offs up to
+      10,000 are reportable and the number is comparable with the DiGR row. Beam
+      search at `:245` and the prefix tree at `:185` are tied to
+      `--prefix_conditioning`: with codes in the input an item's score depends on
+      the path taken to it, so items cannot be scored independently, candidates
+      have to be generated, and a beam will propose prefixes no item owns. The tree
+      is mandatory in that arm at two levels as much as at five, and the cut-offs
+      it can report are capped at the beam width, so `R@1000` and `R@10000` are not
+      computable there. Used by `--mode beam`, and `--mode eval` refuses a
+      prefix-conditioned checkpoint instead of scoring it with the wrong rule.
+      The ceiling is measurable without running a beam: `evaluate_tiger` reports
+      `cover@b` for b in 1, 10, 20, 100, 1000, the share of rows whose target's
+      first code is inside the model's own top b at level 0. Every beam arm's
+      recall is bounded by it, so the faithful arm's ceiling costs one extra topk
+      per batch on top of a run we do anyway.
+- [ ] 4.4 Reuse, do not rebuild: `_load_static_meta`, `_load_splits`,
+      `LengthBucketBatchSampler`, the atomic checkpoint swap, `--resume`,
+      `--save_steps`, `--log_interval` and the CSV log are imported from
+      `train_digr.py`. `Model Training/train_tiger.py` is 1,298 lines, the estimate
+      was 400 to 600, and the overrun is the second-SID-release support and the beam
+      arm.
+- [ ] 4.5 Budget two epochs, and expect no training-time saving over DiGR. Row
+      length at 2 x 8,192 is 90 tokens without prefix conditioning against DiGR's 89,
+      and 92 with it, so an epoch costs 63 to 65 minutes. The TIGER saving is not in training at
+      all: it is in inference, where a beam of 20 replaces scoring 4,783,154 items
+      per query. At this catalogue size the exhaustive score is a 1.7 minute GEMM
+      over the whole val set, so the beam is the more expensive of the two here.
+      That is worth reporting rather than hiding: the speed argument for generative
+      retrieval assumes a query-side beam that is cheap relative to a catalogue-side
+      score, and with 4.78M items and two levels it is not.
 - [ ] 4.6 Run all five cut-offs and write `R@1/10/100/1000/10000`, nDCG@10 and
       MRR@10 into `docs/results.md` beside the DiGR row. The bar it has to clear is
       co-click window 20: R@10 3.7069% and R@100 10.9873%. DiGR's own row is
       R@10 3.6570% and R@100 10.9182%, so the interesting question is whether
       predicting the codes step by step orders the middle of the list better than
       one additive score over the whole catalogue.
+
+**Both SID releases are supported from one script.** Level widths are read from
+`vocab.json`, so 4 x 256 plus the 731-wide collision level and 2 x 8,192 both run
+with no flag beyond `--data_dir`. `Plan 2/train_tiger.sh` selects between them with
+`SID_VERSION=1` or `SID_VERSION=2`, and `PREFIX=1` turns on the paper's
+factorisation. The four cut-offs, the evaluator, the sampler and the checkpointing
+are the same code for both, so the two rows differ only in the SID. Tests:
+`Model Training/test_train_tiger.py`, 29 of them, CPU only, stub backbone.
 
 ---
 

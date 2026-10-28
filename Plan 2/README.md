@@ -285,6 +285,69 @@ Full-catalogue evaluation of `best/`, same 98,304 rows and all 4,783,154 items,
 window 20 at ranks 1, 1,000 and 10,000 while level at ranks 10 and 100. Full table
 and caveats in `docs/results.md` section 12.
 
+## train_tiger.sh
+
+S6, the third arm. `Model Training/train_tiger.py` trains TIGER, which predicts the
+SID codes instead of scoring the catalogue with them, and this wrapper selects which
+SID release it runs on. Level widths come from `vocab.json`, so nothing is guessed
+and the same code serves both:
+
+    sbatch train_tiger.sh                    # v2, 2 x 8,192, about 3 h
+    SID_VERSION=1 sbatch train_tiger.sh      # v1, 4 x 256 plus 731, about 4.5 h
+    PREFIX=1 sbatch train_tiger.sh           # paper factorisation arm
+
+The flag picks the objective, not the level count, and the two arms differ in what
+can be measured.
+
+Default, `PREFIX=0`. Codes are not in the input, every level reads the separator
+state, and an item's score is the sum of its own code's log-probability at each
+level. That is computable for all 4,783,154 items in one forward pass, so the row
+reports the same five cut-offs as DiGR and no trie or beam is involved. Row length is
+89 to 90 tokens against DiGR's 89, so an epoch costs about the same.
+
+`PREFIX=1`. The codes go into the input and level `l` is predicted from the
+separator plus codes `1..l-1`, which is the factorisation in the TIGER paper. An
+item's score then depends on the path used to reach it, so items can no longer be
+scored independently: candidates must be generated, which means a beam, which means
+a trie, because a beam will propose prefixes no item owns. The tree is therefore
+mandatory in this arm at two levels as much as at five. The price is inference, one
+forward per beam row per level instead of one per query, and the cut-offs it can
+report are capped at the beam width, so `R@1000` and `R@10000` cannot be measured
+here. Exhaustive scoring is `L` gathers per item at any `L`, minutes for the whole
+val set, so compute is not what decides between the arms.
+
+What a beam does to the cut-offs, which is the part that decides whether the faithful
+arm belongs in the same table. A beam of `b` only ever returns items whose first code
+the model put in its own top `b`, so its recall obeys
+
+    R@k(beam b) = P(target's code 1 in the model's top b) * P(rank <= k | in beam)
+
+and for `k > b` the second factor is zero by construction. Every number from this arm
+is therefore conditional on the first factor, which the prefix-free arm reports for
+free as `cover@b` in its own log line. Rows measured this way are not the same
+quantity as DiGR's unconditional `R@10` over all 4,783,154 items, and putting them in
+one table without both factors is how a generative retrieval number ends up looking
+5x better than a scoring number on the same data.
+
+The head is `1024 * sum(sid_sizes)` parameters, 16.8M at 2 x 8,192, which is the same
+order as DiGR's code-embedding table for that SID. Training is full fine-tuning with
+no LoRA, matching the frozen DiGR run, and the loaders, sampler, checkpoint swap and
+resume logic are imported from `train_digr.py` rather than copied.
+
+## test_train_tiger.py
+
+`pytest "Model Training/test_train_tiger.py" -q` runs 29 tests, CPU only, no backbone
+and no dataset on
+disk. They pin the prefix key (injective, ordered so `searchsorted` finds a run of
+rows, refusing an int64 overflow and an out-of-range code), the prefix tree against
+brute force (`children` returns only real continuations, `contains` rejects a valid
+prefix that no item owns), beam search (respects the mask, keeps ties in candidate
+order, survives every branch dying), the batching layout for both conditioning modes
+(the separator position at `n` without prefix conditioning, `n + l` with it, and no
+position past the end of the padded row), the ranking maths against brute force and
+across chunk sizes, the head's parameter count, and an end-to-end pass on a table
+lookup standing in for the LLM.
+
 ## test_sid_diagnose.py
 
 `pytest "Plan 2" -q` runs 33 tests on mock data. They pin the packing convention
