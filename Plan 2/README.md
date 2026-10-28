@@ -296,6 +296,14 @@ and the same code serves both:
     SID_VERSION=1 sbatch train_tiger.sh      # v1, 4 x 256 plus 731, about 4.5 h
     PREFIX=1 sbatch train_tiger.sh           # paper factorisation arm
 
+Ran on v2, three epochs, 3.2 GPU-hours: **R@1 1.4400%, R@10 2.4500%, R@100 6.5900%,
+R@1000 20.0800%, R@10000 45.7600%, nDCG@10 0.01870, MRR@10 0.01700**. That leads
+everything measured on this data at rank 1 (DiGR v2 1.0549%, co-click 0.8057%) and
+loses to both from rank 10 outwards (0.67x and 0.60x of DiGR at R@10 and R@100), so
+the arm clears the bar at neither. `docs/results.md` section 13 has the per-epoch
+table and the reading: at two levels with `PREFIX=0` the score is additive over the
+same two code rows as DiGR's, so the run compares two losses on one function class.
+
 The flag picks the objective, not the level count, and the two arms differ in what
 can be measured.
 
@@ -334,9 +342,36 @@ order as DiGR's code-embedding table for that SID. Training is full fine-tuning 
 no LoRA, matching the frozen DiGR run, and the loaders, sampler, checkpoint swap and
 resume logic are imported from `train_digr.py` rather than copied.
 
+### The prefix-free arm, measured
+
+`runs/tiger_v2_sid2x8192_e3`, three epochs of 3,358 steps at 41.5k tokens/s, 3.2
+GPU-hours plus 2.5 minutes of validation per epoch. `best/` is the epoch-2
+checkpoint by val loss, 13.2635 nats over two 8,192-way cross-entropies against
+18.02 for two uniform distributions.
+
+| arm | R@1 | R@10 | R@100 | R@1000 | R@10000 |
+|---|---|---|---|---|---|
+| co-click, window 20 | 0.8057% | **3.7069%** | **10.9873%** | 25.3021% | 46.8882% |
+| DiGR, SID v2 | 1.0549% | 3.6570% | 10.9182% | **27.6622%** | **55.7058%** |
+| TIGER, prefix-free | **1.4400%** | 2.4500% | 6.5900% | 20.0800% | 45.7600% |
+
+Rank 1 belongs to TIGER. From rank 10 outwards it loses to both the model and the
+count table, so the bar is missed by a third and by a half. The reading is in
+`docs/results.md` section 13: with two levels and `PREFIX=0` the score is
+`log p(c1|h) + log p(c2|h)`, which is additive over the same two code rows that
+DiGR adds, so this run compares two losses on one function class. Denser
+supervision sharpens the marginals that decide the first guess and does nothing for
+the ordering inside a bucket.
+
+Two gaps the run exposed. `format_metrics` drops `cover@k` and `recall@5` and no
+metrics file is written, so the ceiling of the `PREFIX=1` arm cannot be read from
+the artifacts. And the row comes from `evaluate_tiger` rather than
+`eval_full_catalog.py`, so one cross-check on a second code path is owed before the
+number is quoted.
+
 ## test_train_tiger.py
 
-`pytest "Model Training/test_train_tiger.py" -q` runs 29 tests, CPU only, no backbone
+`pytest "Model Training/test_train_tiger.py" -q` runs 34 tests, CPU only, no backbone
 and no dataset on
 disk. They pin the prefix key (injective, ordered so `searchsorted` finds a run of
 rows, refusing an int64 overflow and an out-of-range code), the prefix tree against

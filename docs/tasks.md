@@ -5,7 +5,7 @@ three retrieval methods that use RQ-VAE Semantic IDs, all on the same backbone,
 same data, same evaluator.
 
 - **DiGR**: additive read of 1,755 shared code rows. Built, trained, frozen.
-- **TIGER**: autoregressive factorisation over the five codes. Not built.
+- **TIGER**: per-level cross-entropy over the same codes, additive score when prefix-free. Built, trained, measured.
 - **heuristic**: count tables. Built, and currently winning.
 
 Continuous-vector retrieval and ANN are deferred, not cancelled. See the last
@@ -273,12 +273,19 @@ either tower.
 
 ---
 
-## Phase 4: build TIGER (next)
+## Phase 4: build TIGER (built, measured)
 
 **Promoted to next by decision** (user, 2026-10-28). The attribution arm that would
 have separated codebook width from the action token is deferred behind it: the
 deliverable is the three-arm table and TIGER is the only row still missing, so a
 run that only explains an existing row can wait.
+
+The three-arm table is now complete. TIGER's prefix-free arm on the same 2 x 8,192
+codes reaches R@1 1.4400%, R@10 2.4500%, R@100 6.5900%, R@1000 20.0800%,
+R@10000 45.7600%, nDCG@10 0.01870, MRR@10 0.01700 in 3.2 GPU-hours. It takes rank 1
+from both DiGR and the count table and loses from rank 10 outwards, and
+`docs/results.md` section 13 has the reading: at two levels the two arms are one
+additive function class, so that run compares two losses, not two factorisations.
 
 The SID it runs on is the 2 x 8,192 release that S1 endorsed and S4 trained on. That
 simplifies the design in a way worth stating before any code is written: **with two
@@ -321,27 +328,38 @@ mid-epoch checkpointing and `catalog_sid_codes.npy` are reused unchanged.
       first code is inside the model's own top b at level 0. Every beam arm's
       recall is bounded by it, so the faithful arm's ceiling costs one extra topk
       per batch on top of a run we do anyway.
-- [ ] 4.4 Reuse, do not rebuild: `_load_static_meta`, `_load_splits`,
+- [x] 4.4 Reuse, do not rebuild: `_load_static_meta`, `_load_splits`,
       `LengthBucketBatchSampler`, the atomic checkpoint swap, `--resume`,
       `--save_steps`, `--log_interval` and the CSV log are imported from
       `train_digr.py`. `Model Training/train_tiger.py` is 1,298 lines, the estimate
       was 400 to 600, and the overrun is the second-SID-release support and the beam
       arm.
-- [ ] 4.5 Budget two epochs, and expect no training-time saving over DiGR. Row
+- [x] 4.5 Budget two epochs, and expect no training-time saving over DiGR. Row
       length at 2 x 8,192 is 90 tokens without prefix conditioning against DiGR's 89,
-      and 92 with it, so an epoch costs 63 to 65 minutes. The TIGER saving is not in training at
-      all: it is in inference, where a beam of 20 replaces scoring 4,783,154 items
-      per query. At this catalogue size the exhaustive score is a 1.7 minute GEMM
-      over the whole val set, so the beam is the more expensive of the two here.
-      That is worth reporting rather than hiding: the speed argument for generative
-      retrieval assumes a query-side beam that is cheap relative to a catalogue-side
-      score, and with 4.78M items and two levels it is not.
-- [ ] 4.6 Run all five cut-offs and write `R@1/10/100/1000/10000`, nDCG@10 and
-      MRR@10 into `docs/results.md` beside the DiGR row. The bar it has to clear is
-      co-click window 20: R@10 3.7069% and R@100 10.9873%. DiGR's own row is
-      R@10 3.6570% and R@100 10.9182%, so the interesting question is whether
-      predicting the codes step by step orders the middle of the list better than
-      one additive score over the whole catalogue.
+      and 92 with it. Measured: 3,358 steps per epoch, 41.5k tok/s, epoch 1 61.6 min,
+      epoch 2 64.2 min, epoch 3 65.7 min, plus 2.5 min of validation each. The TIGER
+      saving is not in training at all: it is in inference, where a beam of 20
+      replaces scoring 4,783,154 items per query. At this catalogue size the
+      exhaustive score is a 1.7 minute GEMM over the whole val set, so the beam is
+      the more expensive of the two here. That is worth reporting rather than
+      hiding: the speed argument for generative retrieval assumes a query-side beam
+      that is cheap relative to a catalogue-side score, and with 4.78M items and two
+      levels it is not.
+- [x] 4.6 Run all five cut-offs and write `R@1/10/100/1000/10000`, nDCG@10 and
+      MRR@10 into `docs/results.md` beside the DiGR row. Done, and the answer is
+      split: rank 1 1.4400% against DiGR's 1.0549% and co-click's 0.8057%, then
+      2.4500% and 6.5900% at R@10 and R@100 against the bar's 3.7069% and 10.9873%.
+      Predicting the codes step by step does not order the middle of the list
+      better; it sharpens the marginals that decide the first guess.
+- [ ] 4.7 Close the gaps this run exposed, in order. (a) `format_metrics` drops
+      `cover@1/10/20/100/1000` and `recall@5` even though `evaluate_tiger` computes
+      them, and no metrics file is written, so the prefix-conditioned arm's ceiling
+      is unreadable from the artifacts. Print them, dump `metrics.json` per epoch,
+      then `--mode eval` on `best/` recovers both in minutes. (b) Reproduce the
+      R@1 1.4400% on a second code path, because this table has already had one
+      silent ranking bug in `evaluate_tiger`. (c) Run `PREFIX=1` for two epochs,
+      about 2h10m, then `--mode beam` for the faithful arm, reporting `cover@b` and
+      the cut-offs up to the beam width only.
 
 **Both SID releases are supported from one script.** Level widths are read from
 `vocab.json`, so 4 x 256 plus the 731-wide collision level and 2 x 8,192 both run
@@ -349,18 +367,19 @@ with no flag beyond `--data_dir`. `Plan 2/train_tiger.sh` selects between them w
 `SID_VERSION=1` or `SID_VERSION=2`, and `PREFIX=1` turns on the paper's
 factorisation. The four cut-offs, the evaluator, the sampler and the checkpointing
 are the same code for both, so the two rows differ only in the SID. Tests:
-`Model Training/test_train_tiger.py`, 29 of them, CPU only, stub backbone.
+`Model Training/test_train_tiger.py`, 34 of them, CPU only, stub backbone.
 
 ---
 
 ## Phase 5: the table and the write-up
 
-- [ ] 5.1 One table, four rows (popularity, co-click, DiGR, TIGER), five cut-offs,
-      one column for cost, one column for the candidate space.
-- [ ] 5.2 The conditional-ranking column: "given the target is in the top 1,000,
+- [x] 5.1 One table, four rows (popularity, co-click, DiGR, TIGER), five cut-offs,
+      one column for cost, one column for the candidate space. Done in
+      `docs/results.md`.
+- [x] 5.2 The conditional-ranking column: "given the target is in the top 1,000,
       how often does it reach the top 10". This is the column that makes the
-      failure legible, and it currently reads co-click 14.65%, DiGR 12.01%,
-      popularity 9.12%.
+      failure legible, and it now reads co-click 14.65%, DiGR v2 13.22%, TIGER
+      12.20%, DiGR v1 12.01%, popularity 9.12%.
 - [ ] 5.3 State the degrees-of-freedom arithmetic explicitly: DiGR's item side is
       1,755 rows of 1,024 dimensions, 1,797,120 parameters for 4,783,154 items,
       **0.376 per item**.
@@ -528,13 +547,15 @@ of them can be declared a success.
 
 ## Next step
 
-1. **Build TIGER on the 2 x 8,192 SID** (Phase 4). It is the missing row, and the
-   only experiment left that tests a different objective rather than a different
-   input. Four hundred lines, two epochs, about two hours, and no trie or beam
-   because two levels make the exact score a two-column gather.
-2. **S5, the control rows.** Minutes of CPU, so the table's baselines sit on the
-   same data as the model rows.
-3. **Phase 5, the table and the write-up.**
+1. **Phase 5, the write-up.** The table is complete: popularity, co-click, DiGR v1,
+   DiGR v2 and TIGER on one val split, one evaluator and one candidate space. What
+   is left is 5.3 to 5.5 and the prose around them.
+2. **S5, the control rows.** Minutes of CPU. `sid_transition` is the only row that
+   can move, because it now reads two-code tuples instead of five.
+3. **4.7, the three gaps the TIGER run exposed.** (a) print `cover@k` and `recall@5`
+   and write a `metrics.json`; (b) reproduce TIGER's R@1 on a second code path;
+   (c) run `PREFIX=1` for two epochs and a beam pass, which is the only SID arm that
+   is not additive over the code rows.
 
 Deferred behind those, in the order they are worth doing. S7, attribution, 2h10m,
 because it explains the 1.41x rather than adding a row and it is the first thing a

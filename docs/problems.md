@@ -20,7 +20,7 @@ same `eval_full_catalog.py`, same 98,304 val rows).
 | arm | what scores the item | learning |
 |---|---|---|
 | **DiGR** | additive read of 1,755 shared code rows | learned, trained, frozen |
-| **TIGER** | autoregressive factorisation over the 5 codes | learned, not built yet |
+| **TIGER** | per-level cross-entropy over the same codes, additive score | learned, trained, measured |
 | **heuristic** | count tables over item ids and over codes | none |
 
 Continuous-vector retrieval, meaning a learned query encoder plus one vector per
@@ -71,8 +71,9 @@ same competition data says that gap is real and not a metric artifact, which mak
 the failure a property of our model rather than of the task. The diagnosis is now
 specific: the item side of DiGR's score has 0.376 free parameters per item, so it
 cannot store a transition pair, while the count table stores 25.7M of them. TIGER
-is the next build because it keeps the SID and changes only the objective, which is
-the one variable the diagnosis says is worth changing.
+was built to test the other half of that diagnosis, the objective, and it came back
+split: best at rank 1, worse than DiGR from rank 10 outwards. Section 9 has the
+reading.
 
 ---
 
@@ -117,6 +118,7 @@ If the target is already inside the top 1,000, how often does it reach the top 1
 |---|---|
 | co-click, window 20 | 14.65% |
 | DiGR 0.6B, SID v2 (2 x 8,192 + action token) | 13.22% |
+| TIGER 0.6B, SID v2, prefix-free | 12.20% |
 | DiGR 0.6B, SID v1 (4 x 256 + collision level) | 12.01% |
 | popularity | 9.12% |
 | SID depth-1 bucket + cosine | 7.45% |
@@ -231,12 +233,13 @@ ground truth. Against real targets it is 18.3156%. Retired.
 18.85% is reachable on this data by other people, so the task is not the ceiling at
 3.6%. A remains possible only for the restricted setting we chose.
 
-**B. The item side of the score is the ceiling.** This is now the leading
-explanation and it is measured, not hypothesised: 0.376 degrees of freedom per
-item, a 12.01% conditional ranking against a count table's 14.65%, and a model that
-cannot reproduce the pairs it was trained on. TIGER tests the objective half of
-this. The representation half needs per-item parameters, which is the deferred ANN
-arm.
+**B. The item side of the score is the ceiling.** Still the leading explanation, and
+TIGER narrowed it. It tested the objective half and came back mixed: 1.37x at R@1,
+then 0.60x to 0.82x from R@10 outwards. So the objective is not what caps the middle
+of the list. The additive score over shared code rows is, and both arms have it.
+What remains is the representation half, which needs per-item parameters (the
+deferred ANN arm), or the prefix-conditioned head, which stops the score being
+additive without adding item parameters.
 
 **C. The SID is the ceiling.** Rejected as the primary cause. Section 7 shows the
 codes preserve the geometry faithfully. The geometry is weak, but that is Stage 1
@@ -244,29 +247,39 @@ and it affects every SID-based arm equally.
 
 ---
 
-## 9. Why TIGER is still the next build
+## 9. TIGER is built, and the objective is not the ceiling
 
-TIGER changes one thing. Same backbone, same data, same SIDs, same feature block,
-same evaluator. The head changes from one full-catalog softmax over an additive
-score to five per-level terms with the hidden state re-read at each level.
+TIGER changed one thing: same backbone, same data, same 2 x 8,192 codes, same
+feature block, same evaluator, and the loss went from one 4,783,154-way sampled
+softmax to two 8,192-way cross-entropies. On the same 98,304 rows:
 
-That matters because the additive score is the measured problem. DiGR forces every
-item through 1,755 shared rows with no interaction between levels, so the score for
-an item is a sum of five terms that other items share. TIGER's factorisation gives
-the item a distinct conditional probability at each level, and its score can depend
-on which level-0 code the user is in when choosing level 2.
+| arm | R@1 | R@10 | R@100 | R@1000 | R@10000 |
+|---|---|---|---|---|---|
+| co-click, window 20 | 0.8057% | **3.7069%** | **10.9873%** | 25.3021% | 46.8882% |
+| DiGR, SID v2 | 1.0549% | 3.6570% | 10.9182% | **27.6622%** | **55.7058%** |
+| TIGER, SID v2, prefix-free | **1.4400%** | 2.4500% | 6.5900% | 20.0800% | 45.7600% |
 
-What TIGER does not fix:
+TIGER takes rank 1 by 1.37x over DiGR and 1.79x over the count table, then loses by
+0.60x to 0.82x at every other cut-off. The bar was R@10 3.7069% and R@100 10.9873%;
+it reaches 2.4500% and 6.5900%.
 
-- It keeps the SID, so it inherits whatever the codes do not carry.
-- It still shares the 731 level-5 output vectors across every prefix. What it
-  gains over DiGR is the conditioning: the prefix flows into the hidden state, so
-  the 731 vectors are re-weighted per bucket and each bucket gets its own ranking
-  instead of one global scale. Within a bucket there are at most 731 items, so the
-  deep level is close to per-item resolution. The cap that remains is the top four
-  codes deciding which bucket an item lands in.
-- Beam search is approximate. Its numbers are a lower bound at R@k for k above the
-  beam width, and that asymmetry has to be stated whenever the table is shown.
+The shape is clean because at two levels without prefix conditioning the two arms
+sit in one function class. DiGR scores an item as `h . (e(c1) + e(c2)) / (L tau)`,
+TIGER as `log p(c1|h) + log p(c2|h)`. Both are additive over the same two shared
+code rows and both are linear in the separator state, so neither can separate two
+items that share a tuple, and 53.51% of items share one. What differs is the
+supervision: per-level cross-entropy puts a gradient on all 16,384 code rows every
+step, while 300k sampled negatives over 4,783,154 items touch about 6% of them.
+That sharpens the two marginals, which is what decides the first guess, and it does
+nothing for the ordering inside a bucket, which is what R@10 through R@100 measure.
+
+So the head and the loss are not the ceiling. Two objectives pick different points
+on one additive surface. What is left of the paper's design is the
+prefix-conditioned arm, where level 2 is read from a state that contains code 1, so
+the pair score stops being a sum of two independent terms. That arm needs a beam,
+its cut-offs are capped at the beam width, and its ceiling is the level-0 coverage
+of the checkpoint we already have, `cover@k`, which `evaluate_tiger` computes and
+the log does not print.
 
 ---
 
@@ -284,6 +297,8 @@ What TIGER does not fix:
 | DiGR val-loss-best checkpoint | epoch 2 has the best val loss, epoch 3 ranks best | use `final`, not `best` |
 | "depth-1 SID recall is 71.158%" | the "target" was the embedding's own top-10, so it graded the geometry against itself | 18.3156% against real targets |
 | "the task caps out around 4% R@10" | inferred from our own methods converging | OnePiece reaches 18.85% HR@10 on the same data |
+| "TIGER will order the middle of the list better" | at two levels the additive score is shared with DiGR, so a loss change only sharpens the marginals | R@10 2.4500% against DiGR's 3.6570% |
+| "the objective is the ceiling" | TIGER wins rank 1 and loses from rank 10 out, on the same additive surface | the additive form limits the list, not the loss |
 
 ---
 
@@ -301,12 +316,17 @@ What TIGER does not fix:
 4. When the ANN arm enters. It is the design the winners used and the only one
    with per-item resolution, so it is the natural follow-up, but it is not part of
    the three-arm table.
-5. The acceptance bar for TIGER. Proposed: beat co-click at R@10 and R@100. Beating
-   DiGR alone is not a result, because DiGR already loses to a count table.
+5. The acceptance bar for TIGER. **Resolved**: R@10 3.7069% and R@100 10.9873%,
+   against 2.4500% and 6.5900% measured. Missed by a third and by a half.
 
 ---
 
 ## 12. What would change the plan
+
+The first branch has fired, with one correction: it holds for the additive arm,
+which is what DiGR and prefix-free TIGER both are, and not for the SID family while
+the prefix-conditioned arm is unrun. The bullets are kept as written so the
+prediction can be checked against the outcome.
 
 - TIGER lands at or below co-click at R@10. Then the SID-based family is beaten by
   a count table, the answer to the project's question is "none of them", and the

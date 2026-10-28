@@ -18,7 +18,8 @@ recall coincide. `MRR` is truncated at rank 10 everywhere.
 | B4 co-click kNN, window 10, decay 0.5 | 4 s + 44 s CPU | 0.7985% | 3.6794% | 10.8531% | 24.8311% | 46.2148% | 0.02030 | 0.01529 |
 | **B4 co-click kNN, window 20, decay 0.5** | **4 s + 43 s CPU** | **0.8057%** | **3.7069%** | **10.9873%** | **25.3021%** | **46.8882%** | **0.02044** | **0.01539** |
 | DiGR 0.6B, 3 epochs, 300k sampled negatives | 4.6 GPU-h + 3.2 min eval | 0.7924% | 2.5940% | 7.5094% | 21.6003% | 49.7691% | 0.01570 | 0.01258 |
-| **DiGR 0.6B, SID v2 (2 x 8,192 + action token), 3 epochs** | **3.2 GPU-h + 1.7 min eval** | **1.0549%** | **3.6570%** | **10.9182%** | **27.6622%** | **55.7058%** | **0.02190** | **0.01742** |
+| **DiGR 0.6B, SID v2 (2 x 8,192 + action token), 3 epochs** | **3.2 GPU-h + 1.7 min eval** | 1.0549% | 3.6570% | 10.9182% | 27.6622% | 55.7058% | 0.02190 | 0.01742 |
+| TIGER 0.6B, SID v2 (2 x 8,192), 3 epochs, prefix-free | 3.2 GPU-h + 2.5 min eval | **1.4400%** | 2.4500% | 6.5900% | 20.0800% | 45.7600% | 0.01870 | 0.01700 |
 | HSTU tower (window 20, approximate actions) | 20 s GPU + 41 min I/O | 0.0458% | 0.4354% | 2.9063% | 13.5122% | - | 0.00201 | 0.00131 |
 | item-embedding kNN, mean of last 1 clicked | 9 min GPU | 0.0173% | 0.5636% | 2.4638% | 8.1807% | - | - | 0.00151 |
 | item-embedding kNN, mean of last 3 clicked | 9 min GPU | 0.0376% | 0.3560% | 2.2156% | 9.7646% | - | - | 0.00112 |
@@ -52,6 +53,12 @@ DiGR SID v2 over co-click (window 20): R@1 1.31x, R@10 0.99x, R@100 0.99x,
 R@1000 1.09x, R@10000 1.19x, nDCG@10 1.07x, MRR 1.13x.
 DiGR SID v2 over popularity: R@1 2.40x, R@10 2.72x, R@100 2.28x, R@1000 1.88x,
 R@10000 1.51x.
+TIGER over DiGR SID v2: R@1 **1.37x**, R@10 0.67x, R@100 0.60x, R@1000 0.73x,
+R@10000 0.82x, nDCG@10 0.85x, MRR@10 0.98x.
+TIGER over co-click (window 20): R@1 1.79x, R@10 0.66x, R@100 0.60x,
+R@1000 0.79x, R@10000 0.98x, nDCG@10 0.91x, MRR@10 1.10x.
+TIGER over popularity: R@1 3.28x, R@10 1.82x, R@100 1.38x, R@1000 1.36x,
+R@10000 1.24x.
 
 Compute ratio DiGR : co-click = 4.6 GPU-h : 4 s = about **4,100x**.
 
@@ -556,3 +563,83 @@ What it does not support, and what is missing:
 5. Epoch 3 is wasted. Train loss keeps falling (11.40, 10.78, 10.08) while val loss
    turns up after epoch 2, and R@10 moves by 0.02 percentage points. Two epochs is
    both cheaper and better, and `best/` is the checkpoint to quote.
+
+---
+
+## 13. TIGER: the objective moves the first guess, not the list
+
+Built and run on the same 2 x 8,192 SID: `Model Training/train_tiger.py`, launched by
+`Plan 2/train_tiger.sh`, prefix-free arm (`PREFIX=0`). Level 1 and level 2 both read
+the separator state, so an item's score is the sum of its own two code
+log-probabilities. That score is exact for all 4,783,154 items in one pass, which is
+why the row carries the same five cut-offs as DiGR's rather than a beam's.
+
+Three epochs of 3,358 steps at 42k tokens/s. Epoch 1 took 61.6 min, epoch 2
+64.2 min, epoch 3 65.7 min, plus 2.5 min of validation each, so 3.2 GPU-hours. A
+crash at the end of epoch 1 cost another 61 minutes: the head held fp32 weights and
+`evaluate_tiger` calls it outside the autocast block, so a bf16 state met fp32
+weights at `Model Training/train_tiger.py:400`. Fixed, and the resumed run replayed
+58 batches.
+
+| epoch | val loss | L1 | L2 | R@1 | R@10 | R@100 | R@1000 | R@10000 | nDCG@10 | MRR |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 13.5969 | 5.8123 | 7.7846 | 1.03% | 1.88% | 5.17% | 16.54% | 40.29% | 0.0138 | 0.0123 |
+| **2 (`best/`)** | **13.2635** | **5.5904** | **7.6731** | **1.44%** | **2.45%** | **6.59%** | **20.08%** | **45.76%** | **0.0187** | **0.0170** |
+| 3 (`final/`) | 13.3216 | 5.6155 | 7.7061 | 1.43% | 2.51% | 6.78% | 20.40% | 45.93% | 0.0189 | 0.0170 |
+
+The two levels together are 13.26 nats, against 18.02 for two uniform 8,192-way
+distributions, so the model has learned a great deal and still ranks the catalogue
+badly. The table row uses `best/` to keep the checkpoint rule identical to DiGR's.
+Epoch 3 is marginally better at four of the five cut-offs and worse at rank 1 by ten
+rows, and `final/` changes no verdict below.
+
+What the row says.
+
+1. **TIGER owns rank 1.** 1.4400% against DiGR's 1.0549% (1.37x, +379 of 98,304 rows,
+   about 10 standard errors) and co-click's 0.8057% (1.79x). Nothing else measured
+   on this data, including the paper's arm, does better at the first guess.
+2. **It loses everywhere else.** R@10 0.67x, R@100 0.60x, R@1000 0.73x, R@10000
+   0.82x against DiGR v2, and nDCG@10 0.85x. Against co-click, R@10 0.66x and R@100
+   0.60x, so the acceptance bar of R@10 3.7069% and R@100 10.9873% is missed by a
+   third and a half.
+3. **The shape is the finding.** A gain concentrated at rank 1 and a loss that grows
+   through the middle of the list is what a loss change should do when the score
+   function does not change: cross-entropy sharpens the two code marginals, which is
+   exactly what decides the first guess, while item-to-item discrimination inside a
+   bucket is what sampled softmax trains and what R@10 through R@100 measure.
+4. **The score function did not change.** At two levels with `PREFIX=0`, DiGR and
+   TIGER are the same family: DiGR scores an item as `h . (e(c1) + e(c2)) / (L t)`
+   and TIGER as `log p(c1|h) + log p(c2|h)`, both additive over the two shared code
+   rows, both linear in the separator state. Two level-0 codes that tie for `g(c1)`
+   are separated only by `g(c2)`, and 53.51% of items share a tuple outright. So this
+   run compares two losses on one function class. It does not test the paper's
+   factorisation, which needs `PREFIX=1` so that level 2 can see level 1.
+
+What is wrong with the run, and what to do about it.
+
+1. **`cover@k` and `R@5` are computed and thrown away.** `evaluate_tiger` fills
+   `cover@1/10/20/100/1000`, and `rank_metrics` fills `recall@5`; `format_metrics`
+   prints neither and no metrics file is written. So the checkpoint's own level-0
+   coverage, which is the hard ceiling on any prefix-conditioned arm, cannot be read
+   from the artifacts. Fix `format_metrics`, write a `metrics.json` per epoch, then
+   `--mode eval` on `best/` recovers both in a few minutes.
+2. **Two evaluators for one table.** DiGR's row comes from `eval_full_catalog.py`,
+   TIGER's from `evaluate_tiger`. The definition is the same (rank is one plus the
+   count of strictly higher scores, a miss is stored as `kmax + 1`) but the code is
+   not, and this file already records one silent ranking bug in the second path. A
+   1.37x win at the headline cut-off should be reproduced on a second code path once.
+3. **Val loss and recall disagree at epoch 3.** Loss rises to 13.3216 while R@100
+   (6.59 to 6.78), R@1000 (20.08 to 20.40) and R@10000 (45.76 to 45.93) all improve
+   and R@1 falls by ten rows. Val loss is a proxy and here it is not even monotone
+   with the metric being reported.
+4. **Losses are not comparable across arms.** DiGR trains against 300k sampled
+   negatives, TIGER against a full 8,192-way cross-entropy at each level. Only
+   ranking numbers belong in the table.
+5. **No cost saving to book.** 3.2 GPU-hours against 3.2 for DiGR v2. TIGER's speed
+   story is inference, and a prefix-free arm scores the catalogue in a single pass
+   exactly as DiGR does, so the two cost the same here.
+
+The arm that is still missing is `PREFIX=1` with a beam, which is the paper's
+factorisation and the only SID arm that is not additive over the code rows. It
+costs about 2h10m for two epochs plus a beam pass, and its reachable `k` is capped by
+the beam width, which is why `cover@k` from this run matters first.

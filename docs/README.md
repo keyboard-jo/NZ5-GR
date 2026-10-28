@@ -16,12 +16,16 @@ Index only. Each file stands alone.
 | `recap_supervisor.md` | a self-contained status snapshot for the co-supervisor, current as of 2026-10-26 |
 | `../Plan 2/README.md` | the SID diagnostic script, how to read bucket lift, and the content SID measured |
 
-Current state in one line: on the endorsed 2 x 8,192 SID with an action token in the
-stream, DiGR leads co-click at rank 1 (1.05% against 0.81%), is level with it at
-ranks 10 and 100, and leads again at 1,000 and 10,000 (27.66% against 25.30%, 55.71%
-against 46.89%), for 3.2 GPU-hours against 47 seconds. Widening the codebook is what
-moved it: 18,684 items per level-0 code became 584 and bucket lift went from 46.9x
-to 463.3x on the same embedding, while the Stage 1 towers stay below a frequency
-count. Read `results.md` for the numbers, `problems.md` for what they imply,
-`plan_v2.md` for what changes next and what it is expected to buy, and
-`sid_diagnostics.md` before judging any new SID.
+Current state in one line: the three-arm table is complete on the endorsed 2 x 8,192
+SID, and the answer is split by cut-off. TIGER owns rank 1 (1.44% against DiGR's
+1.05% and co-click's 0.81%), DiGR owns ranks 10 to 10,000 (3.66% and 10.92% level
+with co-click, then 27.66% and 55.71% against 25.30% and 46.89%), and the count
+table stays in front of both from rank 10 to 1,000 for 47 seconds against 3.2 GPU
+hours. Widening the codebook is what moved DiGR: 18,684 items per level-0 code
+became 584 and bucket lift went from 46.9x to 463.3x on the same embedding, while
+the Stage 1 towers stay below a frequency count. At two levels a prefix-free score
+is additive over two shared code rows, so DiGR and prefix-free TIGER sit in one
+function class and their gap is a loss difference, not a factorisation. Read
+`results.md` for the numbers, `problems.md` for what they imply, `plan_v2.md` for
+what changes next and what it is expected to buy, and `sid_diagnostics.md` before
+judging any new SID.
