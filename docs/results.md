@@ -617,12 +617,13 @@ What the row says.
 
 What is wrong with the run, and what to do about it.
 
-1. **`cover@k` and `R@5` are computed and thrown away.** `evaluate_tiger` fills
-   `cover@1/10/20/100/1000`, and `rank_metrics` fills `recall@5`; `format_metrics`
-   prints neither and no metrics file is written. So the checkpoint's own level-0
-   coverage, which is the hard ceiling on any prefix-conditioned arm, cannot be read
-   from the artifacts. Fix `format_metrics`, write a `metrics.json` per epoch, then
-   `--mode eval` on `best/` recovers both in a few minutes.
+1. **`cover@k` and `R@5` were computed and thrown away, now fixed.** `evaluate_tiger`
+   filled `cover@1/10/20/100/1000` and `rank_metrics` filled `recall@5`;
+   `format_metrics` printed neither and no metrics file was written, so the
+   checkpoint's own level-0 coverage, which is the hard ceiling on any
+   prefix-conditioned arm, could not be read from the artifacts. Fixed: the log line
+   now carries `R@5` and every `cover@k`, and every epoch writes `metrics.jsonl` plus
+   `metrics.json` beside the checkpoints.
 2. **Two evaluators for one table.** DiGR's row comes from `eval_full_catalog.py`,
    TIGER's from `evaluate_tiger`. The definition is the same (rank is one plus the
    count of strictly higher scores, a miss is stored as `kmax + 1`) but the code is

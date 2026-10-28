@@ -7,6 +7,7 @@ stub model, so the whole file runs in well under a second.
 
 from __future__ import annotations
 
+import json
 import logging
 
 import numpy as np
@@ -550,3 +551,102 @@ def test_target_ranks_accepts_bf16_states():
     ranks = tt.target_ranks(model, states, torch.tensor([0, 1]), chunk=2)
     assert ranks.tolist() == [ranks[0].item(), ranks[1].item()]
     assert 1 <= int(ranks.min()) <= 5
+
+
+# ---------------------------------------------------------------------------
+# Reporting: nothing the evaluator computes may be dropped
+# ---------------------------------------------------------------------------
+
+def _eval_fixture():
+    model = _tiny_retriever()
+    split = _Split([[5, 6, 7], [8, 9, 10, 11, 12]], [0, 4])
+    sid_input = np.array([[20, 30]] * 5, dtype=np.int64)
+    sid_codes = np.array([[0, 0], [1, 1], [2, 2], [3, 3], [0, 1]], dtype=np.int64)
+    ds = tt.TigerDataset(split, np.arange(2, dtype=np.int64), sid_input, sid_codes,
+                         sep_id=1, prefix_conditioning=False)
+    collate = tt.TigerCollate(sep_id=1, num_levels=2, prefix_conditioning=False)
+    return model, DataLoader(ds, batch_size=2, shuffle=False, collate_fn=collate)
+
+
+def test_evaluate_tiger_can_skip_ranking_without_touching_loss_or_coverage():
+    model, loader = _eval_fixture()
+    ranked = tt.evaluate_tiger(model, loader, torch.device("cpu"), torch.float32,
+                               False, catalog_chunk=2)
+    skipped = tt.evaluate_tiger(model, loader, torch.device("cpu"), torch.float32,
+                                False, catalog_chunk=2, rank_items=False)
+    assert ranked["ranked"] == 1.0 and skipped["ranked"] == 0.0
+    assert "recall@1" not in skipped and "ndcg@10" not in skipped
+    assert skipped["n"] == ranked["n"]
+    assert skipped["loss"] == pytest.approx(ranked["loss"], rel=1e-6)
+    for k in tt.BEAM_COVER_KS:
+        assert skipped["cover@%d" % k] == pytest.approx(ranked["cover@%d" % k])
+
+
+def test_format_metrics_prints_r5_and_every_cover():
+    metrics = {"loss": 1.0, "loss@1": 0.5, "loss@2": 0.5, "ranked": 1.0,
+               "recall@1": 0.1, "recall@5": 0.2, "recall@10": 0.3,
+               "ndcg@10": 0.15, "mrr": 0.12}
+    for k in tt.BEAM_COVER_KS:
+        metrics["cover@%d" % k] = 0.5
+    line = tt.format_metrics(metrics, 2)
+    assert "R@5 0.2000" in line
+    assert "cover 1:50.00% 10:50.00% 20:50.00% 100:50.00% 1000:50.00%" in line
+    assert "nDCG@10 0.1500" in line
+
+
+def test_format_metrics_says_ranks_were_skipped():
+    metrics = {"loss": 1.0, "loss@1": 0.5, "loss@2": 0.5, "ranked": 0.0,
+               "cover@10": 0.4}
+    line = tt.format_metrics(metrics, 2)
+    assert "ranks skipped" in line
+    assert "R@1" not in line
+    assert "cover 10:40.00%" in line
+
+
+def test_write_metrics_keeps_every_key_and_replaces_a_rerun(tmp_path):
+    tt._write_metrics(str(tmp_path), 1, {"loss": 3.0, "cover@10": 0.25, "ranked": 0.0})
+    tt._write_metrics(str(tmp_path), 2, {"loss": 2.0, "cover@10": 0.35, "ranked": 0.0})
+    tt._write_metrics(str(tmp_path), 2, {"loss": 2.5, "cover@10": 0.45, "ranked": 0.0})
+    rows = json.loads((tmp_path / "metrics.json").read_text())
+    assert [r["epoch"] for r in rows] == [1, 2], "a rerun of an epoch replaces it"
+    assert rows[1]["loss"] == 2.5
+    assert rows[1]["cover@10"] == 0.45, "cover must survive to disk"
+    assert len((tmp_path / "metrics.jsonl").read_text().strip().splitlines()) == 3
+
+
+def test_head_config_file_is_written_and_read_back(tmp_path):
+    assert tt._read_head_config(str(tmp_path)) == {}
+    payload = {"num_levels": 2, "sid_sizes": [4, 4], "prefix_conditioning": True}
+    (tmp_path / tt.HEAD_CONFIG_FILE).write_text(json.dumps(payload))
+    assert tt._read_head_config(str(tmp_path))["prefix_conditioning"] is True
+
+
+def test_run_eval_refuses_when_the_checkpoint_says_prefix_conditioned(monkeypatch,
+                                                                     tmp_path):
+    """The flag can be forgotten; the checkpoint cannot lie about itself."""
+    (tmp_path / tt.HEAD_CONFIG_FILE).write_text(
+        json.dumps({"num_levels": 2, "prefix_conditioning": True}))
+    args = tt.parse_args(["--mode", "eval", "--no-prefix_conditioning",
+                          "--data_dir", str(tmp_path),
+                          "--checkpoint", str(tmp_path)])
+    monkeypatch.setattr(tt, "_load_for_eval", lambda a, l: (None, None, None, None, None))
+    with pytest.raises(SystemExit, match="beam"):
+        tt.run_eval(args, logging.getLogger("test"))
+
+
+def test_checkpoint_config_decides_the_arm_not_the_flag(tmp_path):
+    """A forgotten flag must not turn a prefix-conditioned model into a free one."""
+    def args_for(flag, ckpt=None):
+        return type("A", (), {"prefix_conditioning": flag, "checkpoint": ckpt})()
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert tt._checkpoint_prefix_conditioning(args_for(False, str(empty))) is False
+    assert tt._checkpoint_prefix_conditioning(args_for(True, str(empty))) is True
+
+    for recorded in (True, False):
+        d = tmp_path / ("ckpt_%s" % recorded)
+        d.mkdir()
+        (d / tt.HEAD_CONFIG_FILE).write_text(
+            json.dumps({"num_levels": 2, "prefix_conditioning": recorded}))
+        assert tt._checkpoint_prefix_conditioning(args_for(not recorded, str(d))) is recorded

@@ -351,15 +351,21 @@ mid-epoch checkpointing and `catalog_sid_codes.npy` are reused unchanged.
       2.4500% and 6.5900% at R@10 and R@100 against the bar's 3.7069% and 10.9873%.
       Predicting the codes step by step does not order the middle of the list
       better; it sharpens the marginals that decide the first guess.
-- [ ] 4.7 Close the gaps this run exposed, in order. (a) `format_metrics` drops
-      `cover@1/10/20/100/1000` and `recall@5` even though `evaluate_tiger` computes
-      them, and no metrics file is written, so the prefix-conditioned arm's ceiling
-      is unreadable from the artifacts. Print them, dump `metrics.json` per epoch,
-      then `--mode eval` on `best/` recovers both in minutes. (b) Reproduce the
-      R@1 1.4400% on a second code path, because this table has already had one
-      silent ranking bug in `evaluate_tiger`. (c) Run `PREFIX=1` for two epochs,
-      about 2h10m, then `--mode beam` for the faithful arm, reporting `cover@b` and
-      the cut-offs up to the beam width only.
+- [x] 4.7 Close the gaps this run exposed, in order. (a) **Done.** `format_metrics`
+      now prints `R@5` and `cover@1/10/20/100/1000`, and every epoch writes
+      `metrics.jsonl` plus `metrics.json` beside the checkpoints, so nothing the
+      evaluator computes is dropped. `evaluate_tiger` gained `rank_items`, and
+      training with `--prefix_conditioning` ranks nothing (the exhaustive path is
+      the prefix-free score) while still reporting loss and `cover@k`.
+      `head_config.json`, which `_read_head_config` had always read and nothing had
+      ever written, is now written by `_save_tiger_checkpoint`, so a checkpoint states
+      which arm it is; `--mode eval` refuses on that record rather than on the flag.
+      (b) Reproduce the R@1 1.4400% on a second code path, because this table has
+      already had one silent ranking bug in `evaluate_tiger`. (c) Run `PREFIX=1` for
+      two epochs, about 2h10m, then `--mode beam` for the faithful arm, reporting
+      `cover@b` and the cut-offs up to the beam width only. `Plan 2/train_tiger.sh`
+      now defaults to `PREFIX=1` and names the run `..._prefix` so it cannot collide
+      with the prefix-free run.
 
 **Both SID releases are supported from one script.** Level widths are read from
 `vocab.json`, so 4 x 256 plus the 731-wide collision level and 2 x 8,192 both run
@@ -547,6 +553,12 @@ of them can be declared a success.
 
 ## Next step
 
+**`docs/direction.md` (2026-10-29) now governs the order below.** In short: run the
+three CPU measurements in its section 4 first (SASRec bound, oracle union of the
+three arms, target-universe rescore), then the query-side work in its section 3
+(co-click code prior, window 60 / 3 anchors, mixture-of-intents head), each with a
+stated prediction and a kill criterion. S9 is demoted by the 0.15 item-side slope,
+and the fair TIGER arm is depth at `PREFIX=1`, not another release at two levels.
 1. **Phase 5, the write-up.** The table is complete: popularity, co-click, DiGR v1,
    DiGR v2 and TIGER on one val split, one evaluator and one candidate space. What
    is left is 5.3 to 5.5 and the prose around them.

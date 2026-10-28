@@ -2,8 +2,15 @@
 
 Index only. Each file stands alone.
 
+> **Read `direction.md` first.** It is the file that decides what the next GPU
+> hours are for, and it contradicts the ordering in `tasks.md`: the item-side
+> capacity axis has a measured slope of 0.15 (`log 1.41 / log 9.3`) and is spent,
+> the intra-list conditional `P(top10 | top1000)` is 13-15% for every method ever
+> measured here, and the remaining 2.5-3x is query-side information plus dose.
+
 | file | what is in it |
 |---|---|
+| `direction.md` | **where the next 5x can and cannot come from**: the coverage × precision decomposition, the 0.15 item-side slope, the co-click code prior, longer history, the mixture-of-intents head, TIGER's depth axis, and the three CPU measurements to run first |
 | `math.md` | the formulas: popularity, SID transition, co-click kNN, DiGR, and why each behaves the way it does |
 | `data.md` | the numbers behind them: catalog, splits, vocab, token layout, what a row of tokens is |
 | `sid_math.md` | how the item embeddings and the Semantic IDs are produced |

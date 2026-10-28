@@ -292,9 +292,9 @@ SID codes instead of scoring the catalogue with them, and this wrapper selects w
 SID release it runs on. Level widths come from `vocab.json`, so nothing is guessed
 and the same code serves both:
 
-    sbatch train_tiger.sh                    # v2, 2 x 8,192, about 3 h
+    sbatch train_tiger.sh                    # v2, 2 x 8,192, PREFIX=1, about 3 h
     SID_VERSION=1 sbatch train_tiger.sh      # v1, 4 x 256 plus 731, about 4.5 h
-    PREFIX=1 sbatch train_tiger.sh           # paper factorisation arm
+    PREFIX=0 sbatch train_tiger.sh           # additive ablation, already measured
 
 Ran on v2, three epochs, 3.2 GPU-hours: **R@1 1.4400%, R@10 2.4500%, R@100 6.5900%,
 R@1000 20.0800%, R@10000 45.7600%, nDCG@10 0.01870, MRR@10 0.01700**. That leads
@@ -307,22 +307,23 @@ same two code rows as DiGR's, so the run compares two losses on one function cla
 The flag picks the objective, not the level count, and the two arms differ in what
 can be measured.
 
-Default, `PREFIX=0`. Codes are not in the input, every level reads the separator
-state, and an item's score is the sum of its own code's log-probability at each
-level. That is computable for all 4,783,154 items in one forward pass, so the row
-reports the same five cut-offs as DiGR and no trie or beam is involved. Row length is
-89 to 90 tokens against DiGR's 89, so an epoch costs about the same.
-
-`PREFIX=1`. The codes go into the input and level `l` is predicted from the
-separator plus codes `1..l-1`, which is the factorisation in the TIGER paper. An
-item's score then depends on the path used to reach it, so items can no longer be
-scored independently: candidates must be generated, which means a beam, which means
+Default, `PREFIX=1`, which is the paper's TIGER. The codes go into the input and
+level `l` is predicted from the separator plus codes `1..l-1`. An item's score then
+depends on the path used to reach it, so items can no longer be scored
+independently: candidates must be generated, which means a beam, which means
 a trie, because a beam will propose prefixes no item owns. The tree is therefore
 mandatory in this arm at two levels as much as at five. The price is inference, one
 forward per beam row per level instead of one per query, and the cut-offs it can
 report are capped at the beam width, so `R@1000` and `R@10000` cannot be measured
 here. Exhaustive scoring is `L` gathers per item at any `L`, minutes for the whole
 val set, so compute is not what decides between the arms.
+
+`PREFIX=0` is the ablation. Codes are not in the input, every level reads the
+separator state, and an item's score is the sum of its own code's log-probability at
+each level. That is computable for all 4,783,154 items in one forward pass, so the
+row reports the same five cut-offs as DiGR and no trie or beam is involved. Row
+length is 89 to 90 tokens against DiGR's 89, so an epoch costs about the same. This
+is the arm whose numbers are above.
 
 What a beam does to the cut-offs, which is the part that decides whether the faithful
 arm belongs in the same table. A beam of `b` only ever returns items whose first code
@@ -363,15 +364,18 @@ DiGR adds, so this run compares two losses on one function class. Denser
 supervision sharpens the marginals that decide the first guess and does nothing for
 the ordering inside a bucket.
 
-Two gaps the run exposed. `format_metrics` drops `cover@k` and `recall@5` and no
-metrics file is written, so the ceiling of the `PREFIX=1` arm cannot be read from
-the artifacts. And the row comes from `evaluate_tiger` rather than
-`eval_full_catalog.py`, so one cross-check on a second code path is owed before the
-number is quoted.
+Two gaps the run exposed, and the state of each. `format_metrics` dropped `cover@k`
+and `recall@5` and no metrics file was written, so the ceiling of the
+`PREFIX=1` arm could not be read from the artifacts: fixed, the log line carries
+both and every epoch writes `metrics.jsonl` and `metrics.json`, training with
+prefix conditioning ranks nothing while still reporting loss and coverage, and
+`head_config.json` is written so a checkpoint records its own arm. The other gap
+stands: the row comes from `evaluate_tiger` rather than `eval_full_catalog.py`, so
+one cross-check on a second code path is owed before the number is quoted.
 
 ## test_train_tiger.py
 
-`pytest "Model Training/test_train_tiger.py" -q` runs 34 tests, CPU only, no backbone
+`pytest "Model Training/test_train_tiger.py" -q` runs 41 tests, CPU only, no backbone
 and no dataset on
 disk. They pin the prefix key (injective, ordered so `searchsorted` finds a run of
 rows, refusing an int64 overflow and an out-of-range code), the prefix tree against

@@ -304,6 +304,12 @@ the log does not print.
 
 ## 11. Open decisions
 
+**Superseded in part by `docs/direction.md` (2026-10-29).** Items 4 and 5 below are
+re-read there: the ANN arm stops being "the natural follow-up" (its exact-per-item
+rows are measured at +11% over shared code rows on the ordering conditional) and the
+next spend moves to the query side and to dose. Read that file before acting on
+decisions 4 and 5 here.
+
 1. The bar. **Resolved** (m03136): the window sweep closed at 20, with R@10
    3.6011% to 3.6794% to 3.7069% in shrinking steps. The bar TIGER has to clear is
    R@10 3.7069% and R@100 10.9873%.
@@ -322,6 +328,12 @@ the log does not print.
 ---
 
 ## 12. What would change the plan
+
+**`docs/direction.md` is the current answer to this section** and it changes the
+plan as written: the item-side capacity axis is measured at `log 1.41 / log 9.3 =
+0.15`, so branch two (`TIGER clearly beats co-click`) no longer implies "build more
+item capacity next". The sections below are kept as written so the predictions can
+be checked against the outcomes.
 
 The first branch has fired, with one correction: it holds for the additive arm,
 which is what DiGR and prefix-free TIGER both are, and not for the SID family while

@@ -30,17 +30,18 @@ THE PREFIX QUESTION
   prefix-conditioned score for item `i` needs `i`'s own prefix in the input, so
   scoring all 4,783,154 items costs one forward pass per item. Two arms therefore:
 
-  `--prefix_conditioning off` (default) trains the L heads on the separator state
-  with no prefix in the input, so all L logits come from one forward and the exact
-  product score of every catalogue item is L gathers. This is the arm that belongs
-  in the three-method table, because it is scored by the same full-catalogue
-  evaluator as DiGR, co-click and popularity.
+  `--prefix_conditioning off` trains the L heads on the separator state with no
+  prefix in the input, so all L logits come from one forward and the exact product
+  score of every catalogue item is L gathers. This is the cheap arm: it is scored by
+  the same full-catalogue evaluator as DiGR, co-click and popularity, which is why
+  it was the first one run, but its score is additive over the code rows, so it does
+  not test the paper's factorisation.
 
   `--prefix_conditioning on` trains with the true prefix fed back, which is the
-  paper's factorisation, and evaluates with `--mode beam` over the prefix tree on a
-  val subset, because exhaustive scoring is not available. The two arms differ in
-  one modelling choice and the difference is measurable, so neither has to be
-  argued about.
+  paper's TIGER, and evaluates with `--mode beam` over the prefix tree, because
+  exhaustive scoring is not available. This is the arm `Plan 2/train_tiger.sh` runs
+  by default (`PREFIX=1`). Its reachable cut-offs are capped at the beam width, so
+  it reports `cover@b` beside them: `R@k(beam b) <= cover@b`.
 
 QUICK START
   python preprocess_digr_v2.py --output_dir digr_data_v2 ...
@@ -411,6 +412,10 @@ class TigerHead(torch.nn.Module):
 class TigerRetriever(torch.nn.Module):
     """Backbone plus per-level heads, with both scoring paths on one object."""
 
+    # Set by the trainer and written into `head_config.json`, so a checkpoint says
+    # which arm it is instead of the evaluator having to be told.
+    prefix_conditioning: bool = False
+
     def __init__(self, backbone: torch.nn.Module, hidden_size: int,
                  sid_sizes: Sequence[int], catalog_codes: np.ndarray,
                  head_init_std: float = DEFAULT_HEAD_INIT_STD):
@@ -542,8 +547,16 @@ BEAM_COVER_KS = (1, 10, 20, 100, 1000)
 @torch.inference_mode()
 def evaluate_tiger(model: TigerRetriever, loader: DataLoader, device: torch.device,
                    amp_dtype: torch.dtype, use_amp: bool,
-                   catalog_chunk: int = DEFAULT_CATALOG_CHUNK) -> Dict[str, float]:
-    """Teacher-forced loss plus full-catalogue ranking metrics."""
+                   catalog_chunk: int = DEFAULT_CATALOG_CHUNK,
+                   rank_items: bool = True) -> Dict[str, float]:
+    """Teacher-forced loss, level-0 coverage, and optionally full-catalogue ranks.
+
+    `rank_items=False` is for prefix-conditioned training. The exhaustive ranking
+    path reads every level from the separator state, which is the prefix-free
+    score, so ranking a prefix-conditioned model through it reports a rule the
+    model was never trained on. Loss and `cover@k` stay valid in both arms, and
+    `--mode beam` is the prefix-conditioned ranking path.
+    """
     model.eval()
     kmax = max(EVAL_KS)
     total_loss = 0.0
@@ -563,14 +576,15 @@ def evaluate_tiger(model: TigerRetriever, loader: DataLoader, device: torch.devi
             logits = model(ids, mask, positions)
             losses = level_cross_entropies(logits, labels)
             loss = sum(losses)
-            states = model.separator_states(ids, mask)
+            states = model.separator_states(ids, mask) if rank_items else None
 
         total_loss += float(loss.item()) * b
         for level, part in enumerate(losses):
             per_level[level] += float(part.item()) * b
         total_n += b
-        ranks.append(target_ranks(model, states, targets.to(device),
-                                 chunk=catalog_chunk).cpu().numpy())
+        if rank_items:
+            ranks.append(target_ranks(model, states, targets.to(device),
+                                     chunk=catalog_chunk).cpu().numpy())
         # Level-0 coverage: how often the target's first code is among the model's
         # top `k` first codes. Cheap, and it bounds every beam arm.
         first = F.log_softmax(logits[0].float(), dim=-1)
@@ -581,11 +595,16 @@ def evaluate_tiger(model: TigerRetriever, loader: DataLoader, device: torch.devi
             cover[k] += float((top == labels[:, 0:1]).any(dim=-1).sum().item())
 
     n = max(1, total_n)
-    rank_array = np.concatenate(ranks) if ranks else np.zeros(0, dtype=np.int64)
-    # A target outside the top `kmax` is stored as `kmax + 1`, the same convention
-    # as the DiGR evaluator, so it fails every cut-off instead of passing them all.
-    rank_array = np.where(rank_array > kmax, kmax + 1, rank_array)
-    out = rank_metrics(rank_array)
+    if rank_items:
+        rank_array = np.concatenate(ranks) if ranks else np.zeros(0, dtype=np.int64)
+        # A target outside the top `kmax` is stored as `kmax + 1`, the same
+        # convention as the DiGR evaluator, so it fails every cut-off instead of
+        # passing them all.
+        rank_array = np.where(rank_array > kmax, kmax + 1, rank_array)
+        out = rank_metrics(rank_array)
+    else:
+        out = {"n": int(total_n)}
+    out["ranked"] = 1.0 if rank_items else 0.0
     out["loss"] = total_loss / n
     out["loss@1"] = per_level[0] / n
     for level in range(1, model.num_levels):
@@ -596,20 +615,29 @@ def evaluate_tiger(model: TigerRetriever, loader: DataLoader, device: torch.devi
 
 
 def format_metrics(metrics: Dict[str, float], levels: int) -> str:
+    """One log line, with nothing the evaluator computed left out.
+
+    `cover@k` is the share of rows whose target's first code is inside the model's
+    own top `k` at level 0. Every beam arm's recall is bounded by it, so it is the
+    number that sizes the prefix-conditioned arm, and it is printed on both arms.
+    """
     parts = [f"loss {metrics['loss']:.4f}"]
     for level in range(levels):
         key = "loss@1" if level == 0 else f"loss@{level + 1}"
         parts.append(f"L{level + 1} {metrics[key]:.4f}")
-    parts.append(f"R@1 {metrics['recall@1']:.4f}")
-    parts.append(f"R@10 {metrics['recall@10']:.4f}")
-    if "recall@100" in metrics:
-        parts.append(f"R@100 {metrics['recall@100']:.4f}")
-    if "recall@1000" in metrics:
-        parts.append(f"R@1000 {metrics['recall@1000']:.4f}")
-    if "recall@10000" in metrics:
-        parts.append(f"R@10000 {metrics['recall@10000']:.4f}")
-    parts.append(f"nDCG@10 {metrics['ndcg@10']:.4f}")
-    parts.append(f"MRR {metrics['mrr']:.4f}")
+    if metrics.get("ranked", 1.0):
+        for k in EVAL_KS:
+            key = f"recall@{k}"
+            if key in metrics:
+                parts.append(f"R@{k} {metrics[key]:.4f}")
+        parts.append(f"nDCG@10 {metrics['ndcg@10']:.4f}")
+        parts.append(f"MRR {metrics['mrr']:.4f}")
+    else:
+        parts.append("ranks skipped (prefix-conditioned, use --mode beam)")
+    covers = [f"{k:g}:{metrics[f'cover@{k}'] * 100:.2f}%"
+              for k in BEAM_COVER_KS if f"cover@{k}" in metrics]
+    if covers:
+        parts.append("cover " + " ".join(covers))
     return " | ".join(parts)
 
 
@@ -666,8 +694,10 @@ def _tiger_meta(args, logger: logging.Logger) -> RunMeta:
     )
 
 
-def _read_head_config(ckpt_dir: str) -> Dict[str, Any]:
-    path = os.path.join(ckpt_dir, "head_config.json")
+def _read_head_config(ckpt_dir: Optional[str]) -> Dict[str, Any]:
+    if not ckpt_dir:
+        return {}
+    path = os.path.join(ckpt_dir, HEAD_CONFIG_FILE)
     if not os.path.isfile(path):
         return {}
     with open(path, "r", encoding="utf-8") as f:
@@ -719,6 +749,7 @@ def _build_model(args, meta: RunMeta, device: torch.device, logger: logging.Logg
 
 
 HEAD_FILE = "tiger_head.pt"
+HEAD_CONFIG_FILE = "head_config.json"
 
 
 def _load_head_weights(model: TigerRetriever, ckpt_dir: str,
@@ -758,6 +789,16 @@ def _save_tiger_checkpoint(model: TigerRetriever, meta: RunMeta, out_dir: str,
     model.backbone.save_pretrained(tmp, safe_serialization=True)
     meta.save(tmp)
     torch.save(model.head.state_dict(), os.path.join(tmp, HEAD_FILE))
+    # `_read_head_config` has always read this file and nothing ever wrote it, so the
+    # num_levels consistency check could never fire and the evaluator had no way to
+    # tell a prefix-conditioned checkpoint from a prefix-free one.
+    with open(os.path.join(tmp, HEAD_CONFIG_FILE), "w", encoding="utf-8") as fh:
+        json.dump({
+            "num_levels": int(model.num_levels),
+            "sid_sizes": [int(w) for w in model.sid_sizes],
+            "hidden_size": int(model.head.layers[0].in_features),
+            "prefix_conditioning": bool(getattr(model, "prefix_conditioning", False)),
+        }, fh, indent=2, sort_keys=True)
     if state is not None:
         torch.save(state, os.path.join(tmp, "train_state.pt"))
     shutil.rmtree(out_dir, ignore_errors=True)
@@ -780,6 +821,37 @@ def _make_state(epoch: int, batch: int, batch_size: int, global_step: int,
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict() if scaler is not None else None,
     }
+
+
+def _write_metrics(run_dir: str, epoch: int, metrics: Dict[str, float]) -> None:
+    """Persist one epoch's metrics beside the checkpoints.
+
+    The log line used to be the only record, so anything the formatter dropped was
+    gone: `cover@1/10/20/100/1000` and `recall@5` were computed every epoch and
+    never stored. `metrics.jsonl` is append-only, `metrics.json` is the whole run
+    as a list, rewritten atomically so a crash cannot leave half a file.
+    """
+    os.makedirs(run_dir, exist_ok=True)
+    row = {"epoch": int(epoch),
+           **{k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))}}
+    with open(os.path.join(run_dir, "metrics.jsonl"), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row, sort_keys=True) + "\n")
+    path = os.path.join(run_dir, "metrics.json")
+    rows: List[Dict[str, Any]] = []
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, list):
+                rows = [r for r in loaded if isinstance(r, dict)]
+        except (json.JSONDecodeError, OSError):
+            rows = []
+    rows = [r for r in rows if int(r.get("epoch", -1)) != int(epoch)] + [row]
+    rows.sort(key=lambda r: int(r.get("epoch", -1)))
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(rows, fh, indent=2, sort_keys=True)
+    os.replace(tmp, path)
 
 
 def run_train(args, logger: logging.Logger) -> None:
@@ -817,6 +889,7 @@ def run_train(args, logger: logging.Logger) -> None:
 
     train_split, val_split = _load_splits(args, meta, logger)
     model, sid_in, sid_codes = _build_model(args, meta, device, logger)
+    model.prefix_conditioning = bool(args.prefix_conditioning)
 
     head_params = model.head.parameter_count()
     total_params = sum(p.numel() for p in model.parameters())
@@ -1066,16 +1139,23 @@ def run_train(args, logger: logging.Logger) -> None:
                 f"L1 acc {running_hit / window:.4f}"
             )
         val = evaluate_tiger(model, val_loader, device, amp_dtype, use_amp,
-                             catalog_chunk=args.catalog_chunk)
+                             catalog_chunk=args.catalog_chunk,
+                             rank_items=not bool(args.prefix_conditioning))
         logger.info(
             f"  == epoch {epoch + 1} done in {(time.time() - epoch_t0) / 60:.1f} min | "
             f"val {format_metrics(val, model.num_levels)}"
         )
+        _write_metrics(args.run_dir, epoch + 1, val)
         if writer is not None:
             writer.add_scalar("val/loss", val["loss"], epoch + 1)
-            for k in EVAL_KS:
-                writer.add_scalar(f"val/recall@{k}", val[f"recall@{k}"], epoch + 1)
-            writer.add_scalar("val/mrr", val["mrr"], epoch + 1)
+            for k in BEAM_COVER_KS:
+                key = f"cover@{k}"
+                if key in val:
+                    writer.add_scalar(f"val/cover@{k}", val[key], epoch + 1)
+            if val.get("ranked", 1.0):
+                for k in EVAL_KS:
+                    writer.add_scalar(f"val/recall@{k}", val[f"recall@{k}"], epoch + 1)
+                writer.add_scalar("val/mrr", val["mrr"], epoch + 1)
 
         if val["loss"] < best_val:
             best_val = val["loss"]
@@ -1123,18 +1203,33 @@ def _load_for_eval(args, logger: logging.Logger):
     return meta, model, sid_in, sid_codes, device
 
 
+def _checkpoint_prefix_conditioning(args) -> bool:
+    """Whether the checkpoint itself was trained with prefix conditioning.
+
+    The command-line flag is only a fallback, for checkpoints written before
+    `head_config.json` existed. Keying the decision off the flag alone meant that
+    forgetting it silently scored a prefix-conditioned model with the prefix-free
+    rule, which reports a model nobody trained.
+    """
+    cfg = _read_head_config(getattr(args, "checkpoint", None))
+    return bool(cfg.get("prefix_conditioning", args.prefix_conditioning))
+
+
 def run_eval(args, logger: logging.Logger) -> None:
     meta, model, sid_in, sid_codes, device = _load_for_eval(args, logger)
-    if args.prefix_conditioning:
+    # The checkpoint is the authority on which arm it is. Before this, the refusal
+    # keyed off the command-line flag, so the flag being forgotten silently scored a
+    # prefix-conditioned model with the prefix-free rule.
+    if _checkpoint_prefix_conditioning(args):
         # Exhaustive scoring reads every level from the separator state, which is the
         # prefix-free arm's score. A prefix-conditioned head gives a different number
         # at every level after the first, so scoring it this way would report a model
         # that was never trained. Refuse rather than print a plausible-looking row.
         raise SystemExit(
-            "--mode eval is exhaustive and therefore prefix-free. A checkpoint "
-            "trained with --prefix_conditioning must be evaluated with --mode beam, "
-            "because its score depends on the path and cannot be computed for every "
-            "item in one pass."
+            "--mode eval is exhaustive and therefore prefix-free, but this checkpoint "
+            "was trained with prefix conditioning. Its score depends on the path, so "
+            "it cannot be computed for every item in one pass. Evaluate it with "
+            "--mode beam, and read `cover@b` from the training log as its ceiling."
         )
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     amp_dtype = dtype_map[args.dtype]

@@ -13,32 +13,35 @@
 # digr_data/, so the only difference between the two is which directory is
 # --data_dir and what the level widths are.
 #
-#   sbatch "Plan 2/train_tiger.sh"                    # v2, 2 x 8,192, about 3 h
+#   sbatch "Plan 2/train_tiger.sh"                    # v2, 2 x 8,192, PREFIX=1, about 3 h
 #   SID_VERSION=1 sbatch "Plan 2/train_tiger.sh"      # v1, 4 x 256 + 731, about 4.5 h
-#   PREFIX=1 sbatch "Plan 2/train_tiger.sh"           # paper factorisation arm
+#   PREFIX=0 sbatch "Plan 2/train_tiger.sh"           # additive ablation, not the paper
 #   EPOCHS=1 sbatch "Plan 2/train_tiger.sh"           # one epoch
 #
 # Scoring. Two arms, and the flag picks the objective, not the level count.
 #
-# PREFIX=0 (default). Codes are not in the input; every level reads the separator
-# state and the score of an item is the sum of its own code's log-probability at
-# each level. That score is computable for all 4,783,154 items in one forward
-# pass, so the evaluator reports the same five cut-offs as the DiGR row. No trie
-# and no beam are needed, because nothing is generated. Row length equals DiGR's,
-# so an epoch costs the same. (It is 90 tokens against DiGR's 89, one separator,
-# so about 1% more.)
+# PREFIX=1 (default, the paper's TIGER). The codes go into the input and level l is
+# predicted from the separator plus codes 1..l-1, which is the factorisation in the
+# TIGER paper. The score of an item now depends on the path taken to it, so all
+# items can no longer be scored independently: candidates have to be generated,
+# which means a beam, which means a trie, because a beam will walk into prefixes
+# that no item owns. That last point is what makes the tree mandatory whenever
+# PREFIX=1, at two levels as much as at five. The cost is inference: a beam of
+# width b over L levels is O(b * L) forwards per query instead of one, and the
+# cut-offs it can report are capped at b, so R@1000 and R@10000 are not computable
+# in this arm. Validation during training therefore reports loss and `cover@k`
+# only; `--mode eval` refuses this checkpoint on purpose and the ranking numbers
+# come from the beam pass.
 #
-# PREFIX=1. The codes go into the input and level l is predicted from the
-# separator plus codes 1..l-1, which is the factorisation in the TIGER paper. The
-# score of an item now depends on the path taken to it, so all items can no longer
-# be scored independently: candidates have to be generated, which means a beam,
-# which means a trie, because a beam will walk into prefixes that no item owns.
-# That last point is what makes the tree mandatory whenever PREFIX=1, at two
-# levels as much as at five. The cost is inference: a beam of width b over L
-# levels is O(b * L) forwards per query instead of one, and the cut-offs it can
-# report are capped at b, so R@1000 and R@10000 are not computable in this arm.
-# Exhaustive scoring costs L gathers per item at any L, which is a few minutes for
-# the whole val set, so cost is not the reason to prefer either arm.
+# PREFIX=0 (the ablation, already measured). Codes are not in the input; every level
+# reads the separator state and the score of an item is the sum of its own code's
+# log-probability at each level. That score is computable for all 4,783,154 items in
+# one forward pass, so the evaluator reports the same five cut-offs as the DiGR row.
+# No trie and no beam are needed, because nothing is generated. Row length equals
+# DiGR's, so an epoch costs the same. (It is 90 tokens against DiGR's 89, one
+# separator, so about 1% more.) At two levels this score is additive over the two
+# code rows, which is the same function class as DiGR, so it measures a loss change
+# rather than the factorisation.
 #
 # Level widths are read from vocab.json, never guessed, so v1 (5 levels) and v2
 # (2 levels) both work with no flag.
@@ -48,14 +51,16 @@ cd "$(dirname "$0")" || exit 1
 
 SID_VERSION="${SID_VERSION:-2}"
 EPOCHS="${EPOCHS:-3}"
-PREFIX="${PREFIX:-0}"
+PREFIX="${PREFIX:-1}"
+SUFFIX=""
+[ "${PREFIX}" = "1" ] && SUFFIX="_prefix"
 
 if [ "${SID_VERSION}" = "1" ]; then
     DATA_DIR="${DATA_DIR:-${HOME}/NZ5/train_model/archive/2026-10-23-preprocess-01/digr_data}"
-    RUN_NAME="${RUN_NAME:-tiger_v1_sid4x256_e${EPOCHS}}"
+    RUN_NAME="${RUN_NAME:-tiger_v1_sid4x256_e${EPOCHS}${SUFFIX}}"
 else
     DATA_DIR="${DATA_DIR:-${HOME}/NZ5/plan2/digr_data}"
-    RUN_NAME="${RUN_NAME:-tiger_v2_sid2x8192_e${EPOCHS}}"
+    RUN_NAME="${RUN_NAME:-tiger_v2_sid2x8192_e${EPOCHS}${SUFFIX}}"
 fi
 OUT_DIR="${OUT_DIR:-${HOME}/NZ5/plan2/runs}"
 
