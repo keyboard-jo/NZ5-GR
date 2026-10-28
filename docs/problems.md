@@ -28,6 +28,38 @@ item plus ANN, is the design all three competition winners used. It is deliberat
 **out of scope for now**. It is the strongest comparison and it comes after the
 three-arm table exists, not before.
 
+### Standing exclusions
+
+Two more things are excluded, and these are excluded for good rather than for now.
+They were settled on 2026-10-28 after each came up more than once, and the reason is
+written here so it does not have to be argued again.
+
+Reranking is out. The deliverable is a comparison of retrieval methods that use
+Semantic IDs, not the strongest possible ranker. A second stage over a shortlist
+measures the second stage. It says nothing about which SID retrieval method is
+better, and it could be bolted onto any of the three arms, so it cannot separate
+them. The shortlist figure stays in `results.md` as a description of what the
+generative arms hand downstream, that the target sits inside DiGR's top 1,000 on
+27.66% of val rows. That is a property of the arms, not a work item.
+
+The item representation stays structural. The vector that is quantised into a
+Semantic ID has to be a function of item content alone, because content is the only
+thing that exists for an item on the day it arrives. Behaviour in the representation
+breaks cold start twice over: a co-occurrence vector is undefined for a new item,
+and a learned behaviour encoder answers a different question for warm items than for
+cold ones, so the code space stops being one space. The current Stage 1 embedding is
+already behaviour-trained, with ItemDNN and HSTU trained in tandem, which is why
+section 5 measures it instead of assuming it. The behaviour came out weak, so what
+we have is in practice close to the structural vector this rule asks for, and adding
+more of the same would buy little even if it were allowed.
+
+One consequence follows directly. The behaviour-SID strand, Phase 3b, where
+co-click counts become a vector and then a code, is retired under the second rule,
+because a co-occurrence vector cannot be defined for a cold item. Improving the
+structural vector is a different question and stays open: a content encoder that
+ranks better while still needing nothing but content at serving time violates
+nothing here.
+
 ---
 
 ## 2. Status in one paragraph

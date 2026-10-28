@@ -403,17 +403,20 @@ identity, and the vocabulary stays inside the 1,966 LLM tokens.
 ## 11. Order of work
 
 The goal is "which SID retrieval method is best", so at most one thing may move
-per comparison.
+per comparison. Two rules bound this file (m05965): reranking is out, because a
+second stage over a shortlist measures the second stage, and the item
+representation stays a function of content, because content is the only input a
+cold item has.
 
 1. TIGER on the frozen content SID. It changes the head and nothing else, so it
    isolates the head. Its bar is co-click window 20, R@10 3.7069%.
-2. The behaviour-SID arm (D3), same head, same backbone, same evaluator, one
-   changed axis: the codes. This isolates the geometry, and it is the only
-   experiment that can tell whether the mechanism above is real.
-3. Only if both point at the item representation as the limit, open the Stage 1
-   rebuild (D2 first, then D1 and D5). It is the most expensive instrument and it
-   bundles several unknowns, so it goes last.
+2. A better content tower stays open, but only in the content-only direction. A
+   weak item vector produces a weak SID however it is cut, so the rebuild is worth
+   doing on its own terms, as long as the vector remains a function of content at
+   serving time.
 
-D6 is dropped. A Stage 1 retrain is not on the path to answering the current
-question, it is on the path to a better embedding, and those are different
-projects.
+The behaviour-SID arm (D3) is closed under the second rule. A co-occurrence vector
+is undefined for an item that arrived today, so it cannot be the code space. A
+Stage 1 retrain that injects behaviour as an input is the same move and is closed
+with it. D6 is dropped as before, since the towers it would average score 0.4354%
+R@10, below a frequency count.

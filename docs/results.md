@@ -189,10 +189,11 @@ beam 100 is the headline metric.
 
 ## 7. Open items
 
-- The reranker ceiling is now measured: DiGR's top 1,000 contains the target on
-  27.66% of val rows, so a reranker over that list caps out at 27.66% R@100 (2.5x
-  the model's own 10.92%) and 27.66% R@10 (7.6x its 3.66%). A cheap test of whether
-  the ordering can be repaired at all.
+- The conversion inside DiGR's own list is now measured, and it stays on record as a
+  description of the arms rather than as work: the target sits in DiGR's top 1,000 on
+  27.66% of val rows and reaches the top 10 on 13.22% of those rows, against 14.65%
+  for co-click. Reranking is out of scope (see `problems.md`, standing exclusions),
+  so this is a property of the generator, not a task.
 - B3 at the wide cut-offs, only if the negative result is going into the report.
 - Check whether train and val share users (`users.npy` in both splits). If they
   do, both methods benefit but co-click benefits more directly from exact pair
@@ -522,11 +523,12 @@ before and 14.65% for co-click. The wider net now catches more targets than
 co-click's does, the first guess is the best of either method, and the ordering
 through the middle of the list is still the weakest part of the model.
 
-The reranker question now has a number. A target is inside DiGR's top 1,000 on
-27.66% of rows, so a reranker over that list cannot push R@100 past 27.66%, which
-is 2.5x the current 10.92%, and cannot push R@10 past 27.66%, which is 7.6x the
-current 3.66%. That is the ceiling for any reranker on this list, and the other
-72.3% of targets it never sees.
+The headroom inside DiGR's own list now has a number. A target is inside DiGR's top
+1,000 on 27.66% of rows, so no reordering of that list can push R@100 past 27.66%,
+which is 2.5x the current 10.92%, or R@10 past 27.66%, which is 7.6x the current
+3.66%. The ceiling belongs to the list rather than to any particular second stage,
+and the other 72.3% of targets never enter the list at all. Reranking is out of
+scope, so the figure is a description of what the generator hands downstream.
 
 What this supports: the paper's own argument, that items per code is the quantity
 that sets reachable accuracy and that the additive mean-pooled head is not the

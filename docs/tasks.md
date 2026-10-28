@@ -119,7 +119,15 @@ apply, which is recorded here so nobody rebuilds them.
 
 ---
 
-## Phase 3b: rebuild the item representation
+## Phase 3b: rebuild the item representation (closed, out of scope)
+
+**Closed by decision (m05965).** The item representation stays a function of item
+content alone, because content is the only input a cold item has. Everything below
+is kept as the record of the reasoning, not as planned work. The current Stage 1
+embedding is not pure, since ItemDNN and HSTU run in tandem, but the measured
+effect is small enough that a structural-only vector is what the pipeline
+effectively produces already, so the rule closes the strand rather than resetting
+it.
 
 The invariant that decides every choice here: **one code space, defined for every
 item, and comparable across items.** A code for a never-clicked item has to sit in
@@ -483,12 +491,12 @@ SIDs, so S1 is now about how far that curve runs rather than whether it moves.
       numbers then the stream carried part of the gain. Deferred behind TIGER
       (m05706) because it explains an existing row rather than adding one, but it is
       the first question anyone will ask about section 12, and it is cheap.
-- [ ] S8 **Reranker over DiGR's top 1,000, deferred.** CPU only. The ceiling is now
-      measured rather than assumed: the target sits in DiGR's top 1,000 on 27.66% of
-      val rows, so a perfect reranker reaches R@100 27.66% (2.5x the current 10.92%)
-      and R@10 27.66% (7.6x the current 3.66%). Features: co-click successors,
-      content cosine, popularity, recency, the SID prefix. It is the only remaining
-      idea that attacks the 13.22% conversion without touching the towers.
+- [x] S8 **Reranker over DiGR's top 1,000, dropped as out of scope** (m05965). A
+      reranker scores another method's list, so it cannot answer which retrieval
+      method is best, and its numbers are conditional on that list. The
+      measurement stays on record because it describes the generator: the target
+      sits in DiGR's top 1,000 on 27.66% of val rows, which a reranker could not
+      push past, and reaches the top 10 on 13.22% of those rows.
 - [ ] S9 **16,384 wide, deferred.** 292 items per level-0 code, inside the DiGR
       paper's 39 to 195 band, 4.7x the item-side parameters of 8,192 and 98 MB bf16.
       An hour for the quantiser and three for the model. Worth one run only after S7
@@ -530,11 +538,12 @@ of them can be declared a success.
 
 Deferred behind those, in the order they are worth doing. S7, attribution, 2h10m,
 because it explains the 1.41x rather than adding a row and it is the first thing a
-reader asks. S8, the reranker over the top 1,000, CPU, with a measured ceiling of
-27.66% at R@100 and 7.6x headroom at R@10. S9, the width run at 16,384, one GPU hour
-for the quantiser and three for the model, held back until S7 says whether the last
-widening's slope is still steep.
+reader asks. S9, the width run at 16,384, one GPU hour for the quantiser and three
+for the model, held back until S7 says whether the last widening's slope is still
+steep.
 
-Phase 3b stays where it is. Nothing in Phase 6 or Phase 4 changes the item
-representation, so the behaviour-SID question is untouched by any of the above and
-the frozen content SID remains the reference for the tables already published.
+Phase 3b is out of scope (m05965). The item representation stays a function of
+content alone, so the frozen content SID remains the reference for every table
+already published, and nothing in Phase 6 or Phase 4 moves it. Reranking is out of
+scope for the same reason the table exists: the question is which retrieval method
+is best, and a reranker only reorders someone else's list.
