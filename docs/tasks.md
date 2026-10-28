@@ -80,29 +80,38 @@ Three rules govern the order below.
 
 ---
 
-## Phase 3: protocol, then the trie
+## Phase 3: protocol, then the trie (closed)
 
-These are small, cheap, and they decide whether TIGER's numbers mean anything.
+**Closed.** It was written for a five-level SID, where a beam over 256^5 tuples
+needs a trie. The endorsed SID has two levels of 8,192, and the exact score of every
+item is a two-column gather over the catalogue's own codes, so a trie would be a
+slower route to the same numbers. The protocol decision in 3.1 stands and the rest
+is kept only as the record of why it was dropped.
+
+These were written for the five-level SID and a beam search. Three of them no longer
+apply, which is recorded here so nobody rebuilds them.
 
 - [x] 3.1 **Fifth-level protocol: decided.** The headline table scores **exact
       item identity** for all four arms. 39.3% of items share their first four
       codes and level 5 is an arbitrary rank inside the group, so a prefix hit
       would inflate recall by up to 39% relative and only for the SID arms. A
       prefix-hit variant is a footnote, never the headline. Confirmed by the user
-      (m03114, paraphrased).
-- [ ] 3.2 **Build the trie over the 4,783,154 code tuples.** Only 3,459,854 of the
-      4,294,967,296 possible four-code prefixes exist, so unconstrained decoding
-      would emit invalid codes almost always. A prefix index already exists in
-      `Model Training/baselines_digr.py` (`build_prefix_index`), so this is a
-      reuse, not new code.
-- [ ] 3.3 **Measure decode cost for beam widths 10, 50, 100, 500.** R@k above the
-      beam width is structurally unreachable, so the beam has to be at least 1,000
-      for the R@1000 and R@10000 rows to be comparable. If 1,000 is too slow, the
-      table gets a beam-width column and the comparison is stated per cut-off.
-- [ ] 3.4 **Sliced evaluator.** At beam 1,000 the candidate set is 1,000 per query,
-      not 4,783,154, so TIGER is scored by candidate-set ranking while DiGR and
-      co-click are scored by full-catalog ranking. Same metric names, different
-      candidate space. Write the one page that says so before writing the code.
+      (m03114, paraphrased). The question is moot now: the 2 x 8,192 SID has no
+      suffix level at all.
+- [x] 3.2 **Build the trie. Dropped.** Only 3,459,854 of 4,294,967,296 four-code
+      prefixes exist, so unconstrained decoding over five levels would emit invalid
+      codes almost always. That is a five-level problem. At two levels the score of
+      every item is `p1[c1_i] + p2[c2_i]`, a gather over codes that all 4,783,154
+      items already own, so no prefix index is needed and nothing can be emitted
+      that is not a real item.
+- [x] 3.3 **Measure decode cost for beam widths. Dropped for the same reason.**
+      There is no beam width to report. R@10,000 is reached by sorting 4,783,154
+      exact scores.
+- [x] 3.4 **Sliced evaluator. Dropped.** It existed because beam 1,000 would score
+      TIGER over 1,000 candidates while DiGR was scored over 4,783,154, so the two
+      rows would not be comparable. With a two-level SID both arms are scored over
+      the full catalogue by the same code, which is a stronger comparison than the
+      sliced one would have been.
 - [ ] 3.5 Optional sanity run. A tiny SASRec or GRU4Rec over item ids, about 15
       minutes on GPU, tells us whether an item-id sequence model clears co-click
       at all on this slice. It is not part of the three-arm table but it bounds
@@ -256,40 +265,53 @@ either tower.
 
 ---
 
-## Phase 4: build TIGER (back burner)
+## Phase 4: build TIGER (next)
 
-**Deferred by decision.** TIGER is engineering rather than exploration: the design
-is settled and the outcomes are predictable, a per-level head at or above DiGR's
-2.5940%. It is worth one run eventually, but it is not where the information is, and
-measuring a head on codes we already know are content-only understates what the head
-can do. Phase 3b comes first. The frozen content SID numbers stay as the historical
-reference for the table.
+**Promoted to next by decision** (user, 2026-10-28). The attribution arm that would
+have separated codebook width from the action token is deferred behind it: the
+deliverable is the three-arm table and TIGER is the only row still missing, so a
+run that only explains an existing row can wait.
 
-Design is settled: **direct SID input**, user feature block carried, temporal
-tokens carried, same backbone, and the existing content SID. The input format
-does not change, so
-`tokens.npy`, `offsets.npy`, `targets.npy`, `LengthBucketBatchSampler`,
-mid-epoch checkpointing and `catalog_sid_codes.npy` are all reused as they are.
+The SID it runs on is the 2 x 8,192 release that S1 endorsed and S4 trained on. That
+simplifies the design in a way worth stating before any code is written: **with two
+levels there is no trie and no beam.** The exact full-catalog score of every item is
+`log p1[c1_i] + log p2[c2_i]`, two gathers over `catalog_sid_codes.npy`, so TIGER is
+scored over all 4,783,154 items in the same space, with the same evaluator, as DiGR.
+The five-level trie work in 3.2 to 3.4 is therefore closed rather than deferred.
 
-- [ ] 4.1 Head. Replace the single full-catalog softmax with five per-level terms.
-      The target for row `j` is `catalog_sid_codes[targets[j]]`, five codes, and
-      the loss is the sum of five cross-entropies over 256, 256, 256, 256, 731.
-      Level 5 has 731 classes, so the last level stays cheap.
-- [ ] 4.2 Inputs. Append the five code tokens to the row after the last event, in
-      the same layout the events already use: temporal token, then five code
-      tokens. Teacher-forced during training, so one forward pass gives all five
-      losses.
-- [ ] 4.3 Inference. Trie-constrained beam, level by level, no teacher forcing.
-      Report the beam width with every number.
+The design is still direct SID input, user feature block carried, temporal tokens
+carried, same backbone, same content SID, same 1,719,430 train rows and 98,304 val
+rows. `tokens.npy`, `offsets.npy`, `targets.npy`, `LengthBucketBatchSampler`,
+mid-epoch checkpointing and `catalog_sid_codes.npy` are reused unchanged.
+
+- [ ] 4.1 Head. Two per-level cross-entropies over 8,192 classes each, replacing
+      DiGR's single 4,783,154-way softmax. `logits_l = h W_l` with `W_l` of shape
+      `[1024, 8192]`. The parameter count lands at 16.8M, which is exactly DiGR's
+      code-embedding table for this SID (16,384 rows of 1,024), so the two heads
+      cost the same and differ only in how the columns are used: DiGR adds them into
+      one item score, TIGER normalises each level separately. The loss for row `j`
+      is `CE(p1, c1[target_j]) + CE(p2, c2[target_j])`.
+- [ ] 4.2 Inputs. Append `SEP, c1, c2` after the last event, so the hidden state at
+      `SEP` predicts `c1` and the hidden state at `c1` predicts `c2`. Teacher-forced
+      during training, one forward pass gives both terms. Row length goes 89 to 92.
+- [ ] 4.3 Inference. No beam, no trie, no constrained decoding: gather the two
+      log-probability columns at each item's own codes and sort. That is exact over
+      the full catalogue, so all five cut-offs up to 10,000 are reportable and the
+      number is directly comparable with the DiGR row.
 - [ ] 4.4 Reuse, do not rebuild: the training loop, the sampler, atomic
       checkpointing, `--resume`, `--save_steps`, `--log_interval`, the CSV log and
-      the early-stop-on-val-loss logic all exist in `Model Training/train_digr.py`.
-      Estimate 600 to 800 lines in a new `Model Training/train_tiger.py`.
-- [ ] 4.5 Budget one epoch first. The target sequence is six tokens instead of
-      one, so expect 1.3x to 1.6x a DiGR epoch, roughly 2 to 2.5 h. Extend with
-      `--resume` only if the curve is still moving.
-- [ ] 4.6 Run all five cut-offs, write `R@1/10/100/1000/10000`, nDCG@10, MRR@10,
-      and the beam width into `docs/results.md`.
+      the val-loss early stop all exist in `Model Training/train_digr.py`. Estimate
+      400 to 600 lines in a new `Model Training/train_tiger.py`, less than the 600
+      to 800 the five-level plan needed because the beam and the trie are gone.
+- [ ] 4.5 Budget two epochs. 92 tokens against 89, and the head is cheaper than a
+      4.78M-row gather, so expect about a DiGR epoch, 63 minutes, not the 1.3x to
+      1.6x the per-level-token plan predicted.
+- [ ] 4.6 Run all five cut-offs and write `R@1/10/100/1000/10000`, nDCG@10 and
+      MRR@10 into `docs/results.md` beside the DiGR row. The bar it has to clear is
+      co-click window 20: R@10 3.7069% and R@100 10.9873%. DiGR's own row is
+      R@10 3.6570% and R@100 10.9182%, so the interesting question is whether
+      predicting the codes step by step orders the middle of the list better than
+      one additive score over the whole catalogue.
 
 ---
 
@@ -334,9 +356,11 @@ a fourth 1,024-wide level cannot collide at all. Its codebooks sit at 9.8544, 9.
 and 9.9085 bits of 10. Depth-1 bucket lift goes from 46.9x to 126.8x between the two
 SIDs, so S1 is now about how far that curve runs rather than whether it moves.
 
-- [ ] S0 **Instrument.** Depth occupancy, collision count and bucket lift at depths
+- [x] S0 **Instrument.** Depth occupancy, collision count and bucket lift at depths
       1 and 2, for any SID directory, against the same 98,304 val rows. Without
       this there is no denominator for S1, and the release cannot be compared.
+      `Plan 2/sid_diagnose.py`, 33 tests, and it is also what measured the 2 x 8,192
+      tie ceiling.
 - [x] S1 **Width sweep, three points done, one left.** 2 x 8,192 was cut as run
       `local/2026-27-10-2-rq`: 16,384 rows, 3.51 parameters per item, 584 items per
       level-0 code, both codebooks 8,192 of 8,192 active at 12.8110 and 12.7668 bits
@@ -399,17 +423,47 @@ SIDs, so S1 is now about how far that curve runs rather than whether it moves.
       (1.03x), and level on R@10 (0.99x). Epoch 3 overfits and adds nothing, so two
       epochs is the setting to reuse. Numbers and caveats: `docs/results.md`
       section 12.
-- [ ] S4b **Full-catalog evaluation of the S4 checkpoint** with
-      `eval_full_catalog.py` on `best/` over the same 98,304 rows, to fill in R@100,
-      R@1000 and R@10000 and make the row directly comparable with the frozen one.
-      Half an hour of GPU, and it is the last measurement missing from the table.
+- [x] S4b **Full-catalog evaluation of the S4 checkpoint** with
+      `eval_full_catalog.py` on `best/` over the same 98,304 rows and the same
+      4,783,154 items, 1.7 min of GPU. R@1 1.0549%, R@10 3.6570%, R@100 10.9182%,
+      R@1000 27.6622%, R@10000 55.7058%, nDCG@10 0.02190, MRR@10 0.01742, loss
+      11.0133. Ahead of the frozen row at every cut-off (1.33x, 1.41x, 1.45x, 1.28x,
+      1.12x). Ahead of co-click window 20 at ranks 1, 1,000 and 10,000 by 7.9, 16.5
+      and 55 standard errors, level at ranks 10 and 100 where the gaps are 49 and 68
+      rows. `P(top 10 | top 1000)` 13.22% against co-click's 14.65%. Table and
+      reading: `docs/results.md` section 12.
+      The first attempt at this used the frozen v1 `digr_data` against the v2
+      checkpoint and produced R@10 0.0437% with loss 26.3504, which is now refused
+      by `check_data_dir_matches_checkpoint()` in `eval_full_catalog.py` before any
+      scoring. Eight tests in `Model Training/test_eval_full_catalog.py`.
 - [ ] S5 **Baselines on the new data.** Popularity and co-click need no SID, so they
       are control rows and must reproduce to the digit, and the S3 build checked the
       val users, the catalogue and the val targets against the frozen split, so the
       published rows already apply. `sid_transition` is the one baseline that can
       move: it now reads 2-code tuples, which are far coarser than the 5-code ones it
-      was built on.
-- [ ] S6 **TIGER on the SID that S1 and S4 endorse**, once, then the three-arm table.
+      was built on. Minutes of CPU, and it belongs with the table rather than with
+      the experiments.
+- [x] S6 **TIGER on the SID that S1 and S4 endorse.** Promoted out of this list into
+      Phase 4, which now carries the design. Deferred no longer: it is the missing
+      row in the three-arm table and the only head that tests a different objective.
+- [ ] S7 **Attribution, deferred by decision.** The arm that separates the three
+      changes S4 made: same 2 x 8,192 codes, `--no-add_action --n_temporal_bins 64`,
+      two epochs, about 2h10m. If the ranking holds near 1.41x then the codebook did
+      all of it and the action token is optional; if it falls back toward the frozen
+      numbers then the stream carried part of the gain. Deferred behind TIGER
+      (m05706) because it explains an existing row rather than adding one, but it is
+      the first question anyone will ask about section 12, and it is cheap.
+- [ ] S8 **Reranker over DiGR's top 1,000, deferred.** CPU only. The ceiling is now
+      measured rather than assumed: the target sits in DiGR's top 1,000 on 27.66% of
+      val rows, so a perfect reranker reaches R@100 27.66% (2.5x the current 10.92%)
+      and R@10 27.66% (7.6x the current 3.66%). Features: co-click successors,
+      content cosine, popularity, recency, the SID prefix. It is the only remaining
+      idea that attacks the 13.22% conversion without touching the towers.
+- [ ] S9 **16,384 wide, deferred.** 292 items per level-0 code, inside the DiGR
+      paper's 39 to 195 band, 4.7x the item-side parameters of 8,192 and 98 MB bf16.
+      An hour for the quantiser and three for the model. Worth one run only after S7
+      says whether the last widening's slope is still steep; the step from 256 to
+      8,192 bought 41% at R@10, and the question is what the next 2x buys.
 
 ---
 
@@ -436,17 +490,21 @@ of them can be declared a success.
 
 ## Next step
 
-Phase 6, in order, and the first three steps are cheap.
+1. **Build TIGER on the 2 x 8,192 SID** (Phase 4). It is the missing row, and the
+   only experiment left that tests a different objective rather than a different
+   input. Four hundred lines, two epochs, about two hours, and no trie or beam
+   because two levels make the exact score a two-column gather.
+2. **S5, the control rows.** Minutes of CPU, so the table's baselines sit on the
+   same data as the model rows.
+3. **Phase 5, the table and the write-up.**
 
-1. S0, the instrument. Occupancy plus bucket lift in one script, so any SID can be
-   scored in minutes instead of an afternoon.
-2. S1, the width sweep. One GPU hour and half a day of CPU. It answers whether the
-   geometry is the binding constraint or the head is, and both answers are useful.
-3. S3, the event stream. The action token is the highest-value single change
-   available: 89.4% of events in a history are exposures and the model cannot tell
-   them from clicks.
+Deferred behind those, in the order they are worth doing. S7, attribution, 2h10m,
+because it explains the 1.41x rather than adding a row and it is the first thing a
+reader asks. S8, the reranker over the top 1,000, CPU, with a measured ceiling of
+27.66% at R@100 and 7.6x headroom at R@10. S9, the width run at 16,384, one GPU hour
+for the quantiser and three for the model, held back until S7 says whether the last
+widening's slope is still steep.
 
-Phase 3b waits behind S1, because if the width sweep confirms the geometry is
-saturated then 3b.0 is the only change that can move it. The frozen content SID
-stays untouched while Phase 6 is in flight, so the DiGR and baseline rows remain
-valid as the reference. `docs/plan_v2.md` states both predictions before the runs.
+Phase 3b stays where it is. Nothing in Phase 6 or Phase 4 changes the item
+representation, so the behaviour-SID question is untouched by any of the above and
+the frozen content SID remains the reference for the tables already published.

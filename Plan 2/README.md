@@ -276,8 +276,14 @@ Result, `runs/digr_v2_sid2x8192_e3_sampled300k`, 3h11m at 63.3 min per epoch:
 
 Epoch 2 is the checkpoint to use: best val loss, and epoch 3 only adds overfitting.
 Against the frozen 5-level run that is +31% R@1, +41% R@10, +38% nDCG@10 and +36%
-MRR@10 at 30% less compute per epoch. Cut-offs past 10 need `eval_full_catalog.py`
-on `best/`. Full table and caveats in `docs/results.md` section 12.
+MRR@10 at 30% less compute per epoch.
+
+Full-catalogue evaluation of `best/`, same 98,304 rows and all 4,783,154 items,
+1.7 min: R@1 1.0549%, R@10 3.6570%, R@100 10.9182%, R@1000 27.6622%, R@10000
+55.7058%, nDCG@10 0.02190, MRR@10 0.01742, loss 11.0133. That is 1.33x, 1.41x,
+1.45x, 1.28x and 1.12x the frozen run at the same cut-offs, and ahead of co-click
+window 20 at ranks 1, 1,000 and 10,000 while level at ranks 10 and 100. Full table
+and caveats in `docs/results.md` section 12.
 
 ## test_sid_diagnose.py
 

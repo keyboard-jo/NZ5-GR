@@ -18,7 +18,7 @@ recall coincide. `MRR` is truncated at rank 10 everywhere.
 | B4 co-click kNN, window 10, decay 0.5 | 4 s + 44 s CPU | 0.7985% | 3.6794% | 10.8531% | 24.8311% | 46.2148% | 0.02030 | 0.01529 |
 | **B4 co-click kNN, window 20, decay 0.5** | **4 s + 43 s CPU** | **0.8057%** | **3.7069%** | **10.9873%** | **25.3021%** | **46.8882%** | **0.02044** | **0.01539** |
 | DiGR 0.6B, 3 epochs, 300k sampled negatives | 4.6 GPU-h + 3.2 min eval | 0.7924% | 2.5940% | 7.5094% | 21.6003% | 49.7691% | 0.01570 | 0.01258 |
-| **DiGR 0.6B, SID v2 (2 x 8,192 + action token), 3 epochs** | **3.2 GPU-h** | **1.0400%** | **3.6600%** | - | - | - | **0.02170** | **0.01710** |
+| **DiGR 0.6B, SID v2 (2 x 8,192 + action token), 3 epochs** | **3.2 GPU-h + 1.7 min eval** | **1.0549%** | **3.6570%** | **10.9182%** | **27.6622%** | **55.7058%** | **0.02190** | **0.01742** |
 | HSTU tower (window 20, approximate actions) | 20 s GPU + 41 min I/O | 0.0458% | 0.4354% | 2.9063% | 13.5122% | - | 0.00201 | 0.00131 |
 | item-embedding kNN, mean of last 1 clicked | 9 min GPU | 0.0173% | 0.5636% | 2.4638% | 8.1807% | - | - | 0.00151 |
 | item-embedding kNN, mean of last 3 clicked | 9 min GPU | 0.0376% | 0.3560% | 2.2156% | 9.7646% | - | - | 0.00112 |
@@ -32,10 +32,10 @@ arm on the same codes.
 
 The SID v2 row is a second configuration, not a replacement. It uses a different
 codebook (2 x 8,192), a different event stream (action token, 128 gap bins) and a
-temperature rescaled so that `1/(L*tau)` is unchanged. Its cut-offs beyond 10 are
-missing because the trainer reports `EVAL_KS = (1, 5, 10)`. Section 12 has the
-per-epoch numbers and the comparison; `eval_full_catalog.py` on that checkpoint is
-the outstanding measurement.
+temperature rescaled so that `1/(L*tau)` is unchanged. It is scored on `best/`,
+epoch 2, because val loss turns up at epoch 3 while R@10 moves by 0.02 percentage
+points and nDCG falls. Section 12 has the per-epoch numbers, the full-catalogue
+table and what the gain can and cannot be attributed to.
 
 co-click (window 20) over DiGR: R@1 **1.02x**, R@10 **1.43x**, R@100 **1.46x**,
 R@1000 **1.17x**, R@10000 0.94x, nDCG@10 1.30x, MRR 1.22x.
@@ -46,6 +46,12 @@ R@1000 1.72x, R@10000 1.27x.
 DiGR over popularity: R@1 1.80x, R@10 1.93x, R@100 1.57x, R@1000 1.47x,
 R@10000 1.35x.
 DiGR over B3: R@1 32.4x, R@10 14.4x, R@100 8.0x.
+DiGR SID v2 over the frozen DiGR: R@1 1.33x, R@10 1.41x, R@100 1.45x,
+R@1000 1.28x, R@10000 1.12x, nDCG@10 1.39x, MRR 1.38x.
+DiGR SID v2 over co-click (window 20): R@1 1.31x, R@10 0.99x, R@100 0.99x,
+R@1000 1.09x, R@10000 1.19x, nDCG@10 1.07x, MRR 1.13x.
+DiGR SID v2 over popularity: R@1 2.40x, R@10 2.72x, R@100 2.28x, R@1000 1.88x,
+R@10000 1.51x.
 
 Compute ratio DiGR : co-click = 4.6 GPU-h : 4 s = about **4,100x**.
 
@@ -183,6 +189,10 @@ beam 100 is the headline metric.
 
 ## 7. Open items
 
+- The reranker ceiling is now measured: DiGR's top 1,000 contains the target on
+  27.66% of val rows, so a reranker over that list caps out at 27.66% R@100 (2.5x
+  the model's own 10.92%) and 27.66% R@10 (7.6x its 3.66%). A cheap test of whether
+  the ordering can be repaired at all.
 - B3 at the wide cut-offs, only if the negative result is going into the report.
 - Check whether train and val share users (`users.npy` in both splits). If they
   do, both methods benefit but co-click benefits more directly from exact pair
@@ -430,9 +440,9 @@ was built and trained, and section 12 has the result.
 
 ## 12. SID v2 and the action token: the model now leads the heuristic
 
-The first configuration in which DiGR is not behind co-click on the headline
-ranking measures. Three things changed at once, which is stated up front because it
-limits what the gain can be attributed to.
+The first configuration in which DiGR is ahead of co-click at rank 1 and beyond
+rank 100, and level with it at ranks 10 and 100. Three things changed at once,
+which is stated up front because it limits what the gain can be attributed to.
 
 Everything else is held fixed against the frozen row: Qwen3-0.6B, full fine-tune,
 batch 512, three epochs, sampled softmax over 300,000 negatives, the same 1,719,430
@@ -473,18 +483,63 @@ GPU-hours for three epochs against 4.6, at 41.5k tokens per second against 41.9k
 Sequences are 89 tokens instead of 132, so there is 31% less work per epoch even
 though every epoch sees the same 1,719,430 rows.
 
+### The full-catalogue run
+
+`eval_full_catalog.py` over the same 4,783,154 items and the same 98,304 rows, on
+`best/`. Its loss reproduces the training log to four decimals, 11.0133 both ways,
+so the evaluator and the trainer agree about the same checkpoint.
+
+| k | SID v2 | frozen v1 | v2 / v1 | co-click w20 | v2 / co-click | popularity | v2 / popularity |
+|---|---|---|---|---|---|---|---|
+| 1 | 1.0549% | 0.7924% | 1.33x | 0.8057% | 1.31x | 0.4395% | 2.40x |
+| 10 | 3.6570% | 2.5940% | 1.41x | 3.7069% | 0.99x | 1.3438% | 2.72x |
+| 100 | 10.9182% | 7.5094% | 1.45x | 10.9873% | 0.99x | 4.7862% | 2.28x |
+| 1,000 | 27.6622% | 21.6003% | 1.28x | 25.3021% | 1.09x | 14.7288% | 1.88x |
+| 10,000 | 55.7058% | 49.7691% | 1.12x | 46.8882% | 1.19x | 36.8215% | 1.51x |
+
+nDCG@10 0.02190 against 0.01570 for the frozen run and 0.02044 for co-click,
+MRR@10 0.01742 against 0.01258 and 0.01539, and the loss sits 4.367 nats under
+`ln K = 15.381` where the frozen run sits 4.138 under it.
+
+Four things follow.
+
+The improvement is not uniform across the ranking, and its shape is the useful
+part. It is largest at rank 100 (1.45x), then rank 10 (1.41x), then rank 1 (1.33x),
+and it drops to 1.28x at 1,000 and 1.12x at 10,000. A finer partition helps most
+where a single level-0 code was previously deciding the order. At 10,000 the old
+model already caught 49.77% of targets, so there is less left for a sharper
+partition to reclaim.
+
+Where DiGR stands against the heuristic is now arithmetic rather than opinion. The
+gaps at rank 1, 1,000 and 10,000 are 7.9, 16.5 and 55 standard errors of a binomial
+proportion over 98,304 rows. The gaps at rank 10 and rank 100 are 0.05 and 0.07
+percentage points, 49 and 68 rows, both under one standard error. So the model
+leads at 1, 1,000 and 10,000, and ranks 10 and 100 are ties.
+
+Section 5's asymmetry has shrunk but has not gone. Given that the target is inside
+the top 1,000, DiGR reaches it in the top 10 13.22% of the time, against 12.01%
+before and 14.65% for co-click. The wider net now catches more targets than
+co-click's does, the first guess is the best of either method, and the ordering
+through the middle of the list is still the weakest part of the model.
+
+The reranker question now has a number. A target is inside DiGR's top 1,000 on
+27.66% of rows, so a reranker over that list cannot push R@100 past 27.66%, which
+is 2.5x the current 10.92%, and cannot push R@10 past 27.66%, which is 7.6x the
+current 3.66%. That is the ceiling for any reranker on this list, and the other
+72.3% of targets it never sees.
+
 What this supports: the paper's own argument, that items per code is the quantity
 that sets reachable accuracy and that the additive mean-pooled head is not the
 bottleneck. The item side went from 0.376 to 3.51 parameters per item and depth-1
-bucket lift went from 46.9x to 126.8x, and the ranking improved by roughly 40%
-relative on every measure the log reports.
+bucket lift went from 46.9x to 126.8x, and the ranking improved by 33 to 45 percent
+relative from rank 1 to rank 100, 28 percent at rank 1,000 and 12 percent at rank
+10,000.
 
 What it does not support, and what is missing:
 
-1. No cut-off beyond 10. The frozen row's R@100 through R@10,000 came from
-   `eval_full_catalog.py`. Until that runs on `runs/digr_v2_sid2x8192_e3_sampled300k/best`
-   the long tail is unknown, so the conversion-rate argument (how often a top-1,000
-   hit reaches the top 10) cannot be repeated for this configuration.
+1. The middle of the list. Ranks 10 and 100 are still ties with co-click, and
+   P(top 10 given top 1,000) is 13.22% against 14.65%. Section 5's asymmetry has
+   shrunk, not disappeared.
 2. No attribution. Three axes moved together. The width evidence is independent
    (`Plan 2/sid_diagnose.py` measured the partition, not the model), but the action
    token and the 128 gap bins are credited on faith. The cheap arm is the event

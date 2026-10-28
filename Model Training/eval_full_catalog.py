@@ -55,14 +55,20 @@ REF_POPULARITY_R1 = 0.00439453125          # 0.4395%
 REF_POPULARITY_R10 = 1321 / 98304          # 0.0134379069, i.e. 1.3438%
 # co-click kNN at --history_window 20, the strongest form measured. The sweep
 # 5 -> 10 -> 20 kept rising and window 20 also wins rank 1, so this is the bar.
+REF_COCLICK_WINDOW = 20
 REF_COCLICK = {1: 0.008057, 10: 0.037069, 100: 0.109873,
                1000: 0.253021, 10000: 0.468882}
 REF_COCLICK_R10 = REF_COCLICK[10]
 REF_POPULARITY = {1: 0.00439453125, 10: 1321 / 98304, 100: 0.047862,
                   1000: 0.147288, 10000: 0.368215}
-REF_SUBSET_R1 = 0.0083                     # 0.83%, clicked run over 504,404
-REF_SUBSET_R10 = 0.0327                    # 3.27%, clicked run over 504,404
-REF_SUBSET_LOSS = 9.7457
+# The frozen SID v1 run (`digr_0p6b_e3_full_sampled300k/final`), same 98,304 val
+# rows, same catalogue, same metric code. This is the row a new configuration has
+# to beat, and unlike the 504,404-label subset numbers below it IS comparable.
+REF_FROZEN_V1 = {1: 0.007924, 10: 0.025940, 100: 0.075094,
+                 1000: 0.216003, 10000: 0.497691}
+# Retired: an earlier run scored on a 504,404-label subset. Kept only so a reader
+# who saw the number in a log can identify it as different.
+
 
 
 def build_logger() -> logging.Logger:
@@ -283,7 +289,8 @@ def main() -> int:
                     f"{rec / uni:7.1f}x uniform")
     logger.info(f"  MRR@{T.MRR_K:<5d}{m['mrr']:.5f}")
     logger.info("-" * 78)
-    logger.info("  DiGR / co-click(window 5) / popularity, same rows and cut-offs:")
+    logger.info(f"  DiGR / co-click(window {REF_COCLICK_WINDOW}) / popularity, "
+                "same rows and cut-offs:")
     logger.info(f"    {'k':>6}  {'DiGR':>9}  {'co-click':>9}  {'pop':>9}  "
                 f"{'vs co-click':>11}")
     for k in ks:
@@ -296,18 +303,18 @@ def main() -> int:
             + (f"{100 * pop:8.4f}%  " if pop else f"{'':>9}  ")
             + (f"{rec / cc:10.2f}x" if cc else "")
         )
-    logger.info(f"    frozen v1 run on its 504,404-label subset  "
-                f"R@1 {100 * REF_SUBSET_R1:.4f}%  R@10 {100 * REF_SUBSET_R10:.4f}%  "
-                f"loss {REF_SUBSET_LOSS:.4f}  (NOT comparable, and it is a "
-                "different run's training log) ")
+    logger.info("  vs the frozen SID v1 run (final), same rows and cut-offs:")
+    logger.info("    " + "  ".join(
+        f"R@{k} {m[f'recall@{k}'] / REF_FROZEN_V1[k]:.2f}x"
+        for k in ks if REF_FROZEN_V1.get(k)))
     logger.info("-" * 78)
     lift1 = m["recall@1"] / REF_POPULARITY_R1
     lift10 = m["recall@10"] / REF_POPULARITY_R10
     beats = [k for k in ks if REF_COCLICK.get(k) and m[f"recall@{k}"] > REF_COCLICK[k]]
     loses = [k for k in ks if REF_COCLICK.get(k) and m[f"recall@{k}"] <= REF_COCLICK[k]]
     logger.info(f"  lift over popularity: R@1 {lift1:.2f}x  R@10 {lift10:.2f}x")
-    logger.info(f"  beats co-click(window 5) at k={beats or 'none'}; "
-                f"loses at k={loses or 'none'}")
+    logger.info(f"  beats co-click(window {REF_COCLICK_WINDOW}) at "
+                f"k={beats or 'none'}; loses at k={loses or 'none'}")
     logger.info(f"  best band: "
                 + ", ".join(
                     f"R@{k} {m[f'recall@{k}'] / REF_COCLICK[k]:.2f}x"

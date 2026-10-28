@@ -84,14 +84,16 @@ If the target is already inside the top 1,000, how often does it reach the top 1
 | method | R@10 given the target is in the top 1,000 |
 |---|---|
 | co-click, window 20 | 14.65% |
-| DiGR 0.6B | 12.01% |
+| DiGR 0.6B, SID v2 (2 x 8,192 + action token) | 13.22% |
+| DiGR 0.6B, SID v1 (4 x 256 + collision level) | 12.01% |
 | popularity | 9.12% |
 | SID depth-1 bucket + cosine | 7.45% |
 | item-embedding kNN | 6.89% |
 
 Four point six GPU-hours of a 0.6B language model moved that number from 9.12% to
-12.01%. That is the whole return, and it is what sent the project looking for a
-different cause.
+12.01%, and a sharper partition over the same vectors moved it to 13.22%. That is
+the whole return so far, and it is what sent the project looking for a different
+cause.
 
 The cause is not the encoder, the sequence length, the number of epochs or the loss.
 The score is `z = V h / tau` with `v_i` a mean over the item's five shared code
@@ -109,19 +111,28 @@ except through a row that thousands of other items also use. The paper's own
 catalogues sit at 39 to 195 items per level-0 code, 96 to 479 times finer, so its
 reported accuracy is not reachable from here without changing the resolution.
 
+Raising it works, which is the part that was only argued before. The same 256-d
+vectors cut at 2 x 8,192 give 16,386 rows, 3.51 parameters per item and 584 items
+per level-0 code, and the ordering improved by 33 to 45 percent relative through
+rank 100 with everything else held fixed. That is what a resolution fix looks like
+when it lands: not a better score for the same items, but fewer items sharing a row.
+
 The count table has the opposite shape. 25,669,281 distinct pairs, 5.37 successors
 per item. Its top 10 for a query is roughly those 5.37 known next items plus
 popularity padding, and that beats the model. The model sees the same pairs during
 training and cannot store one of them.
 
-So the ceiling is set by the resolution of the score, which is a setting rather than a
-property, and it has already been measured once. Holding everything else fixed and
-quantising the same 256-d vectors at 3 x 1,024 instead of 4 x 256 plus a collision
-suffix moved depth-1 bucket lift from 46.9x to 126.8x, so the partition became 2.7x
-more label-pure. That also falsified the earlier prediction in `docs/plan_v2.md` that
-width could only help capacity. The next point on that curve has a known arithmetic
-answer: 16,384 wide puts level 0 at 292 items per code, which is where the paper
-sits.
+So the ceiling is set by the resolution of the score, which is a setting rather than
+a property, and it has been raised twice. Quantising the same vectors at 3 x 1,024
+instead of 4 x 256 plus a collision suffix moved depth-1 bucket lift from 46.9x to
+126.8x, so the partition became 2.7x more label-pure. That also falsified the
+earlier prediction in `docs/plan_v2.md` that width could only help capacity. Cutting
+at 2 x 8,192 and training on the result moved the ranking itself: R@1 1.0549%
+against 0.7924%, R@10 3.6570% against 2.5940%, R@100 10.9182% against 7.5094%,
+R@1000 27.6622% against 21.6003%. Each raise costs a GPU hour for the quantiser and
+three for the model. The paper sits at 39 to 195 items per level-0 code, and 16,384
+wide puts level 0 at 292, so what is left to learn is whether that slope flattens,
+not whether it exists.
 
 ---
 

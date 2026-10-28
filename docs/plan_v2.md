@@ -346,9 +346,11 @@ three epochs at batch 512.
   11.0133 against 11.2431 frozen, R@1 1.0400% against 0.7924%, R@10 3.6600% against
   2.5940%, nDCG@10 0.02170 against 0.01570, MRR@10 0.01710 against 0.01258. Against
   co-click window 20 that is ahead on R@1, nDCG, MRR and the combined score, and
-  level on R@10. Epoch 3 overfits, so two epochs is the setting. Cut-offs beyond 10
-  are still unmeasured: `eval_full_catalog.py` on the checkpoint is the open item.
-  Full numbers and caveats in `docs/results.md` section 12.
+  level on R@10. Epoch 3 overfits, so two epochs is the setting. The full-catalogue
+  run fills in the tail: R@100 10.9182%, R@1000 27.6622%, R@10000 55.7058%, against
+  7.5094%, 21.6003% and 49.7691% frozen, so the gain is 1.45x at rank 100 and fades
+  to 1.12x at 10,000. Ahead of co-click window 20 at ranks 1, 1,000 and 10,000, level
+  at ranks 10 and 100. Full numbers and caveats in `docs/results.md` section 12.
 - **S5, baselines on the new data (CPU, minutes).** Popularity and co-click need no
   SID at all, so they are control rows and must reproduce exactly. `sid_transition`
   needs the new codes and is the one baseline that can move.
