@@ -335,11 +335,20 @@ three epochs at batch 512.
 - **S3, event stream (CPU, one preprocess pass).** Action token, gap bins 64 to 128,
   two code levels, hour and weekday as an opt-in flag so they can be ablated without
   a code change. The default build is 4 tokens per event and 153.5M train tokens;
-  with the flag on it is 5 and 187.5M. Rebuild `digr_data` and record the token count
-  and the manifest counts.
+  with the flag on it is 5 and 187.5M. **Built**: `Plan 2/preprocess_digr_v2.py`,
+  877.6 s, 1,719,430 train rows and 98,304 val rows, 153,461,256 and 8,808,890
+  tokens, vocabulary 16,662, event width 4, and the split check confirmed the same
+  98,304 val users and the same targets as the frozen build.
 - **S4, DiGR on the new data (GPU 4.5-5.5h).** Same frozen config, same 300k
   negatives, same three epochs, same evaluator. Two axes moved together here on
   purpose, because S1 and S3 both gate on the same run being worth doing.
+  **Run**, 3h11m at 63.3 min per epoch. Epoch 2 is the best checkpoint: val loss
+  11.0133 against 11.2431 frozen, R@1 1.0400% against 0.7924%, R@10 3.6600% against
+  2.5940%, nDCG@10 0.02170 against 0.01570, MRR@10 0.01710 against 0.01258. Against
+  co-click window 20 that is ahead on R@1, nDCG, MRR and the combined score, and
+  level on R@10. Epoch 3 overfits, so two epochs is the setting. Cut-offs beyond 10
+  are still unmeasured: `eval_full_catalog.py` on the checkpoint is the open item.
+  Full numbers and caveats in `docs/results.md` section 12.
 - **S5, baselines on the new data (CPU, minutes).** Popularity and co-click need no
   SID at all, so they are control rows and must reproduce exactly. `sid_transition`
   needs the new codes and is the one baseline that can move.

@@ -364,7 +364,7 @@ SIDs, so S1 is now about how far that curve runs rather than whether it moves.
       is dead twice over and the first draft of Correction 2 was wrong. The width axis
       closes at 2 x 8,192 by decision rather than by saturation, so
       `docs/embedding_weakness.md` section 9 is rewritten around items per code.
-- [ ] S3 **Event stream, one preprocess pass.** Action token (exposure, click,
+- [x] S3 **Event stream, one preprocess pass.** Action token (exposure, click,
       unknown), gap bins 64 to 128, two code levels, hour and weekday behind a flag
       so they can be ablated. Default build is 4 tokens per event and 153.5M train
       tokens, against 221.5M today; with the flag on it is 5 and 187.5M. No session
@@ -378,7 +378,10 @@ SIDs, so S1 is now about how far that curve runs rather than whether it moves.
       users in seconds before the tokeniser starts, then the val users, the
       catalogue and the val targets after the pass. That decision is mandatory, so
       a run must either reproduce an archived split or pass `--allow_new_split`. 14 tests in `Plan 2/test_preprocess_digr_v2.py`.
-- [ ] S4 **DiGR on the new data.** `Plan 2/train_digr_v2.sh`, frozen config, 300k
+      **Built** in 877.6 s: 1,719,430 train rows, 98,304 val rows, 153,461,256 and
+      8,808,890 tokens, vocabulary 16,662, event width 4, and the split check
+      reproduced the frozen val users and targets exactly.
+- [x] S4 **DiGR on the new data.** `Plan 2/train_digr_v2.sh`, frozen config, 300k
       negatives, three epochs, same evaluator, about 3h10m because the stream is
       153,461,256 tokens against 221,500,536. Two axes move together on purpose.
       One flag is not the frozen value: `--temperature 0.175` instead of 0.07,
@@ -387,9 +390,25 @@ SIDs, so S1 is now about how far that curve runs rather than whether it moves.
       with the data. Holding `1/(L*T)` at 2.857 keeps the score scale where the
       frozen run tuned it, leaving the SID and the stream as the only changes.
       Smoke it first with `--max_steps 30 --run_name smoke_v2`.
+      **Run and finished** (`runs/digr_v2_sid2x8192_e3_sampled300k`, 3h11m, 63.3 min
+      per epoch at 41.5k tok/s). Epoch 2 is the best checkpoint: val loss 11.0133
+      against the frozen 11.2431, R@1 1.0400% against 0.7924%, R@10 3.6600% against
+      2.5940%, nDCG@10 0.02170 against 0.01570, MRR@10 0.01710 against 0.01258,
+      combined 0.31*HR + 0.69*NDCG 0.0263 against 0.0189. Against co-click window 20
+      it is ahead on R@1 (1.29x), nDCG (1.06x), MRR (1.11x) and the combined score
+      (1.03x), and level on R@10 (0.99x). Epoch 3 overfits and adds nothing, so two
+      epochs is the setting to reuse. Numbers and caveats: `docs/results.md`
+      section 12.
+- [ ] S4b **Full-catalog evaluation of the S4 checkpoint** with
+      `eval_full_catalog.py` on `best/` over the same 98,304 rows, to fill in R@100,
+      R@1000 and R@10000 and make the row directly comparable with the frozen one.
+      Half an hour of GPU, and it is the last measurement missing from the table.
 - [ ] S5 **Baselines on the new data.** Popularity and co-click need no SID, so they
-      are control rows and must reproduce to the digit. `sid_transition` is the one
-      baseline that can move.
+      are control rows and must reproduce to the digit, and the S3 build checked the
+      val users, the catalogue and the val targets against the frozen split, so the
+      published rows already apply. `sid_transition` is the one baseline that can
+      move: it now reads 2-code tuples, which are far coarser than the 5-code ones it
+      was built on.
 - [ ] S6 **TIGER on the SID that S1 and S4 endorse**, once, then the three-arm table.
 
 ---

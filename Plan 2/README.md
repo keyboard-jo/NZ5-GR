@@ -263,7 +263,21 @@ the command line, so the smoke test needs no edit:
 score is `1/(L * temperature)` and `L` falls from 5 to 2, so leaving 0.07 would
 multiply every logit by 2.5 for no reason connected to the data. Holding `1/(L*T)`
 at 2.857 keeps the score scale identical, which leaves the SID and the event
-stream as the only two things that changed.
+stream as the only two things that changed. The trainer now derives that default
+from the level count, so the flag documents intent rather than carrying the value.
+
+Result, `runs/digr_v2_sid2x8192_e3_sampled300k`, 3h11m at 63.3 min per epoch:
+
+| epoch | val loss | R@1 | R@10 | nDCG@10 | MRR@10 |
+|---|---|---|---|---|---|
+| 1 | 11.3101 | 0.6700% | 2.8200% | 0.01580 | 0.01210 |
+| 2 | 11.0133 | 1.0400% | 3.6600% | 0.02170 | 0.01710 |
+| 3 | 11.1558 | 0.9900% | 3.6800% | 0.02150 | 0.01690 |
+
+Epoch 2 is the checkpoint to use: best val loss, and epoch 3 only adds overfitting.
+Against the frozen 5-level run that is +31% R@1, +41% R@10, +38% nDCG@10 and +36%
+MRR@10 at 30% less compute per epoch. Cut-offs past 10 need `eval_full_catalog.py`
+on `best/`. Full table and caveats in `docs/results.md` section 12.
 
 ## test_sid_diagnose.py
 

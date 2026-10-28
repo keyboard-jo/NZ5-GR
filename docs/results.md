@@ -18,6 +18,7 @@ recall coincide. `MRR` is truncated at rank 10 everywhere.
 | B4 co-click kNN, window 10, decay 0.5 | 4 s + 44 s CPU | 0.7985% | 3.6794% | 10.8531% | 24.8311% | 46.2148% | 0.02030 | 0.01529 |
 | **B4 co-click kNN, window 20, decay 0.5** | **4 s + 43 s CPU** | **0.8057%** | **3.7069%** | **10.9873%** | **25.3021%** | **46.8882%** | **0.02044** | **0.01539** |
 | DiGR 0.6B, 3 epochs, 300k sampled negatives | 4.6 GPU-h + 3.2 min eval | 0.7924% | 2.5940% | 7.5094% | 21.6003% | 49.7691% | 0.01570 | 0.01258 |
+| **DiGR 0.6B, SID v2 (2 x 8,192 + action token), 3 epochs** | **3.2 GPU-h** | **1.0400%** | **3.6600%** | - | - | - | **0.02170** | **0.01710** |
 | HSTU tower (window 20, approximate actions) | 20 s GPU + 41 min I/O | 0.0458% | 0.4354% | 2.9063% | 13.5122% | - | 0.00201 | 0.00131 |
 | item-embedding kNN, mean of last 1 clicked | 9 min GPU | 0.0173% | 0.5636% | 2.4638% | 8.1807% | - | - | 0.00151 |
 | item-embedding kNN, mean of last 3 clicked | 9 min GPU | 0.0376% | 0.3560% | 2.2156% | 9.7646% | - | - | 0.00112 |
@@ -26,7 +27,15 @@ recall coincide. `MRR` is truncated at rank 10 everywhere.
 DiGR is frozen at `digr_0p6b_e3_full_sampled300k/final`. Epoch 2 wrote a lower
 val loss (11.2342 against 11.2431) but epoch 3 ranks better at every cut-off, so
 `final` is the checkpoint behind the row above and no further DiGR runs are
-planned.
+planned on that SID. It stays the reference row for TIGER, which is a comparison
+arm on the same codes.
+
+The SID v2 row is a second configuration, not a replacement. It uses a different
+codebook (2 x 8,192), a different event stream (action token, 128 gap bins) and a
+temperature rescaled so that `1/(L*tau)` is unchanged. Its cut-offs beyond 10 are
+missing because the trainer reports `EVAL_KS = (1, 5, 10)`. Section 12 has the
+per-epoch numbers and the comparison; `eval_full_catalog.py` on that checkpoint is
+the outstanding measurement.
 
 co-click (window 20) over DiGR: R@1 **1.02x**, R@10 **1.43x**, R@100 **1.46x**,
 R@1000 **1.17x**, R@10000 0.94x, nDCG@10 1.30x, MRR 1.22x.
@@ -343,6 +352,7 @@ score on our full-catalog space:
 
 | method | HR@10 | NDCG@10 | 0.31*HR + 0.69*NDCG |
 |---|---|---|---|
+| DiGR, SID v2 (2 x 8,192 + action) | 3.6600% | 2.1700% | 0.0263 |
 | co-click, window 20 | 3.7069% | 2.0440% | 0.0256 |
 | co-click, window 5 | 3.6011% | 1.9890% | 0.0249 |
 | DiGR | 2.5940% | 1.5700% | 0.0189 |
@@ -411,7 +421,81 @@ leaves room for the per-event action and gap tokens.
 What this points at is items per code, which is the number that has to match the
 DiGR paper for its accuracy to be reachable. The paper's own catalogues sit at 39 to
 195 items per level-0 code. Ours started at 18,684, and 3 x 1,024 only takes that to
-4,671. Two codebooks of 16,384 take it to 292, which is the regime the paper was
-evaluated in and the configuration OnePiece ran on this data, so that is the next SID
-rather than another 1,024-wide variant.
+4,671. Two codebooks of 8,192 take it to 584, which is the closest reachable point to
+OnePiece's configuration on this data at a bit depth that still keeps collisions
+rare (26 bits, 67,108,864 possible tuples for 4,783,154 items). That is the SID that
+was built and trained, and section 12 has the result.
 
+---
+
+## 12. SID v2 and the action token: the model now leads the heuristic
+
+The first configuration in which DiGR is not behind co-click on the headline
+ranking measures. Three things changed at once, which is stated up front because it
+limits what the gain can be attributed to.
+
+Everything else is held fixed against the frozen row: Qwen3-0.6B, full fine-tune,
+batch 512, three epochs, sampled softmax over 300,000 negatives, the same 1,719,430
+train rows, the same 98,304 val rows, the same 4,783,154-item catalogue, the same
+targets, the same full-catalog evaluator.
+
+| axis | frozen | SID v2 |
+|---|---|---|
+| codebook | 4 x 256 + 731 collision level | 2 x 8,192 |
+| SID depth | 5 | 2 |
+| items per level-0 code | 18,684 | 584 |
+| head rows / parameters | 1,755 / 1.80M | 16,386 / 16.78M |
+| parameters per item | 0.376 | 3.51 |
+| event slot | gap + 5 codes = 6 tokens | gap + action + 2 codes = 4 tokens |
+| gap bins | 64 | 128 |
+| action token | none | exposure / click / unknown |
+| vocab | 67,358 (with the profile block) | 16,662 |
+| train tokens per epoch | 221,500,536 | 153,461,256 |
+| temperature | 0.07 | 0.175, so `1/(L*tau)` is 2.857 both ways |
+
+Per-epoch val metrics, from the training log. That log prints raw fractions, so
+`0.0366` is 3.66 percent, the same convention the frozen run printed.
+
+| epoch | val loss | R@1 | R@5 | R@10 | nDCG@10 | MRR@10 | train tail loss |
+|---|---|---|---|---|---|---|---|
+| 1 | 11.3101 | 0.6700% | 1.8700% | 2.8200% | 0.01580 | 0.01210 | 11.3977 |
+| 2 | **11.0133** | **1.0400%** | **2.6000%** | 3.6600% | **0.02170** | **0.01710** | 10.7791 |
+| 3 | 11.1558 | 0.9900% | 2.5900% | **3.6800%** | 0.02150 | 0.01690 | 10.0828 |
+
+Against the frozen 5-level row, at epoch 2: R@1 1.31x, R@10 1.41x, nDCG@10 1.38x,
+MRR@10 1.36x, combined score 0.0263 against 0.0189 (1.39x). Against co-click window
+20: R@1 1.29x, R@10 0.99x, nDCG@10 1.06x, MRR@10 1.11x, combined score 0.0263
+against 0.0256 (1.03x). So the model is ahead on three of the four ranking
+measures, level on R@10, and ahead on the combined score for the first time.
+
+Cost fell as well. 63.3 minutes per epoch against about 91 for the frozen run, 3.2
+GPU-hours for three epochs against 4.6, at 41.5k tokens per second against 41.9k.
+Sequences are 89 tokens instead of 132, so there is 31% less work per epoch even
+though every epoch sees the same 1,719,430 rows.
+
+What this supports: the paper's own argument, that items per code is the quantity
+that sets reachable accuracy and that the additive mean-pooled head is not the
+bottleneck. The item side went from 0.376 to 3.51 parameters per item and depth-1
+bucket lift went from 46.9x to 126.8x, and the ranking improved by roughly 40%
+relative on every measure the log reports.
+
+What it does not support, and what is missing:
+
+1. No cut-off beyond 10. The frozen row's R@100 through R@10,000 came from
+   `eval_full_catalog.py`. Until that runs on `runs/digr_v2_sid2x8192_e3_sampled300k/best`
+   the long tail is unknown, so the conversion-rate argument (how often a top-1,000
+   hit reaches the top 10) cannot be repeated for this configuration.
+2. No attribution. Three axes moved together. The width evidence is independent
+   (`Plan 2/sid_diagnose.py` measured the partition, not the model), but the action
+   token and the 128 gap bins are credited on faith. The cheap arm is the event
+   stream alone on the same codes: re-preprocess without the action token at 64 gap
+   bins, two epochs, about 2h10m.
+3. One run, no seed. The R@10 gap to co-click is 0.05 percentage points, which is
+   about 45 rows out of 98,304, so R@10 should be read as a tie. R@1 and MRR are
+   outside that band.
+4. co-click window 20 was selected on this val split, so its number is mildly
+   optimistic while DiGR's is a single configuration. That cuts against co-click,
+   not for it.
+5. Epoch 3 is wasted. Train loss keeps falling (11.40, 10.78, 10.08) while val loss
+   turns up after epoch 2, and R@10 moves by 0.02 percentage points. Two epochs is
+   both cheaper and better, and `best/` is the checkpoint to quote.
