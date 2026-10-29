@@ -98,6 +98,46 @@ DiGR is 2.4x on `nDCG@N_r` and 2.7x on `MRR@10`, so the count baseline is furthe
 than its recall alone already showed.
 
 
+### The short cut-offs, for reference only
+
+People ask for these, so here they are in a separate table. They are **not** comparable, for
+the reasons under the table.
+
+| arm | R@1 | R@5 | R@10 | MRR@10 | source |
+| --- | --- | --- | --- | --- | --- |
+| **TIGER prefix, beam 20** † | **2.0406%** | **6.0964%** | **8.8969%** | **0.03803** | dumps |
+| DiGR v2 | 1.0549% | 2.6245% | 3.6570% | 0.01742 | dumps |
+| coclick h20 | 0.8057% | 2.4882% | 3.7069% | 0.01539 | dumps |
+| coclick h10 | 0.7985% | 2.4780% | 3.6794% | 0.01529 | dumps |
+| coclick h5 | 0.7853% | 2.4241% | 3.6011% | 0.01499 | dumps |
+| popularity | 0.4395% | 0.9074% | 1.3438% | 0.00648 | dumps |
+| TIGER prefix-free v2 | 1.4400% | — | 2.4500% | 0.01700 | archive |
+| DiGR v1 (4x256 + 731) | 0.7924% | — | 2.5940% | 0.01258 | archive |
+| item-embedding kNN, last 1 | 0.0173% | — | 0.5636% | 0.00151 | archive |
+| HSTU tower probe | 0.0458% | — | 0.4354% | 0.00131 | archive |
+| B3 SID transition | 0.0244% | — | 0.1801% | 0.00060 | archive |
+
+Two things are wrong with a short cut-off across these rows, and the table is here to be read
+with both in mind.
+
+**TIGER's columns are on the wrong axis** (†, same marker as above). Its `R@10` is the share
+of rows where the target sat in the first ten **tuples**, and ten tuples hold about 96 items.
+So its apparent 2.4x over DiGR at `R@10` is a 96-item list against a 10-item list, which is
+exactly the artefact the main table refuses to print. Measured honestly it has no `R@10` at
+all, only an `R@~96`.
+
+**A beam cannot return fewer than 192 items.** Its short cut-offs are not the same decision
+problem as a top-10 over 4.78M, because the list it draws its top 10 from was already 192
+long. Reading the column as each arm's own top-10 is the only correct reading. It is not a
+ranking of the arms, and the archive rows make the point by themselves: prefix-free TIGER has
+the best `R@1` of any full-catalogue arm (1.4400% against DiGR's 1.0549%) and the worst
+`R@10` of the three main candidates (2.4500%).
+
+The `—` cells were never recorded, not withheld. The archive tables kept `R@1`, `R@10` and
+`MRR` only; `R@5` existed for the TIGER rows because `rank_metrics` returns it, and DiGR v2's
+`R@5` was in the training log to two significant figures (2.6000%) until it was recomputed
+exactly from the dumps above (2.6245%).
+
 ## 1.4 The crossover
 
 Reach per item named is not a constant, so the ranking inverts with the budget:
