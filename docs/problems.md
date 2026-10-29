@@ -278,8 +278,9 @@ on one additive surface. What is left of the paper's design is the
 prefix-conditioned arm, where level 2 is read from a state that contains code 1, so
 the pair score stops being a sum of two independent terms. That arm needs a beam,
 its cut-offs are capped at the beam width, and its ceiling is the level-0 coverage
-of the checkpoint we already have, `cover@k`, which `evaluate_tiger` computes and
-the log does not print.
+of the checkpoint we already have, `cover@k`, which the training log prints and the
+beam pass measures (`docs/results.md` section 14: 43.31% at beam 20, of which
+12.58% of rows are reached end to end).
 
 ---
 

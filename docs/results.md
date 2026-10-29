@@ -20,18 +20,24 @@ recall coincide. `MRR` is truncated at rank 10 everywhere.
 | DiGR 0.6B, 3 epochs, 300k sampled negatives | 4.6 GPU-h + 3.2 min eval | 0.7924% | 2.5940% | 7.5094% | 21.6003% | 49.7691% | 0.01570 | 0.01258 |
 | **DiGR 0.6B, SID v2 (2 x 8,192 + action token), 3 epochs** | **3.2 GPU-h + 1.7 min eval** | 1.0549% | 3.6570% | 10.9182% | 27.6622% | 55.7058% | 0.02190 | 0.01742 |
 | TIGER 0.6B, SID v2 (2 x 8,192), 3 epochs, prefix-free | 3.2 GPU-h + 2.5 min eval | **1.4400%** | 2.4500% | 6.5900% | 20.0800% | 45.7600% | 0.01870 | 0.01700 |
-| TIGER 0.6B, SID v2 (2 x 8,192), 2 epochs, **prefix-conditioned** (`PREFIX=1`), section 14 | 2.1 GPU-h | - | - | - | - | - | - | - |
+| TIGER 0.6B, SID v2 (2 x 8,192), 2 epochs, **prefix-conditioned** (`PREFIX=1`), beam 20, section 14 ‡ | 2.1 GPU-h + 47 min beam | 2.0400% | 8.9000% | - | - | - | 0.04993 | 0.03803 |
 | HSTU tower (window 20, approximate actions) | 20 s GPU + 41 min I/O | 0.0458% | 0.4354% | 2.9063% | 13.5122% | - | 0.00201 | 0.00131 |
 | item-embedding kNN, mean of last 1 clicked | 9 min GPU | 0.0173% | 0.5636% | 2.4638% | 8.1807% | - | - | 0.00151 |
 | item-embedding kNN, mean of last 3 clicked | 9 min GPU | 0.0376% | 0.3560% | 2.2156% | 9.7646% | - | - | 0.00112 |
 | item-embedding kNN, mean of last 5 clicked | 9 min GPU | 0.0539% | 0.3174% | 2.0742% | 9.6965% | - | - | 0.00110 |
 
-The prefix-conditioned row is dashed because that arm has no item-level ranks yet:
-with `PREFIX=1` an item's score is not a function of its own codes alone, so
-`evaluate_tiger` skips ranking and `--mode beam` is the pass that produces them.
-The log carries level-0 coverage instead, and section 14 turns it into ceilings:
-`R@1 <= 9.44%`, `R@10 <= 33.31%`, `R@100 <= 67.35%`, `R@1000 <= 91.55%`. The row
-is in the table so the arm cannot be forgotten; it is not a result yet.
+The ‡ on the prefix-conditioned row means **the numbers are measured and are still
+not the same quantity as the rows above them.** With `PREFIX=1` an item's score is
+not a function of its own codes alone, so `evaluate_tiger` skips ranking and
+`--mode beam` produces the ranks instead. `R@k` there is a position inside the 20
+two-code tuples the beam kept, and on this catalogue 20 tuples name on the order of
+30 items against 4,783,154 for every other row. So the arm's comparable quantity is
+not `R@10` but the share of rows whose target it names at all, **12.58%**, and the
+comparable place to read it is the matched-budget table in section 14. Reading
+`8.90%` against DiGR's `3.6570%` compares a 30-item shortlist to a full-catalogue
+ranking and overstates the arm by about 1.4x. `R@100` and beyond are absent because
+a beam of 20 cannot name more than 20 tuples; that needs a wider beam, not a
+bigger model.
 
 DiGR is frozen at `digr_0p6b_e3_full_sampled300k/final`. Epoch 2 wrote a lower
 val loss (11.2342 against 11.2431) but epoch 3 ranks better at every cut-off, so
@@ -676,8 +682,9 @@ GPU-hours for the three-epoch prefix-free arm, i.e. about 3% more per epoch.
 nothing when `prefix_conditioning` is on (`ranks skipped (prefix-conditioned, use
 --mode beam)`), because an item's score is no longer a function of its own codes
 alone and the catalogue cannot be scored in a single pass. `--mode beam` is the pass
-that produces item ranks and it has not been run. What the log does carry is the
-quantity section 13 item 1 recorded as missing from the artifacts.
+that produces item ranks, and it has now run: the numbers are in "The beam pass"
+below. What the training log carries instead is the quantity section 13 item 1
+recorded as missing from the artifacts.
 
 `cover@b` is **level-0 coverage**, not recall: the share of rows whose target's
 first code is inside the model's top-`b` first-code predictions
@@ -714,12 +721,104 @@ What it establishes.
    neither belongs in the table (section 13 item 4 makes the same point about
    sampled-softmax against per-level cross-entropy).
 
-What is wrong with the run, and what to do about it.
+### The beam pass, 2026-10-29
 
-1. **No item ranks, so no row.** Everything above is a ceiling. `--mode beam` at
-   `b` in 20, 100, 1,000 is under an hour and converts all of it into `R@k`,
-   finishing task 4.7(c). Until it runs this arm cannot be compared to DiGR or to
-   co-click at any cut-off.
+`Plan 2/eval_tiger_beam.sh`, log `tiger_beam_727918.out`, 2026-10-29 11:19:06 to
+12:06:16, **47 minutes** on one GPU, checkpoint
+`runs/tiger_v2_sid2x8192_e2_prefix/best` (epoch 2), beam width 20, all 98,304 val
+rows, prefix tree over all 4,783,154 items. This is the beam pass the ceilings were
+waiting for, and it finishes task 4.7(c).
+
+| quantity | value |
+|---|---|
+| targets decoded inside the beam of 20 | 12,367 / 98,304 (**12.58%**) |
+| level-0 cover@20 | 42,578 / 98,304 (**43.31%**) |
+| R@1 | 2.0400% |
+| R@5 | 6.1000% |
+| R@10 | 8.9000% |
+| nDCG@1 | 0.02041 |
+| nDCG@5 | 0.04090 |
+| nDCG@10 | 0.04993 |
+| MRR@10 | 0.03803 |
+
+Two defects had to be fixed before the pass produced anything, both in the beam's
+own path and neither in the model. Both are now covered by
+`Model Training/test_train_tiger.py`, and the 0.29% below is not in the table above.
+
+1. `run_beam` built its loader with the checkpoint's `prefix_conditioning`, so the
+   collator appended the target's own codes and `_state_for_prefixes` then appended
+   the predicted prefix after them. Level 0 was scored from the position that
+   follows the true codes, which in training predicts nothing. That run decoded
+   0.29% in 53 minutes.
+2. `_state_for_prefixes` located the separator as `attention_mask.sum(-1) - 1` on a
+   row still carrying the batch's right padding, so every level past the first read
+   a pad slot. Fixed by cropping the row to its real length before appending. This
+   one is silent by construction: level 0 stays correct, so the failure looks like a
+   weak head and not a broken path.
+
+**The check that the surviving number is real.** Level-0 cover@20 here is 42,578
+rows, which is 43.30497%, and therefore the same 42,578 the training log printed as
+`cover@20 43.30%`. The two come from different code paths, `target_ranks` in
+`evaluate_tiger` and the beam's own `step_fn`. A row leak would have to corrupt both
+identically. So the level-0 path is right, and the distance between 43.31% and
+12.58% is the level-1 joint and not a bug. The monotonicities hold as well: 12,367
+decoded <= 42,578 covered, and R@1 <= R@5 <= R@10 <= decoded.
+
+**The loss is in the beam, not in the ordering.** 12,367 / 42,578 = **29.0%** of the
+rows with the right first code also keep the right second code inside a beam of 20,
+so two thirds of the coverage is thrown away at the joint. Of the decoded rows,
+8,749 of 12,367, about **71%**, land at rank 10 or better. Once the beam holds the
+target it usually ranks it, which makes the beam width the lever and the level-1
+ordering the thing that is already working.
+
+### Why this row is not comparable to the rows above
+
+It is measured, and it still does not belong in the same column as DiGR. `R@k` here
+is a position inside 20 two-code tuples, and with 53.51% of items sharing their
+two-code tuple, 20 tuples name roughly 30 items. Every other row in the headline
+table is a position inside 4,783,154 items. The arm is a candidate generator plus a
+ranker over its own candidates, and only its first stage can be compared:
+
+| arm | candidates named per row | target reachable | source |
+|---|---|---|---|
+| TIGER `PREFIX=1`, beam 20 | ~30 items in 20 tuples | **12.58%** | measured |
+| DiGR, SID v2 | 30 of 4,783,154 | 7.12% | interpolated |
+| co-click, window 20 | 30 of 4,783,154 | 7.18% | interpolated |
+| popularity | 30 of 4,783,154 | 2.99% | interpolated |
+| TIGER, prefix-free | 30 of 4,783,154 | 4.43% | interpolated |
+
+**At a matched candidate budget the arm is 1.77x, not 2.4x.** 12.58% against
+DiGR's 7.12% is the number to quote for depth. The naive comparison, `R@10 8.90%`
+against `3.6570%`, comes out at 2.43x and overstates the arm by about 1.4x, because
+the two lists differ by five orders of magnitude.
+
+Three caveats on that table. The interpolated column is log-linear in `k` between
+the arm's measured `R@10` and `R@100` in the headline table; the evaluation keeps no
+per-row rank array, so exact values are a rerun and not a recomputation. The ~30
+items comes from the 53.51% tie rate and a largest group of 315, and counting the
+code multiplicities exactly is one pass over the code array. And every TIGER number
+here is tuple-level, so item-level recall is at most this, bounded by the tie
+ceilings `R@1 <= 53.57%` and `R@10 <= 93.20%`.
+
+The within-arm conditional is a different quantity and it is deliberately not in the
+table: 8.90% / 12.58% = 70.7% of decoded rows at rank 10 or better, against DiGR's
+3.6570% / 55.7058% = 6.6%. Comparing those two numbers is meaningless because the
+lists differ by five orders of magnitude, and it is exactly the flattery a wide
+beam buys.
+
+What would close the gap, cheapest first. A beam of 60, about 2.5x the cost or
+roughly 2 hours, splits the 30.7 pp between 43.31% and 12.58% into beam width
+against head quality. The prefix-free checkpoint through the same pass is the
+attribution control and should collapse to about 0.02%, because its level-1 head
+never saw a prefix. And a four-level SID is the only configuration in which the
+paper's factorisation gets more than one conditional step to spend.
+
+### What is wrong with the run, and what to do about it
+
+1. **One depth, so no deep cut-offs.** The beam at 20 has run and `R@100` and above
+   are still absent, because a beam of 20 cannot name more than 20 tuples. The row
+   carries a marker instead of four more dashes, and what it buys is the 12.58%
+   reach in the table above.
 2. **Two levels is the minimum depth at which prefix conditioning means anything,
    and it is the depth at which it has the least to spend.** The 2.97-nat figure is
    the size of one conditional step. A 4 x 1,024 or 4 x 2,048 SID would give three

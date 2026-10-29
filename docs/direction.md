@@ -198,11 +198,15 @@ Two consequences, and they change the priority in §4:
 - **The level-0 ceiling is not the constraint.** Any `R@k(beam 1000)` up to 91.55%
 is reachable, and the prefix-free arm's realized 20.08% is nowhere near it. The
 middle-of-list weakness is ordering, not coverage.
-- **The missing item ranks are the only thing between this arm and the table.**
-`--mode beam` at b ∈ {20, 100, 1000} is under an hour. **Run it immediately after
-the §4 CPU measurements, before §3.1-§3.3.** It either produces the repo's best
-coverage at every cut-off or kills the depth thesis outright, and it is two orders
-of magnitude cheaper than either alternative.
+- **The beam pass ran on 2026-10-29, and depth pays at 1.77x.** Beam 20 reaches the
+  target for **12.58%** of val rows, and cover@20 reproduces the training log's
+  43.30% row for row, so the path is verified. But beam 20 names only ~30 items, so
+  the comparable statement is 12.58% reach against DiGR's **7.12%** in its top 30 of
+  4,783,154, and against co-click's 7.18%. Its `R@10 8.90%` is a rank inside those 20
+  tuples and must not be placed beside DiGR's 3.6570%; that comparison overstates the
+  arm by about 1.4x. Two thirds of the covered rows (12,367/42,578 = 29.0%) are lost
+  at the level-1 joint, which makes beam width the next cheap lever and a four-level
+  SID the actual test of the paper.
 
 Depth at 4 levels remains the real test of the paper, and 2.97 nats per conditional
 step is now the measured size of the prize for adding one.

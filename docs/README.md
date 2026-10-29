@@ -32,7 +32,11 @@ hours. Widening the codebook is what moved DiGR: 18,684 items per level-0 code
 became 584 and bucket lift went from 46.9x to 463.3x on the same embedding, while
 the Stage 1 towers stay below a frequency count. At two levels a prefix-free score
 is additive over two shared code rows, so DiGR and prefix-free TIGER sit in one
-function class and their gap is a loss difference, not a factorisation. Read
+function class and their gap is a loss difference, not a factorisation. The
+prefix-conditioned arm has now run, and depth pays: at a matched 30-item candidate
+budget it names the target 12.58% of the time against DiGR's 7.12%, one conditional
+level for 1.77x, while two thirds of its level-0 coverage is still lost at the
+joint. Read
 `results.md` for the numbers, `problems.md` for what they imply, `plan_v2.md` for
 what changes next and what it is expected to buy, and `sid_diagnostics.md` before
 judging any new SID.

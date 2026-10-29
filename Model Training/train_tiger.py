@@ -1294,9 +1294,14 @@ def run_beam(args, logger: logging.Logger) -> None:
     rows = len(split) if not args.beam_rows else min(int(args.beam_rows), len(split))
     indices = np.arange(rows, dtype=np.int64)
     dataset = TigerDataset(split, indices, sid_in, sid_codes, meta.vocab.sep_id,
-                           prefix_conditioning=args.prefix_conditioning)
+                           prefix_conditioning=False)
     collate = TigerCollate(meta.vocab.sep_id, meta.vocab.num_levels,
-                           prefix_conditioning=args.prefix_conditioning)
+                           prefix_conditioning=False)
+    # The row must be `history + [SEP]` here, not the training row. With
+    # `prefix_conditioning=True` the loader appends the target's own codes, and
+    # `_state_for_prefixes` then appends the predicted prefix after them, so level 0
+    # read its state from after the true codes and every score was noise. The prefix
+    # is built by the beam, so the loader must leave the row bare.
     loader = DataLoader(dataset, batch_size=args.eval_batch_size, shuffle=False,
                         collate_fn=collate, num_workers=0)
 
@@ -1308,6 +1313,7 @@ def run_beam(args, logger: logging.Logger) -> None:
     )
     hit = 0
     total = 0
+    cover = 0
     ranks: List[int] = []
     for ids, mask, labels, _positions, _targets, _rows in loader:
         ids = ids.to(device)
@@ -1316,12 +1322,16 @@ def run_beam(args, logger: logging.Logger) -> None:
         # decode one row at a time through the same helper, batched over beam
         for row in range(ids.shape[0]):
             target = tuple(int(c) for c in labels[row].tolist())
+            first: Dict[str, np.ndarray] = {}
 
             def step_fn(prefixes, _row=row, _target=target):
                 states = _state_for_prefixes(model, ids[_row:_row + 1],
                                              mask[_row:_row + 1], prefixes, meta, device)
                 logits = model.logits_from_state(states)[len(prefixes[0])]
-                return F.log_softmax(logits.float(), dim=-1).cpu().numpy()
+                logp = F.log_softmax(logits.float(), dim=-1).cpu().numpy()
+                if not prefixes[0]:
+                    first["logp"] = logp[0]
+                return logp
 
             def allowed(prefix, level, _index=index):
                 return _index.children(prefix)
@@ -1329,6 +1339,13 @@ def run_beam(args, logger: logging.Logger) -> None:
             beam = beam_search(step_fn, meta.vocab.sid_sizes[:meta.vocab.num_levels],
                                beam_width=args.beam_width, allowed=allowed)
             total += 1
+            # Level-0 cover, the same quantity the training log prints as `cover@k`
+            # and the hard cap on what the whole beam can decode. Without it a broken
+            # row and a broken beam look identical, because both show a near-zero
+            # decode rate, and one of those costs a 53-minute round trip to find.
+            if "logp" in first:
+                top = np.argsort(-first["logp"])[:args.beam_width]
+                cover += int(int(target[0]) in top)
             ordered = [p for _, p in beam]
             if target in ordered:
                 hit += 1
@@ -1341,6 +1358,10 @@ def run_beam(args, logger: logging.Logger) -> None:
     ceiling = 100.0 * hit / max(1, total)
     logger.info(
         f"  beam@{args.beam_width}: {hit}/{total} targets decoded ({ceiling:.2f}%)"
+    )
+    logger.info(
+        f"  level-0 cover@{args.beam_width}: {cover}/{total} rows "
+        f"({100.0 * cover / max(1, total):.2f}%), which caps targets decoded"
     )
     if ranks:
         # `ranks` holds a 1-based position for every row, and a row whose target
@@ -1369,9 +1390,16 @@ def _state_for_prefixes(model: TigerRetriever, ids: torch.Tensor, mask: torch.Te
     The row is `history + [SEP] + prefix tokens`, so the state that predicts the next
     code is the last real token of that sequence.
     """
+    if ids.shape[0] != 1:
+        raise ValueError("expects one row; the caller slices ids[row:row + 1]")
     n = len(prefixes)
-    row = ids.repeat(n, 1)
-    row_mask = mask.repeat(n, 1)
+    # Crop the trailing padding before appending. The separator is located as
+    # `attention_mask.sum(-1) - 1`, which only lands on the last appended token if no
+    # padding sits between the row and the appended prefix. Callers pass a batch row of
+    # the batch's padded width, so crop to this row's own length.
+    n_real = int(mask[0].sum())
+    row = ids[:, :n_real].repeat(n, 1)
+    row_mask = mask[:, :n_real].repeat(n, 1)
     if prefixes and prefixes[0]:
         offsets = meta.vocab.sid_offsets
         extra = torch.as_tensor(

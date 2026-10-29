@@ -374,10 +374,17 @@ mid-epoch checkpointing and `catalog_sid_codes.npy` are reused unchanged.
       40.78 / 65.05 / **91.83**, so beam-1,000 coverage falls while beam-1 rises).
       The conditional L2 of 4.7051 against the prefix-free unconditional 7.6731 is
       2.97 nats of level-1 information, 38.7% of the level-2 entropy. Numbers and
-      reading in `docs/results.md` §14. **Still open: the `--mode beam` pass** at
-      b in 20, 100, 1000, which is the only way this arm gets an item-level row.
-      Until then its ceilings are `R@1 <= 9.44%`, `R@10 <= 33.31%`,
-      `R@100 <= 67.35%`, `R@1000 <= 91.55%`.
+      reading in `docs/results.md` §14. **The `--mode beam` pass ran 2026-10-29**
+      (`tiger_beam_727918.out`, 47 min, beam width 20): 12,367/98,304 targets
+      decoded (12.58%), level-0 cover@20 42,578 rows (43.31%, the same count the
+      training log printed), R@1 2.0400%, R@5 6.1000%, R@10 8.9000%, nDCG@10
+      0.04993, MRR@10 0.03803. Those `R@k` are positions inside 20 two-code tuples,
+      roughly 30 items, so they are not comparable to the full-catalogue rows; the
+      comparable figure is 12.58% reach against DiGR's 7.12% at the same 30-item
+      budget, **1.77x**, in §14's matched-budget table. 12,367/42,578 = 29.0% of
+      covered rows survive the level-1 joint, so beam width is the next lever.
+      Still open: a beam of 60 to separate width from head quality, the prefix-free
+      checkpoint as the attribution control, and a four-level SID.
 
 **Both SID releases are supported from one script.** Level widths are read from
 `vocab.json`, so 4 x 256 plus the 731-wide collision level and 2 x 8,192 both run

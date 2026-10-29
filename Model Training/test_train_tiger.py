@@ -437,6 +437,55 @@ def test_retriever_logits_at_reads_the_requested_positions():
         assert torch.allclose(part, expected, atol=1e-6)
 
 
+def test_state_for_prefixes_matches_the_training_logits_on_a_padded_row():
+    """The beam must score from the same position training read.
+
+    `_state_for_prefixes` appends the prefix to a row taken out of a padded batch. The
+    separator is located as `attention_mask.sum(-1) - 1`, so leftover padding pushes
+    that index back into the pad and the level reads a state that predicts nothing.
+    A cluster run with exactly that fault decoded 0.29% of targets against a 43.30%
+    ceiling while every other beam test passed, because the stub models there are not
+    position sensitive.
+    """
+    sep = 1
+    codes = np.array([[0, 0], [1, 1], [2, 2], [3, 3], [4, 4]], dtype=np.int64)
+    sid_input = codes + np.array([10, 20], dtype=np.int64)
+    split = _Split([[5, 6], [7, 8, 9, 10]], [0, 3])
+    ds = tt.TigerDataset(split, np.arange(2, dtype=np.int64), sid_input, codes, sep,
+                         prefix_conditioning=False)
+    collate = tt.TigerCollate(sep, 2, prefix_conditioning=False)
+    ids, mask, _labels, _positions, _targets, rows = collate([ds[0], ds[1]])
+    assert int(mask[0].sum()) < ids.shape[1], "row 0 must be padded or this is vacuous"
+
+    model = _tiny_retriever(num_levels=2, widths=(8, 8), catalog=5)
+    vocab = type("V", (), dict(sid_offsets=[10, 20], sid_sizes=[8, 8], num_levels=2,
+                               sep_id=sep, total_size=32))()
+    meta = type("M", (), dict(vocab=vocab))()
+
+    with torch.inference_mode():
+        for row in range(2):
+            target = codes[int(rows[row])]
+            id_row, mask_row = ids[row:row + 1], mask[row:row + 1]
+            n_real = int(mask_row.sum())
+            # Training read its logits from `history + [SEP] + c1 + c2` at [sep, sep + 1].
+            train_ids = torch.cat(
+                [id_row[:, :n_real],
+                 torch.as_tensor(sid_input[int(rows[row])]).reshape(1, -1)], dim=1)
+            expected = model(train_ids, torch.ones_like(train_ids),
+                             torch.tensor([[n_real - 1, n_real]]))
+            for level in range(2):
+                state = tt._state_for_prefixes(
+                    model, id_row, mask_row,
+                    [tuple(int(c) for c in target[:level])], meta, torch.device("cpu"))
+                got = model.logits_from_state(state)[level]
+                assert torch.allclose(got, expected[level], atol=1e-6), (
+                    f"row {row} level {level} scored from the wrong position")
+
+    # Multi-row input is the mistake the single-row contract exists to prevent.
+    with pytest.raises(ValueError):
+        tt._state_for_prefixes(model, ids, mask, [()], meta, torch.device("cpu"))
+
+
 def test_evaluate_tiger_runs_and_reports_every_cut_off():
     model = _tiny_retriever()
     split = _Split([[5, 6, 7], [8, 9, 10, 11, 12]], [0, 4])
@@ -672,6 +721,7 @@ class _GradModel(torch.nn.Module):
         self.w = torch.nn.Parameter(torch.as_tensor(weights, dtype=torch.float32))
         self.num_levels = int(len(weights))
         self.grad_enabled: list = []
+        self.rows: list = []
 
     def logits_from_state(self, states):
         self.grad_enabled.append(torch.is_grad_enabled())
@@ -679,6 +729,7 @@ class _GradModel(torch.nn.Module):
                 for level in range(self.num_levels)]
 
     def separator_states(self, input_ids, attention_mask):
+        self.rows.append(input_ids)
         return torch.zeros(input_ids.shape[0], 4)
 
 
@@ -718,8 +769,19 @@ def test_run_beam_decodes_under_inference_mode_and_reports_ndcg(monkeypatch, cap
     assert "R@1 100.00%" in text, "both rows put their own tuple first"
     assert "nDCG@1 1.00000" in text, "nDCG comes from the same rank array as R@k"
     assert "MRR@10 1.00000" in text
+    assert "level-0 cover@2: 2/2 rows" in text, "cover caps what the beam can decode"
     assert model.grad_enabled and not any(model.grad_enabled), \
         "beam_search calls .numpy() on the head output, so autograd must be off"
+
+    # The row the beam scores has to be `history + [SEP]` and nothing else. The first
+    # run of this pass built the loader with prefix_conditioning=True, so the row
+    # already ended with the target's own codes and level 0 read its state from after
+    # the answer. That showed up as a 0.29% decode rate and cost 53 minutes of GPU.
+    shortest = min(model.rows, key=lambda t: t.shape[1])
+    assert int(shortest[0, -1]) == meta.vocab.sep_id, \
+        "level 0 must be read at the separator, not after the target's codes"
+    longest = max(model.rows, key=lambda t: t.shape[1])
+    assert int(longest[0, -1]) != meta.vocab.sep_id, "the prefix token was appended"
 
 
 def test_run_beam_reports_no_cut_off_wider_than_the_beam(monkeypatch, caplog):
@@ -742,5 +804,6 @@ def test_run_beam_reports_no_cut_off_wider_than_the_beam(monkeypatch, caplog):
 
     text = caplog.text
     assert "0/1 targets decoded" in text
+    assert "level-0 cover@1: 0/1 rows" in text, "the target code is not in the top 1"
     assert "R@1 0.00%" in text, "a target outside the beam counts as a miss here"
     assert "R@100" not in text, "the beam cannot report a cut-off wider than itself"
