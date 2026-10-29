@@ -9,6 +9,11 @@ The archived files refer to each other as `docs/x.md`. Those paths are now
 `docs/archive/x.md`; nothing else inside them was edited, so their text still reads as it
 did when it was written.
 
+How every number below is produced, including the miss convention, the tie handling, the
+matched-budget construction and the guards that refuse a misaligned dump, is documented
+separately in [`evaluation.md`](evaluation.md). Read that before comparing anything here
+with a number from another paper.
+
 Two things are recorded below. The measured result of the matched-budget pass, which is
 the first comparison in this project where every arm was allowed the same number of items
 per row. And the direction, which survived that result and is now sharper for it.
