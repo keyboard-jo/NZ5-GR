@@ -18,6 +18,9 @@ Two things are recorded below. The measured result of the matched-budget pass, w
 the first comparison in this project where every arm was allowed the same number of items
 per row. And the direction, which survived that result and is now sharper for it.
 
+What to do next is in [`tasks.md`](tasks.md): an ablation that separates the new SID from the
+new features, a redone SID diagnosis, and a bigger-backbone run that is deliberately last.
+
 ---
 
 # 1. The result: matched budget, 2026-10-29
