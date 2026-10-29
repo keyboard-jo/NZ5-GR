@@ -183,6 +183,30 @@ the stated ceiling. Cost ~2h10m plus a beam pass. It is not the 5x, but as it
 stands the table's TIGER row is a loss change and not a method comparison, and any
 reviewer who knows the paper will say so.
 
+**Measured 2026-10-28** (`docs/results.md` §14, run
+`tiger_v2_sid2x8192_e2_prefix`, 2h08m for two epochs). The `PREFIX=1` arm has now
+run at 2 × 8,192 and gives the number this section was waiting for: conditional
+level-2 cross-entropy **4.7051 nats** against the prefix-free arm's unconditional
+**7.6731**. Knowing the true level-0 code therefore removes **2.968 nats** of
+level-1's 7.673 nats of uncertainty — **38.7%** — for one level of depth. Level-0
+coverage saturates at 91.55% at beam 1,000 and actually *falls* 0.28 pp between
+epochs while beam-1 rises 0.82 pp, so the arm buys head precision with tail
+coverage.
+
+Two consequences, and they change the priority in §4:
+
+- **The level-0 ceiling is not the constraint.** Any `R@k(beam 1000)` up to 91.55%
+is reachable, and the prefix-free arm's realized 20.08% is nowhere near it. The
+middle-of-list weakness is ordering, not coverage.
+- **The missing item ranks are the only thing between this arm and the table.**
+`--mode beam` at b ∈ {20, 100, 1000} is under an hour. **Run it immediately after
+the §4 CPU measurements, before §3.1-§3.3.** It either produces the repo's best
+coverage at every cut-off or kills the depth thesis outright, and it is two orders
+of magnitude cheaper than either alternative.
+
+Depth at 4 levels remains the real test of the paper, and 2.97 nats per conditional
+step is now the measured size of the prize for adding one.
+
 ---
 
 ## 4. Measure these before spending a GPU hour (all CPU)

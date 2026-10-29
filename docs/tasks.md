@@ -367,6 +367,18 @@ mid-epoch checkpointing and `catalog_sid_codes.npy` are reused unchanged.
       now defaults to `PREFIX=1` and names the run `..._prefix` so it cannot collide
       with the prefix-free run.
 
+      **Done 2026-10-28, half of it.** `runs/tiger_v2_sid2x8192_e2_prefix`, log
+      `tiger_726500.out`, 2h08m for two epochs, val loss 10.6595 -> 10.3537, L1
+      5.6486, L2 4.7051. Level-0 coverage at epoch 2: `cover@1` 9.44%, `@10`
+      33.31%, `@20` 43.30%, `@100` 67.35%, `@1000` 91.55% (epoch 1: 8.62 / 31.29 /
+      40.78 / 65.05 / **91.83**, so beam-1,000 coverage falls while beam-1 rises).
+      The conditional L2 of 4.7051 against the prefix-free unconditional 7.6731 is
+      2.97 nats of level-1 information, 38.7% of the level-2 entropy. Numbers and
+      reading in `docs/results.md` §14. **Still open: the `--mode beam` pass** at
+      b in 20, 100, 1000, which is the only way this arm gets an item-level row.
+      Until then its ceilings are `R@1 <= 9.44%`, `R@10 <= 33.31%`,
+      `R@100 <= 67.35%`, `R@1000 <= 91.55%`.
+
 **Both SID releases are supported from one script.** Level widths are read from
 `vocab.json`, so 4 x 256 plus the 731-wide collision level and 2 x 8,192 both run
 with no flag beyond `--data_dir`. `Plan 2/train_tiger.sh` selects between them with

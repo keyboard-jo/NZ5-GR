@@ -20,10 +20,18 @@ recall coincide. `MRR` is truncated at rank 10 everywhere.
 | DiGR 0.6B, 3 epochs, 300k sampled negatives | 4.6 GPU-h + 3.2 min eval | 0.7924% | 2.5940% | 7.5094% | 21.6003% | 49.7691% | 0.01570 | 0.01258 |
 | **DiGR 0.6B, SID v2 (2 x 8,192 + action token), 3 epochs** | **3.2 GPU-h + 1.7 min eval** | 1.0549% | 3.6570% | 10.9182% | 27.6622% | 55.7058% | 0.02190 | 0.01742 |
 | TIGER 0.6B, SID v2 (2 x 8,192), 3 epochs, prefix-free | 3.2 GPU-h + 2.5 min eval | **1.4400%** | 2.4500% | 6.5900% | 20.0800% | 45.7600% | 0.01870 | 0.01700 |
+| TIGER 0.6B, SID v2 (2 x 8,192), 2 epochs, **prefix-conditioned** (`PREFIX=1`), section 14 | 2.1 GPU-h | - | - | - | - | - | - | - |
 | HSTU tower (window 20, approximate actions) | 20 s GPU + 41 min I/O | 0.0458% | 0.4354% | 2.9063% | 13.5122% | - | 0.00201 | 0.00131 |
 | item-embedding kNN, mean of last 1 clicked | 9 min GPU | 0.0173% | 0.5636% | 2.4638% | 8.1807% | - | - | 0.00151 |
 | item-embedding kNN, mean of last 3 clicked | 9 min GPU | 0.0376% | 0.3560% | 2.2156% | 9.7646% | - | - | 0.00112 |
 | item-embedding kNN, mean of last 5 clicked | 9 min GPU | 0.0539% | 0.3174% | 2.0742% | 9.6965% | - | - | 0.00110 |
+
+The prefix-conditioned row is dashed because that arm has no item-level ranks yet:
+with `PREFIX=1` an item's score is not a function of its own codes alone, so
+`evaluate_tiger` skips ranking and `--mode beam` is the pass that produces them.
+The log carries level-0 coverage instead, and section 14 turns it into ceilings:
+`R@1 <= 9.44%`, `R@10 <= 33.31%`, `R@100 <= 67.35%`, `R@1000 <= 91.55%`. The row
+is in the table so the arm cannot be forgotten; it is not a result yet.
 
 DiGR is frozen at `digr_0p6b_e3_full_sampled300k/final`. Epoch 2 wrote a lower
 val loss (11.2342 against 11.2431) but epoch 3 ranks better at every cut-off, so
@@ -640,7 +648,85 @@ What is wrong with the run, and what to do about it.
    story is inference, and a prefix-free arm scores the catalogue in a single pass
    exactly as DiGR does, so the two cost the same here.
 
-The arm that is still missing is `PREFIX=1` with a beam, which is the paper's
-factorisation and the only SID arm that is not additive over the code rows. It
-costs about 2h10m for two epochs plus a beam pass, and its reachable `k` is capped by
-the beam width, which is why `cover@k` from this run matters first.
+The arm this section said was missing is `PREFIX=1`, the paper's factorisation and
+the only SID arm that is not additive over the code rows. It has now been trained;
+section 14 has the log. Its reachable `k` is capped by the beam width, which is why
+`cover@k` mattered first, and the beam pass itself is still outstanding.
+
+---
+
+## 14. TIGER prefix-conditioned: the ceiling exists, and it is high
+
+`Plan 2/train_tiger.sh` with `PREFIX=1`, run `tiger_v2_sid2x8192_e2_prefix`, log
+`tiger_726500.out`, 2026-10-28 19:58:51 to 22:06:33. Same SID v2 (2 x 8,192), same
+Qwen3-0.6B, same launcher as the prefix-free arm; the only change is that level 2
+reads a state that contains level 1. Two epochs of 3,358 steps at batch 512,
+bf16, gradient checkpointing on, `attn=sdpa` because FlashAttention2 is not installed
+on the cluster (the loader warns and falls back). Head 16,777,216 parameters,
+3.5076 per item, backbone + head 474,306,560. 42-44k tokens/s, checkpoints every 300
+steps. Epoch 1 63.5 min, epoch 2 63.3 min, so **2h08m for the pair** against 3.2
+GPU-hours for the three-epoch prefix-free arm, i.e. about 3% more per epoch.
+
+| epoch | val loss | L1 | L2 | cover@1 | cover@10 | cover@20 | cover@100 | cover@1000 |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 10.6595 | 5.7283 | 4.9312 | 8.62% | 31.29% | 40.78% | 65.05% | 91.83% |
+| **2 (`best/`, `final/`)** | **10.3537** | **5.6486** | **4.7051** | **9.44%** | **33.31%** | **43.30%** | **67.35%** | **91.55%** |
+
+`R@k` is absent, and that is the design and not a failure: `evaluate_tiger` ranks
+nothing when `prefix_conditioning` is on (`ranks skipped (prefix-conditioned, use
+--mode beam)`), because an item's score is no longer a function of its own codes
+alone and the catalogue cannot be scored in a single pass. `--mode beam` is the pass
+that produces item ranks and it has not been run. What the log does carry is the
+quantity section 13 item 1 recorded as missing from the artifacts.
+
+`cover@b` is **level-0 coverage**, not recall: the share of rows whose target's
+first code is inside the model's top-`b` first-code predictions
+(`Model Training/train_tiger.py:595`). A beam of `b` can only reach what that set
+reaches, so `R@k(beam b) <= cover@b`. A level-0 code holds 584 items on average
+(4,783,154 / 8,192), so the beam-1,000 ceiling is a recall over roughly 584,000
+items and belongs beside DiGR's R@10000 (55.71%), not beside its R@1000.
+
+What it establishes.
+
+1. **The ceiling is high and it saturates in one epoch.** `cover@1000` moves
+   91.83% to 91.55% while `cover@1` moves 8.62% to 9.44% and `cover@100` 65.05% to
+   67.35%. About 8.2% of val targets have a first code that never enters the top
+   1,000 at either epoch, so no beam width fixes those rows; and the 0.28 pp fall
+   says the second epoch bought head precision with tail coverage. That trade is
+   visible here for the first time in this project.
+2. **The beam pass now has upper bounds.** `R@1 <= 9.44%`, `R@10 <= 33.31%`,
+   `R@100 <= 67.35%`, `R@1000 <= 91.55%`. The prefix-free arm's realized 20.08% at
+   `k = 1000` sits far under its counterpart, so its weak middle is a ranking loss
+   and not a coverage loss, which is what section 13 item 3 argued from the shape of
+   the curve and what is now bounded directly.
+3. **Level 1 removes 2.97 nats from level 2.** Conditional L2 cross-entropy is
+   4.7051 nats against the prefix-free arm's unconditional 7.6731, so knowing the
+   true `c1` removes 2.968 nats (4.28 bits) of the 7.673 nats (11.07 bits) of
+   uncertainty about `c2`: **38.7%**. L1 is flat, 5.6486 against 5.5904, 0.06 nats
+   worse, which is what it should be when level 0 no longer has to carry level-2
+   information by itself. This is a direct measurement of the quantity the paper's
+   factorisation is built on, and at two levels it can only be spent once. At four
+   levels each conditional step would carry the same class of gain, which is the
+   actual argument for depth over width on the TIGER side.
+4. **The two val losses measure different random variables.** 10.3537 against
+   13.2635 is almost entirely L2, teacher-forced on the true `c1` in this arm and
+   unconditional in the other. Neither number is evidence about the other arm, and
+   neither belongs in the table (section 13 item 4 makes the same point about
+   sampled-softmax against per-level cross-entropy).
+
+What is wrong with the run, and what to do about it.
+
+1. **No item ranks, so no row.** Everything above is a ceiling. `--mode beam` at
+   `b` in 20, 100, 1,000 is under an hour and converts all of it into `R@k`,
+   finishing task 4.7(c). Until it runs this arm cannot be compared to DiGR or to
+   co-click at any cut-off.
+2. **Two levels is the minimum depth at which prefix conditioning means anything,
+   and it is the depth at which it has the least to spend.** The 2.97-nat figure is
+   the size of one conditional step. A 4 x 1,024 or 4 x 2,048 SID would give three
+   of them for about the same tokens per event, and that is the arm that tests the
+   paper.
+3. **`best/` and `final/` coincide here.** Epoch 2 is both the last epoch and the
+   best val loss, so the checkpoint rule in section 13 does not bite. A three-epoch
+   prefix run would settle whether coverage turns up the way it did in the
+   prefix-free arm at epoch 3, where val loss rose while R@100 through R@10000 all
+   improved.

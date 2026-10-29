@@ -162,6 +162,10 @@ class _Split:
         self.targets = np.asarray(targets, dtype=np.int64)
         self.lengths = np.array([len(r) for r in rows], dtype=np.int64)
 
+    def __len__(self) -> int:
+        """`run_beam` sizes its row count from the split, so the slice needs this."""
+        return int(self.targets.size)
+
 
 def _batch():
     split = _Split([[5, 6, 7], [8, 9, 10, 11, 12]], [0, 5])
@@ -650,3 +654,93 @@ def test_checkpoint_config_decides_the_arm_not_the_flag(tmp_path):
         (d / tt.HEAD_CONFIG_FILE).write_text(
             json.dumps({"num_levels": 2, "prefix_conditioning": recorded}))
         assert tt._checkpoint_prefix_conditioning(args_for(not recorded, str(d))) is recorded
+
+
+# ---------------------------------------------------------------------------
+# Beam evaluation end to end
+# ---------------------------------------------------------------------------
+
+class _GradModel(torch.nn.Module):
+    """A loaded retriever, as far as the beam can tell: its logits still need grad.
+
+    A stub built out of buffers would hide the failure this covers, because
+    `Tensor.numpy()` only refuses a tensor that requires grad.
+    """
+
+    def __init__(self, weights):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.as_tensor(weights, dtype=torch.float32))
+        self.num_levels = int(len(weights))
+        self.grad_enabled: list = []
+
+    def logits_from_state(self, states):
+        self.grad_enabled.append(torch.is_grad_enabled())
+        return [self.w[level].expand(states.shape[0], -1)
+                for level in range(self.num_levels)]
+
+    def separator_states(self, input_ids, attention_mask):
+        return torch.zeros(input_ids.shape[0], 4)
+
+
+def _beam_meta():
+    vocab = type("V", (), dict(sid_sizes=[3, 3], num_levels=2, sid_offsets=[0, 3],
+                               sep_id=99, total_size=100))()
+    catalog = type("C", (), dict(size=6))()
+    return type("M", (), dict(vocab=vocab, catalog=catalog))()
+
+
+def test_run_beam_decodes_under_inference_mode_and_reports_ndcg(monkeypatch, caplog):
+    """The beam pass must not build a graph, and must report nDCG beside recall.
+
+    Regression: `step_fn` converts the head output with `.numpy()`, which raises
+    `Can't call numpy() on Tensor that requires grad` on a loaded model, because
+    nothing had turned autograd off. `--mode beam` had no test, so the first real
+    run was the first time that line executed.
+    """
+    codes = np.array([[0, 0], [1, 1], [2, 2], [0, 1], [1, 0], [2, 0]], dtype=np.int64)
+    sid_in = (codes + 10).astype(np.int64)
+    split = _Split([[5, 6], [7, 8]], [3, 3])
+    # Level 0 prefers code 0 and level 1 prefers code 1, so item 3 (0, 1) wins.
+    model = _GradModel([[0.0, -6.0, -6.0], [-6.0, 0.0, -6.0]])
+    meta = _beam_meta()
+
+    monkeypatch.setattr(tt, "_load_for_eval",
+                        lambda a, l: (meta, model, sid_in, codes, torch.device("cpu")))
+    monkeypatch.setattr(tt, "_load_splits", lambda a, m, l: (split, split))
+
+    args = tt.parse_args(["--mode", "beam", "--beam_width", "2", "--beam_rows", "0",
+                          "--prefix_conditioning"])
+    with caplog.at_level(logging.INFO, logger="test-beam"):
+        tt.run_beam(args, logging.getLogger("test-beam"))
+
+    text = caplog.text
+    assert "2/2 targets decoded" in text
+    assert "R@1 100.00%" in text, "both rows put their own tuple first"
+    assert "nDCG@1 1.00000" in text, "nDCG comes from the same rank array as R@k"
+    assert "MRR@10 1.00000" in text
+    assert model.grad_enabled and not any(model.grad_enabled), \
+        "beam_search calls .numpy() on the head output, so autograd must be off"
+
+
+def test_run_beam_reports_no_cut_off_wider_than_the_beam(monkeypatch, caplog):
+    """A row that misses the beam is a miss, and R@100 is not invented at width 2."""
+    codes = np.array([[0, 0], [1, 1]], dtype=np.int64)
+    # Level 0 prefers code 1, and a beam of 1 follows it, so item 0 (0, 0) never
+    # enters the beam at all.
+    model = _GradModel([[0.0, 6.0, -6.0], [0.0, 0.0, 0.0]])
+    split = _Split([[5, 6]], [0])
+
+    monkeypatch.setattr(tt, "_load_for_eval",
+                        lambda a, l: (_beam_meta(), model, (codes + 10).astype(np.int64),
+                                      codes, torch.device("cpu")))
+    monkeypatch.setattr(tt, "_load_splits", lambda a, m, l: (split, split))
+
+    args = tt.parse_args(["--mode", "beam", "--beam_width", "1", "--beam_rows", "0",
+                          "--prefix_conditioning"])
+    with caplog.at_level(logging.INFO, logger="test-beam"):
+        tt.run_beam(args, logging.getLogger("test-beam"))
+
+    text = caplog.text
+    assert "0/1 targets decoded" in text
+    assert "R@1 0.00%" in text, "a target outside the beam counts as a miss here"
+    assert "R@100" not in text, "the beam cannot report a cut-off wider than itself"

@@ -811,10 +811,14 @@ class RunMeta:
             catalog=catalog,
             user_map=user_map,
             gap_edges=gap_edges,
-            model_name=head["model_name"],
-            temperature=float(head["temperature"]),
-            l2_normalize=bool(head["l2_normalize"]),
-            max_seq_len=int(head["max_seq_len"]),
+            # `train_tiger.py` writes this file as well, and its head config carries
+            # the TIGER-specific keys in place of these four. Defaulting them keeps a
+            # TIGER checkpoint loadable; the fields TIGER actually needs (model name,
+            # temperature) are fixed by `_tiger_meta` right after this returns.
+            model_name=head.get("model_name", DEFAULT_MODEL_NAME),
+            temperature=float(head.get("temperature", 1.0)),
+            l2_normalize=bool(head.get("l2_normalize", False)),
+            max_seq_len=int(head.get("max_seq_len", 0) or 0),
             dtype=head.get("dtype", "bf16"),
             max_feat_tokens=int(head.get("max_feat_tokens", 0) or 0),
             use_lora=bool(head.get(

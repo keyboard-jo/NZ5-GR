@@ -708,17 +708,22 @@ def _build_model(args, meta: RunMeta, device: torch.device, logger: logging.Logg
     """Backbone (fresh or resumed) plus the TIGER head."""
     sid_in, sid_codes = sid_matrices(meta.catalog, meta.vocab)
     hidden_size = int(getattr(args, "hidden_size", 0) or 0)
+    # Checkpointing trades compute for memory by recomputing activations on the
+    # backward pass. Eval never runs one, so it only slows the run down, and a
+    # reentrant checkpoint under `torch.inference_mode` has no input that requires
+    # grad, which some torch versions reject outright.
+    checkpointing = bool(args.gradient_checkpointing) and args.mode == "train"
 
     if args.resume:
         if meta.use_lora:
             backbone = load_backbone(meta.model_name, meta.vocab.total_size, args, logger)
             _, PeftModel, _ = _require_peft()
             backbone_model = PeftModel.from_pretrained(backbone, args.resume, is_trainable=True)
-            if args.gradient_checkpointing:
+            if checkpointing:
                 _enable_gradient_checkpointing(backbone_model, logger)
         else:
             backbone_model = _load_full_checkpoint(meta.model_name, args.resume, args, logger)
-            if args.gradient_checkpointing:
+            if checkpointing:
                 _enable_gradient_checkpointing(backbone_model, logger)
     else:
         backbone = load_backbone(meta.model_name, meta.vocab.total_size, args, logger)
@@ -727,7 +732,7 @@ def _build_model(args, meta: RunMeta, device: torch.device, logger: logging.Logg
         else:
             backbone_model = backbone
             backbone_model.train()
-            if args.gradient_checkpointing:
+            if checkpointing:
                 _enable_gradient_checkpointing(backbone_model, logger)
 
     if hidden_size <= 0:
@@ -789,16 +794,20 @@ def _save_tiger_checkpoint(model: TigerRetriever, meta: RunMeta, out_dir: str,
     model.backbone.save_pretrained(tmp, safe_serialization=True)
     meta.save(tmp)
     torch.save(model.head.state_dict(), os.path.join(tmp, HEAD_FILE))
-    # `_read_head_config` has always read this file and nothing ever wrote it, so the
-    # num_levels consistency check could never fire and the evaluator had no way to
-    # tell a prefix-conditioned checkpoint from a prefix-free one.
-    with open(os.path.join(tmp, HEAD_CONFIG_FILE), "w", encoding="utf-8") as fh:
-        json.dump({
-            "num_levels": int(model.num_levels),
-            "sid_sizes": [int(w) for w in model.sid_sizes],
-            "hidden_size": int(model.head.layers[0].in_features),
-            "prefix_conditioning": bool(getattr(model, "prefix_conditioning", False)),
-        }, fh, indent=2, sort_keys=True)
+    # `meta.save` has already written this file with the keys `RunMeta.load` reads.
+    # Update it rather than replacing it: a fresh dict here dropped `model_name`,
+    # `temperature`, `l2_normalize` and `max_seq_len`, which made every TIGER
+    # checkpoint unloadable by this file's own evaluator.
+    head_path = os.path.join(tmp, HEAD_CONFIG_FILE)
+    head_cfg = _read_head_config(tmp)
+    head_cfg.update({
+        "num_levels": int(model.num_levels),
+        "sid_sizes": [int(w) for w in model.sid_sizes],
+        "hidden_size": int(model.head.layers[0].in_features),
+        "prefix_conditioning": bool(getattr(model, "prefix_conditioning", False)),
+    })
+    with open(head_path, "w", encoding="utf-8") as fh:
+        json.dump(head_cfg, fh, indent=2, sort_keys=True)
     if state is not None:
         torch.save(state, os.path.join(tmp, "train_state.pt"))
     shutil.rmtree(out_dir, ignore_errors=True)
@@ -1263,12 +1272,17 @@ def run_eval(args, logger: logging.Logger) -> None:
         )
 
 
+@torch.inference_mode()
 def run_beam(args, logger: logging.Logger) -> None:
     """Prefix-conditioned beam decoding on a val subset, with the prefix tree.
 
     This is the paper's inference path. It cannot score the whole catalogue, which
     is why `--mode eval` uses the prefix-free head, and its purpose is to measure how
     much the prefix actually buys on this data.
+
+    Inference mode is load-bearing, not an optimisation. `beam_search` calls
+    `.numpy()` on the head's output, which refuses a tensor that still requires grad,
+    and a loaded model's parameters require grad until something turns it off.
     """
     meta, model, sid_in, sid_codes, device = _load_for_eval(args, logger)
     if not args.prefix_conditioning:
@@ -1329,15 +1343,22 @@ def run_beam(args, logger: logging.Logger) -> None:
         f"  beam@{args.beam_width}: {hit}/{total} targets decoded ({ceiling:.2f}%)"
     )
     if ranks:
-        # `R@k` here is conditioned on the beam containing the target, so it is the
-        # beam's own ordering accuracy, not a full-catalogue recall. Multiply by the
-        # ceiling to get the number that is comparable with the exhaustive arms.
+        # `ranks` holds a 1-based position for every row, and a row whose target
+        # never entered the beam is stored as `beam_width + 1`. So every recall
+        # below is already end to end: the rows the beam missed count as misses.
+        # Multiplying by the ceiling again would count those rows twice.
         arr = np.asarray(ranks, dtype=np.int64)
-        for k in (1, 10):
-            if k <= args.beam_width:
-                inner = float((arr <= k).sum()) / max(1, total)
-                logger.info(f"  beam R@{k} {100.0 * inner:.2f}% "
-                            f"(x ceiling = {100.0 * inner:.2f}% end to end)")
+        # A cut-off above the beam width is unreachable by construction, and a miss
+        # sits at `beam_width + 1`, so keep only k the beam can actually satisfy.
+        ks = [k for k in EVAL_KS if k <= args.beam_width]
+        m = rank_metrics(arr, ks=ks, mrr_k=MRR_K)
+        for k in ks:
+            logger.info(f"  beam R@{k} {100.0 * m[f'recall@{k}']:.2f}%  "
+                        f"nDCG@{k} {m[f'ndcg@{k}']:.5f}")
+        logger.info(f"  beam MRR@{MRR_K} {m['mrr']:.5f}")
+        logger.info(f"  (beam@{args.beam_width} decoded the target for "
+                    f"{ceiling:.2f}% of rows; the R@k above already count the "
+                    f"rest as misses)")
 
 
 def _state_for_prefixes(model: TigerRetriever, ids: torch.Tensor, mask: torch.Tensor,
