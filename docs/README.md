@@ -60,26 +60,43 @@ Same 98,304 validation rows, same 4,783,154 item catalogue, every arm scored by 
 the single true target is inside the items that arm names. `matched @ N_r` allows each arm
 the exact number of items the beam named on that row.
 
-| arm | items named / row | matched @ N_r | @ k=171 | @ k=192 | @ k=1000 | @ k=10000 | cost |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| **DiGR v2** | full catalogue | **13.9994%** | 13.8224% | 14.4989% | 27.6622% | 55.7058% | 1.8 min GPU |
-| coclick h20 | ~192 | ~13.68% *est* | 13.5824% | 14.1825% | 25.3021% | 46.8882% | 43 s CPU |
-| coclick h10 | ~192 | ~13.5% *est* | 13.4369% | 14.0371% | 24.8311% | — | 43 s CPU |
-| coclick h5 | ~192 | ~13.4% *est* | 12.8621% | 13.4145% | 23.6176% | — | 43 s CPU |
-| **TIGER prefix, beam 20** | **192.2** | **12.5804%** | 12.5804% | 12.5804% | n/a | n/a | 46.6 min GPU |
-| popularity | ~192 | ~6.5% *est* | 6.2083% | 6.6060% | 14.7288% | 36.8215% | < 1 s CPU |
+| arm | items named / row | matched @ N_r | nDCG@N_r | MRR@10 | @ k=171 | @ k=192 | @ k=1000 | @ k=10000 | cost |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **DiGR v2** | full catalogue | **13.9994%** | **0.04013** | **0.01742** | 13.8224% | 14.4989% | 27.6622% | 55.7058% | 1.8 min GPU |
+| coclick h20 | ~192 | 13.7034% | 0.03832 | 0.01539 | 13.5824% | 14.1825% | 25.3021% | 46.8882% | 43 s CPU |
+| coclick h10 | ~192 | 13.5518% | 0.03797 | 0.01529 | 13.4369% | 14.0371% | 24.8311% | — | 43 s CPU |
+| coclick h5 | ~192 | 12.9985% | 0.03673 | 0.01499 | 12.8621% | 13.4145% | 23.6176% | — | 43 s CPU |
+| **TIGER prefix, beam 20** | **192.2** | **12.5804%** | n/a † | n/a † | 12.5804% | 12.5804% | n/a | n/a | 46.6 min GPU |
+| popularity | ~192 | 6.3070% | 0.01673 | 0.00648 | 6.2083% | 6.6060% | 14.7288% | 36.8215% | < 1 s CPU |
 
-`matched @ N_r` is the only like-for-like column. `R@k` columns are comparable between the
-full-catalogue arms only: TIGER's rank is a tuple rank over ~9.6 items per position, so its
-`R@10` is not the same measurement as DiGR's `R@10`.
+`matched @ N_r`, `nDCG@N_r` and `MRR@10` are the three like-for-like columns. The `R@k`
+columns are comparable between the full-catalogue arms only.
 
-The `est` cells are derived, not measured. DiGR loses 0.50 pp going from uniform k=192 to
-its per-row budget (14.4989 to 13.9994); the same shift is applied to each co-click window.
-Measure them by re-running the join with the fixed picker, which costs seconds.
+**† Why TIGER has no `nDCG@N_r` or `MRR@10`.** Both metrics weight a hit by its position,
+and TIGER's positions are **tuple** positions, not item positions: its position 3 holds
+about 29 items while DiGR's holds one. Measuring it on that axis is not a larger value of
+the same quantity, it is a different quantity, inflated by the ~9.6 items per position. Its
+own tuple-axis figures are `nDCG 0.0592` and `MRR@10 0.03803`, against DiGR's item-axis
+`0.04013` and `0.01742`, and printing those two side by side is exactly the comparison the
+blank cells refuse to make. `12.5804%` stays in `matched @ N_r` because its own reach needs
+no axis conversion: a decoded row is a hit, a missing row is not.
+
+Every cell above is measured from the four dumps. Earlier revisions carried `~est` cells for
+the co-click and popularity rows, derived by applying DiGR's uniform-$k$ to per-row-budget
+shift. Measured against those estimates: h20 13.68% -> 13.7034%, h10 13.5% -> 13.5518%,
+h5 13.4% -> 12.9985%. The first two were within 0.05 pp, the h5 estimate was 0.40 pp out,
+and all three estimates are retired.
 
 **Reading.** At the budget the beam actually uses, DiGR is 1.11x TIGER, and co-click sits
-between them. TIGER is **8-11% behind DiGR** and about 7% behind plain co-click h20. The
-earlier claim that TIGER was 1.77x ahead was an artefact of assuming a 30-item budget.
+between them. TIGER is **10.1% behind DiGR** and 8.2% behind plain co-click h20. The earlier
+claim that TIGER was 1.77x ahead was an artefact of assuming a 30-item budget.
+
+The two rank-aware columns sharpen one ordering and leave the rest alone. DiGR's edge over
+co-click h20 widens from +2.2% on matched recall to +4.7% on `nDCG@N_r`, so DiGR's hits sit
+shallower inside the same budget even where the raw hit counts are close. Against popularity
+DiGR is 2.4x on `nDCG@N_r` and 2.7x on `MRR@10`, so the count baseline is further behind
+than its recall alone already showed.
+
 
 ## 1.4 The crossover
 

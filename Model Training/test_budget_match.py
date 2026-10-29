@@ -143,7 +143,30 @@ def test_matched_budget_uses_each_rows_named_items(tmp_path):
     # seen budget per row is 4, 4, 3, 1: rows 0 and 2 can be hits
     assert arm_row["match_seen"] == pytest.approx(0.5)
     assert arm_row["own_at_10"] == pytest.approx(0.5)
+    # nDCG@N_r over ranks 1, 10001, 2, 10001 with budgets 5, 5, 5, 2:
+    # hits at rank 1 and rank 2, weighted by 1/log2(r+1).
+    assert arm_row["ndcg_all"] == pytest.approx((1.0 + 1.0 / np.log2(3.0)) / 4)
+    assert arm_row["mrr10"] == pytest.approx((1.0 + 0.5) / 4)
     assert got["seen_label"] == "target-set"
+
+
+def test_rank_aware_metrics_are_blank_for_a_tuple_axis_arm(tmp_path):
+    """TIGER's positions are tuple positions, so nDCG and MRR are not reportable."""
+    data = _write_dataset(tmp_path)
+    beam, arm = tmp_path / "beam.npz", tmp_path / "arm.npz"
+    _write_beam(beam)
+    _write_arm(arm)
+    _run(tmp_path, data, beam, [("arm", arm)])
+    with open(tmp_path / "out" / "budget_match.json", encoding="utf-8") as f:
+        got = json.load(f)
+
+    tiger_row = got["arms"][0]
+    assert np.isnan(tiger_row["ndcg_all"])
+    assert np.isnan(tiger_row["mrr10"])
+    # Its reach is still reportable, because that needs no axis conversion.
+    assert tiger_row["match_all"] == pytest.approx(got["tiger_reach"])
+    # And the item-axis arm still gets both, so the blank is per-arm, not global.
+    assert not np.isnan(got["arms"][1]["ndcg_all"])
 
 
 def test_tiger_reach_never_counts_a_miss_as_a_hit(tmp_path):

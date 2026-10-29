@@ -275,6 +275,26 @@ def own_metric(rank: np.ndarray, k: int) -> float:
     return float((rank <= k).mean())
 
 
+def ndcg_matched(rank: np.ndarray, budget: np.ndarray) -> float:
+    """nDCG with the cut-off replaced by the row's own budget.
+
+    One target per row, so IDCG is 1 at every cut-off and the metric is just the
+    weighted hit rate.  The budget only moves the indicator threshold; nothing is
+    divided by it.  This is the rank-aware twin of `match_all` and is only defined
+    on an item axis, so it is NaN for TIGER, whose positions are tuple positions.
+    """
+    r = np.asarray(rank, dtype=np.float64)
+    gain = np.where(r <= budget, 1.0 / np.log2(np.maximum(r, 1.0) + 1.0), 0.0)
+    return float(gain.mean())
+
+
+def mrr_at(rank: np.ndarray, k: int) -> float:
+    """MRR truncated at a fixed k.  No budget involved, so this one is comparable
+    for any arm that ranks items, and NaN for an arm that ranks tuples."""
+    r = np.asarray(rank, dtype=np.float64)
+    return float(np.where(r <= k, 1.0 / np.maximum(r, 1.0), 0.0).mean())
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(
         description="Compare arms at the candidate budget each row's beam actually named",
@@ -476,6 +496,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             "match_all": float((arm_rank <= n_all).mean()),
             "match_seen": float((arm_rank <= n_seen).mean()),
             "match_kmed": float((arm_rank <= k_med).mean()),
+            "ndcg_all": ndcg_matched(arm_rank, n_all),
+            "mrr10": mrr_at(arm_rank, 10),
             "own_at_1": own_metric(arm_rank, 1),
             "own_at_10": own_metric(arm_rank, 10),
             "own_at_100": own_metric(arm_rank, 100),
@@ -499,6 +521,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     tiger_row = {"arm": "TIGER (beam)", "named_mean": k_mean, "match_all": tiger_reach,
                  "match_seen": tiger_reach, "match_kmed": tiger_reach,
+                 "ndcg_all": float("nan"), "mrr10": float("nan"),
                  "own_at_1": float((beam_rank <= 1).mean()),
                  "own_at_10": float((beam_rank <= 10).mean()),
                  "own_at_100": float("nan")}
@@ -508,14 +531,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             row["ratio_to_tiger"] = row["match_all"] / tiger_reach
 
     header = ["arm", "named_mean", "match_all", "match_seen", "match_kmed",
-              "own_at_1", "own_at_10", "own_at_100"]
+              "ndcg_all", "mrr10", "own_at_1", "own_at_10", "own_at_100"]
     lines = [f"| arm | named/row | matched (all items) | matched ({seen_label}) | "
-             f"matched at k={k_med} | own R@1 | own R@10 | own R@100 |",
-             "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+             f"matched at k={k_med} | nDCG@N_r | MRR@10 | own R@1 | own R@10 | own R@100 |",
+             "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for row in table:
         cells = [row["arm"], f"{row['named_mean']:.1f}"]
-        for key in ("match_all", "match_seen", "match_kmed", "own_at_1", "own_at_10",
-                    "own_at_100"):
+        for key in ("match_all", "match_seen", "match_kmed"):
+            value = row[key]
+            cells.append("n/a" if value != value else f"{100 * value:.4f}%")
+        for key in ("ndcg_all", "mrr10"):
+            value = row[key]
+            cells.append("n/a" if value != value else f"{value:.5f}")
+        for key in ("own_at_1", "own_at_10", "own_at_100"):
             value = row[key]
             cells.append("n/a" if value != value else f"{100 * value:.4f}%")
         lines.append("| " + " | ".join(cells) + " |")
@@ -526,6 +554,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"TIGER's reach is `mean(rank <= {beam_width})`, never `rank <= N`: a miss is "
           f"stored as {beam_width + 1} and would otherwise pass whenever N >= "
           f"{beam_width + 1}.")
+    print("n/a in nDCG@N_r or MRR@10 means the arm ranks tuples, not items, so the metric "
+          "would be measured on a different axis and is not reportable beside the others.")
 
     out_dir = cli.out_dir or os.getcwd()
     os.makedirs(out_dir, exist_ok=True)

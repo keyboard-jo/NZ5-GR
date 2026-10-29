@@ -316,6 +316,20 @@ $$
 \texttt{match\_kmed} \;=\; \frac{1}{N}\sum_{r} \mathbb{1}\!\left[\rho_r \le \operatorname{median}_r N_r\right]
 $$
 
+The rank-aware twins replace the cut-off the same way, or not at all:
+
+$$
+\texttt{ndcg@N\_r} \;=\; \frac{1}{N}\sum_{r} \frac{\mathbb{1}[\rho_r \le N_r]}{\log_2(\rho_r+1)}
+\qquad
+\texttt{mrr10} \;=\; \frac{1}{N}\sum_{r} \frac{\mathbb{1}[\rho_r \le 10]}{\max(\rho_r,1)}
+$$
+
+nDCG needs the budget for the same reason recall does: which ranks exist depends on how long
+the list is. MRR does not, because its cut-off is the fixed $k = 10$, so it carries the same
+value in both columns. Both are **undefined for an arm whose ranks are tuple positions** and
+`budget_match.py` writes `n/a` rather than a number, since a tuple position holding about
+9.6 items is not a position on the item axis.
+
 `match_all` is the primary column and the **only like-for-like one** in the project: every
 arm is asked the same question, "was the target inside the first $N_r$ items you would have
 returned". `match_kmed` gives every arm one flat budget, equal to the beam's median, which
@@ -397,8 +411,9 @@ Stated plainly, because the tables are easy to over-read.
    clears the bar without being comfortable, so the ordering is suggestive rather than
    settled until a paired test is run.
 4. **Ranks are not comparable across arms at a fixed $k$.** A tuple rank, an item rank and
-   a popularity-padded rank are different objects. Only $\texttt{match\_all}$ compares like
-   with like.
+   a popularity-padded rank are different objects. Only $\texttt{match\_all}$,
+   $\texttt{ndcg@N\_r}$ and $\texttt{mrr10}$ compare like with like, and the last two are
+   defined only for an arm that ranks items.
 5. **The 67% of the catalogue that is never clicked** occupies rank positions for every arm.
    That is the standard convention, but it means these numbers are not comparable with
    papers that rank a candidate pool of a few hundred items.
