@@ -604,3 +604,75 @@ def test_coclick_cold_fill_is_bounded_by_the_catalog(data_dir, logger):
                              kmax=1000)
     assert len(top) == len(CATALOG)
     assert len(set(top.tolist())) == len(CATALOG)
+
+
+# ---------------------------------------------------------------------------
+# --dump_ranks: the per-row ranks a matched-budget comparison reads
+# ---------------------------------------------------------------------------
+
+
+def _load_dump(dump_dir, kind):
+    """Reassemble one arm's chunk files the way `budget_match.py` does."""
+    files = sorted(os.path.join(str(dump_dir), f) for f in os.listdir(str(dump_dir))
+                   if f.startswith(f"{kind}_") and f.endswith(".npz"))
+    assert files, f"no dump files for {kind} in {dump_dir}"
+    rows, targets, ranks = [], [], []
+    for f in files:
+        with np.load(f) as z:
+            rows.append(z["rows"])
+            targets.append(z["targets"])
+            ranks.append(z["rank"])
+    rows = np.concatenate(rows)
+    order = np.argsort(rows, kind="stable")
+    return rows[order], np.concatenate(targets)[order], np.concatenate(ranks)[order]
+
+
+def test_dump_ranks_covers_every_row_exactly_once(data_dir, tmp_path):
+    """One npz per arm per chunk, named by the chunk's first row.
+
+    The chunking is invisible from the outside: the files carry their `rows` array, so
+    the reader reassembles by row. That is what makes a fork pool safe, and it is why
+    the dump has to be verified by row coverage rather than by file count.
+    """
+    out_json = str(tmp_path / "metrics.json")
+    dump = tmp_path / "ranks"
+    assert B.main(["--data_dir", data_dir, "--baselines", "popularity,coclick",
+                   "--history_window", "2", "--workers", "1",
+                   "--dump_ranks", str(dump), "--out_json", out_json]) == 0
+
+    with open(out_json, "r", encoding="utf-8") as f:
+        reported = json.load(f)["baselines"]
+    for kind, metrics in reported.items():
+        rows, targets, rank = _load_dump(dump, kind)
+        assert rows.tolist() == list(range(len(VAL_TARGETS))), "every row, once, in order"
+        assert targets.tolist() == list(VAL_TARGETS), "the target is the catalogue row"
+        # The dump has to reproduce the run, or the table built from it describes a
+        # different experiment from the one in the log.
+        for k in (1, 10, 100):
+            assert float((rank <= k).mean()) == pytest.approx(metrics[f"recall@{k}"])
+    assert len({f.split("_")[0] for f in os.listdir(str(dump))}) == 2, "no stray names"
+
+
+def test_dump_ranks_keeps_a_rank_past_the_cut_off(data_dir, tmp_path):
+    """A rank beyond the widest cut-off must survive, or the arm looks perfect."""
+    dump = tmp_path / "ranks"
+    # `--ks` is left alone on purpose: `main` assigns the module globals EVAL_KS and
+    # KMAX from it and does not restore them, so a narrow sweep would leak into
+    # whichever test ran next.
+    assert B.main(["--data_dir", data_dir, "--baselines", "popularity",
+                   "--workers", "1", "--dump_ranks", str(dump),
+                   "--out_json", str(tmp_path / "m.json")]) == 0
+    _, _, rank = _load_dump(dump, "popularity")
+    assert int(rank.max()) > 1, "an exact rank above the cut-off is still recorded"
+
+
+def test_dump_ranks_per_window_does_not_collide(data_dir, tmp_path):
+    """Two windows into one directory would be two arms claiming the same rows."""
+    dump = tmp_path / "ranks"
+    for w in ("1", "2"):
+        assert B.main(["--data_dir", data_dir, "--baselines", "coclick",
+                       "--history_window", w, "--workers", "1",
+                       "--dump_ranks", str(dump / f"h{w}"),
+                       "--out_json", str(tmp_path / f"m{w}.json")]) == 0
+        rows, _, _ = _load_dump(dump / f"h{w}", "coclick")
+        assert rows.tolist() == list(range(len(VAL_TARGETS)))

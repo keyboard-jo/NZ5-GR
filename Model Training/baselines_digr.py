@@ -632,17 +632,35 @@ def empty_metrics() -> Dict[str, float]:
     return out
 
 
+def ndcg_head(metrics: Dict[str, float]) -> str:
+    """`nDCG@{MRR_K}` for the log lines, or a dash when that cut-off was not scored.
+
+    `--ks` decides which cut-offs exist, so a run with `--ks 1,100` has no
+    `ndcg@10` and indexing it raised KeyError after the whole evaluation had run.
+    """
+    value = metrics.get(f"ndcg@{MRR_K}")
+    return "n/a" if value is None else f"{value:.5f}"
+
+
 def accumulate(metrics: Dict[str, float], top: np.ndarray, target: int,
-               kmax: Optional[int] = None) -> None:
+               kmax: Optional[int] = None,
+               rank_out: Optional[List[int]] = None) -> None:
     """Add one query. A miss gets rank kmax + 1, never rank 0.
 
     Rank 0 would pass every `rank <= k` test and turn 1/log2(rank+1) into a
     division by zero, which is the bug that made an earlier DiGR run report
     infinite nDCG.
+
+    `rank_out` collects the exact rank, which the metric reduction throws away. It is
+    the only way to answer "was the target inside the first N items" for an N that
+    differs per row, which is what `budget_match.py` needs to compare these baselines
+    against a beam that names a variable number of items.
     """
     kmax = KMAX if kmax is None else int(kmax)
     hit = np.flatnonzero(top == target)
     rank = int(hit[0]) + 1 if hit.size else kmax + 1
+    if rank_out is not None:
+        rank_out.append(rank)
     metrics["n"] += 1.0
     for k in EVAL_KS:
         if rank <= k:
@@ -670,6 +688,8 @@ def _chunk_range(args: Tuple[int, int]) -> Dict[str, float]:
     g = _G
     metrics = empty_metrics()
     targets = g["targets"]
+    dump_dir = g.get("dump_dir")
+    rank_out: Optional[List[int]] = [] if dump_dir else None
     for i in range(lo, hi):
         target = int(targets[i])
         if g["kind"] == "popularity":
@@ -687,7 +707,22 @@ def _chunk_range(args: Tuple[int, int]) -> Dict[str, float]:
                 g["coclick"], g["query_items"][i], g["query_valid"][i],
                 g["history_decay"], g["popularity_order"], kmax=KMAX,
             )
-        accumulate(metrics, top, target, kmax=KMAX)
+        accumulate(metrics, top, target, kmax=KMAX, rank_out=rank_out)
+    if dump_dir and rank_out is not None:
+        if len(rank_out) != hi - lo:
+            raise AssertionError(
+                f"collected {len(rank_out)} ranks for rows [{lo}, {hi})"
+            )
+        # One file per chunk, named by the chunk's first row. `budget_match.py`
+        # concatenates them in name order, so the rank array it builds is in split
+        # row order by construction rather than by luck of pool completion order.
+        os.makedirs(dump_dir, exist_ok=True)
+        np.savez_compressed(
+            os.path.join(dump_dir, f"{g['kind']}_{lo:06d}.npz"),
+            rows=np.arange(lo, hi, dtype=np.int64),
+            targets=np.asarray(targets[lo:hi], dtype=np.int64),
+            rank=np.asarray(rank_out, dtype=np.int64),
+        )
     return metrics
 
 
@@ -747,6 +782,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     p.add_argument("--chunk_rows", type=int, default=DEFAULT_CHUNK_ROWS)
     p.add_argument("--out_json", type=str, default=None)
+    p.add_argument("--dump_ranks", type=str, default=None,
+                   help="directory for per-chunk rank files (npz: rows, targets, "
+                        "rank). One file per baseline per chunk, so a parallel run "
+                        "cannot deliver rows out of order. `budget_match.py` reads "
+                        "`<dir>/<baseline>_*.npz`")
     return p
 
 
@@ -856,7 +896,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             _G.clear()
             _G.update(kind="popularity", targets=val_targets[:n_eval],
-                      popularity_order=popularity_order)
+                      popularity_order=popularity_order,
+                      dump_dir=args.dump_ranks)
             parts = run_chunks(_chunk_range, make_ranges(n_eval, args.workers),
                                args.workers)
         elif kind == "sid_transition":
@@ -871,7 +912,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                       tables=tables, catalog_level_codes=catalog_level_codes,
                       smoothing=float(args.smoothing),
                       history_decay=float(args.history_decay),
-                      weighting=args.weighting, tie_break=tie_break)
+                      weighting=args.weighting, tie_break=tie_break,
+                      dump_dir=args.dump_ranks)
             parts = run_chunks(_chunk_range, make_ranges(n_eval, args.workers),
                                args.workers)
         else:
@@ -890,7 +932,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                       coclick=coclick, query_items=query_items,
                       query_valid=query_valid,
                       history_decay=float(args.history_decay),
-                      popularity_order=popularity_order)
+                      popularity_order=popularity_order,
+                      dump_dir=args.dump_ranks)
             parts = run_chunks(_chunk_range, make_ranges(n_eval, args.workers),
                                args.workers)
 
@@ -904,7 +947,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"  rows {human_int(int(metrics['n']))}   "
             + "   ".join(f"R@{k} {metrics[f'recall@{k}'] * 100:.4f}%"
                          for k in EVAL_KS)
-            + f"   nDCG@10 {metrics['ndcg@10']:.5f}"
+            + f"   nDCG@10 {ndcg_head(metrics)}"
               f"   MRR {metrics['mrr']:.5f}   ({time.time() - start:.0f}s)"
         )
 
@@ -915,7 +958,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"  {kind:<16} "
             + "  ".join(f"R@{k} {metrics[f'recall@{k}'] * 100:7.4f}%"
                         for k in EVAL_KS)
-            + f"  nDCG@10 {metrics['ndcg@10']:.5f}  MRR {metrics['mrr']:.5f}"
+            + f"  nDCG@10 {ndcg_head(metrics)}  MRR {metrics['mrr']:.5f}"
         )
     if "popularity" not in results:
         logger.info(

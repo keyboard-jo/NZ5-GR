@@ -19,6 +19,15 @@
 #   BEAM_WIDTH=100 sbatch eval_tiger_beam.sh       # adds R@100 and nDCG@100
 #   CKPT=runs/<run>/final sbatch eval_tiger_beam.sh
 #   PREFIX=0 sbatch eval_tiger_beam.sh             # ablation leg, see below
+#   DUMP_ROWS=dumps/beam_v2_prefix.npz sbatch eval_tiger_beam.sh
+#
+# What the dump is for. `budget_match.py` needs the tuples the beam kept, because
+# 20 tuples carry a variable number of catalogue items (mean ~30 here, up to 315 in
+# one tuple) and only that count makes a matched-budget comparison with DiGR honest.
+# The dump adds seconds to a 47-minute run and cannot be reconstructed afterwards,
+# so it is on whenever DUMP_ROWS is set. Use it with BEAM_ROWS=0: a partial dump is
+# refused by the reader, since a budget from one row set cannot be paired with a
+# rank from another.
 #
 # What comes back. R@k, nDCG@k and MRR@10 for every k up to the beam width, all
 # counted end to end: a row whose target never entered the beam is a miss, so these
@@ -44,6 +53,16 @@ PREFIX="${PREFIX:-1}"
 BEAM_WIDTH="${BEAM_WIDTH:-20}"
 BEAM_ROWS="${BEAM_ROWS:-0}"
 EVAL_BATCH="${EVAL_BATCH:-128}"
+DUMP_ROWS="${DUMP_ROWS:-}"
+
+DUMP_FLAG=()
+if [ -n "${DUMP_ROWS}" ]; then
+    mkdir -p "$(dirname "${DUMP_ROWS}")"
+    DUMP_FLAG=(--dump_rows "${DUMP_ROWS}")
+    [ "${BEAM_ROWS}" = "0" ] || \
+        echo "  ! DUMP_ROWS set with BEAM_ROWS=${BEAM_ROWS}; budget_match.py refuses a
+     partial dump, so set BEAM_ROWS=0 for a run whose dump will be used" >&2
+fi
 
 # Empty unless the ablation leg is asked for, so it splits to no argument.
 PREFIX_FLAG="--prefix_conditioning"
@@ -58,6 +77,7 @@ done
 echo "checkpoint  ${CKPT}"
 echo "data        ${DATA_DIR}"
 echo "beam width  ${BEAM_WIDTH}, rows $([ "${BEAM_ROWS}" = "0" ] && echo all || echo "${BEAM_ROWS}"), prefix conditioning ${PREFIX}"
+echo "dump        ${DUMP_ROWS:-none}"
 
 module purge
 module load Anaconda3/2023.09-0
@@ -79,4 +99,5 @@ python train_tiger.py \
     --beam_width "${BEAM_WIDTH}" \
     --beam_rows "${BEAM_ROWS}" \
     --eval_batch_size "${EVAL_BATCH}" \
+    "${DUMP_FLAG[@]}" \
     "$@"

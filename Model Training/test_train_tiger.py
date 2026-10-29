@@ -807,3 +807,38 @@ def test_run_beam_reports_no_cut_off_wider_than_the_beam(monkeypatch, caplog):
     assert "level-0 cover@1: 0/1 rows" in text, "the target code is not in the top 1"
     assert "R@1 0.00%" in text, "a target outside the beam counts as a miss here"
     assert "R@100" not in text, "the beam cannot report a cut-off wider than itself"
+
+def test_run_beam_dump_carries_what_a_budget_comparison_needs(monkeypatch, tmp_path):
+    """`--dump_rows` must record the tuples, because the item count is not recoverable.
+
+    A beam of W names W tuples, and a tuple carries 1 to 315 catalogue items, so the
+    number of items the arm named differs on every row. `budget_match.py` rebuilds that
+    count from these tuples; without them the only options are interpolating another
+    arm's curve or assuming a fixed k, and both were what this run replaced.
+    """
+    codes = np.array([[0, 0], [1, 1], [2, 2], [0, 1], [1, 0], [2, 0]], dtype=np.int64)
+    sid_in = (codes + 10).astype(np.int64)
+    # Row 0 targets item 0 = (0, 0), which a beam of 1 drops; row 1 targets item 3.
+    split = _Split([[5, 6], [7, 8]], [0, 3])
+    model = _GradModel([[0.0, -6.0, -6.0], [-6.0, 0.0, -6.0]])
+    meta = _beam_meta()
+
+    monkeypatch.setattr(tt, "_load_for_eval",
+                        lambda a, l: (meta, model, sid_in, codes, torch.device("cpu")))
+    monkeypatch.setattr(tt, "_load_splits", lambda a, m, l: (split, split))
+
+    out = tmp_path / "dumps" / "beam.npz"      # the directory does not exist yet
+    args = tt.parse_args(["--mode", "beam", "--beam_width", "1", "--beam_rows", "0",
+                          "--prefix_conditioning", "--dump_rows", str(out)])
+    tt.run_beam(args, logging.getLogger("test-beam"))
+
+    with np.load(out) as z:
+        assert z["rows"].tolist() == [0, 1]
+        assert z["targets"].tolist() == [0, 3], "the catalogue row, not the code"
+        assert z["rank"].tolist() == [2, 1], "a miss is beam_width + 1, so it stays a miss"
+        assert int(z["beam_width"]) == 1
+        assert int(z["n_rows"]) == 2 and int(z["n_split"]) == 2
+        assert z["sid_sizes"].tolist() == [3, 3], "the widths the tuples are counted with"
+        assert z["tuples"].shape == (2, 1, 2), "padded to [rows, beam_width, levels]"
+        assert z["tuples"][1, 0].tolist() == [0, 1]
+        assert z["covered0"].tolist() == [True, True], "level-0 cover is per row"

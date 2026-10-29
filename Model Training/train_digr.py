@@ -1024,7 +1024,9 @@ def _load_splits(args, meta: RunMeta, logger: logging.Logger
 
 @torch.inference_mode()
 def evaluate(model: DiGRRetriever, loader: DataLoader, device: torch.device,
-             amp_dtype: torch.dtype, use_amp: bool) -> Dict[str, float]:
+             amp_dtype: torch.dtype, use_amp: bool,
+             rank_sink: Optional[List[Tuple[np.ndarray, np.ndarray, np.ndarray]]] = None,
+             ) -> Dict[str, float]:
     """Full-catalog ranking metrics.
 
     Every row carries exactly one target, so hit rate and recall coincide and
@@ -1033,7 +1035,15 @@ def evaluate(model: DiGRRetriever, loader: DataLoader, device: torch.device,
     `EVAL_KS` is set, so a recall@1000 run still reports MRR@10.  A row whose
     target misses the top `kmax` is scored as rank `kmax + 1`, so it is a miss at
     every `k` and adds zero gain (rank 0 would pass every test).
+
+    `rank_sink`, when given, receives `(rows, targets, rank)` per batch above the
+    `[B]` sub-batch. The ranks are otherwise reduced into cut-offs and lost, and
+    they are the only way to ask a question this function cannot: "was the target
+    inside the first N items" for an N that differs per row (see
+    `budget_match.py`). `rows` is the split row index, not the batch position, so
+    the caller can scatter into a full-length array.
     """
+
 
     model.eval()
     kmax = max(EVAL_KS)
@@ -1043,7 +1053,7 @@ def evaluate(model: DiGRRetriever, loader: DataLoader, device: torch.device,
     gains = {k: 0.0 for k in EVAL_KS}
     rr = 0.0
 
-    for ids, mask, targets, _ in loader:
+    for ids, mask, targets, rows in loader:
         ids = ids.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
@@ -1080,6 +1090,12 @@ def evaluate(model: DiGRRetriever, loader: DataLoader, device: torch.device,
             torch.where(rank <= MRR_K, 1.0 / rank.clamp(min=1.0),
                         torch.zeros_like(rank)).sum().item()
         )
+        if rank_sink is not None:
+            rank_sink.append((
+                rows.detach().cpu().numpy().astype(np.int64, copy=False),
+                targets.detach().cpu().numpy().astype(np.int64, copy=False),
+                rank.detach().cpu().numpy().astype(np.int64),
+            ))
 
     n = max(1, total_n)
     out: Dict[str, float] = {

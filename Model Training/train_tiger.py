@@ -1315,6 +1315,11 @@ def run_beam(args, logger: logging.Logger) -> None:
     total = 0
     cover = 0
     ranks: List[int] = []
+    dump = bool(getattr(args, "dump_rows", None))
+    dump_row: List[int] = []
+    dump_target: List[int] = []
+    dump_cover0: List[bool] = []
+    dump_tuples: List[List[List[int]]] = []
     for ids, mask, labels, _positions, _targets, _rows in loader:
         ids = ids.to(device)
         mask = mask.to(device)
@@ -1345,7 +1350,10 @@ def run_beam(args, logger: logging.Logger) -> None:
             # decode rate, and one of those costs a 53-minute round trip to find.
             if "logp" in first:
                 top = np.argsort(-first["logp"])[:args.beam_width]
-                cover += int(int(target[0]) in top)
+                covered0 = int(target[0]) in top
+            else:
+                covered0 = False
+            cover += int(covered0)
             ordered = [p for _, p in beam]
             if target in ordered:
                 hit += 1
@@ -1355,7 +1363,19 @@ def run_beam(args, logger: logging.Logger) -> None:
                 ranks.append(ordered.index(target) + 1)
             else:
                 ranks.append(args.beam_width + 1)
+            if dump:
+                # All four per row, from the same decode, so `budget_match.py` can
+                # pair a row's beam cost with that row's rank in any other arm.
+                dump_row.append(int(_rows[row]))
+                dump_target.append(int(_targets[row]))
+                dump_cover0.append(bool(covered0))
+                dump_tuples.append([list(p) for p in ordered[:args.beam_width]])
     ceiling = 100.0 * hit / max(1, total)
+    if dump:
+        _write_beam_dump(args.dump_rows, dump_row, ranks, dump_target, dump_cover0,
+                         dump_tuples, args.beam_width,
+                         meta.vocab.sid_sizes[:meta.vocab.num_levels], len(split),
+                         logger)
     logger.info(
         f"  beam@{args.beam_width}: {hit}/{total} targets decoded ({ceiling:.2f}%)"
     )
@@ -1380,6 +1400,51 @@ def run_beam(args, logger: logging.Logger) -> None:
         logger.info(f"  (beam@{args.beam_width} decoded the target for "
                     f"{ceiling:.2f}% of rows; the R@k above already count the "
                     f"rest as misses)")
+
+
+def _write_beam_dump(path: str, val_rows: List[int], ranks: List[int],
+                     targets: List[int], cover0: List[bool],
+                     tuples: List[List[List[int]]], beam_width: int,
+                     sid_sizes: Sequence[int], n_split: int,
+                     logger: logging.Logger) -> None:
+    """Save the per-row beam result, with the tuples it kept.
+
+    `tuples` is padded with -1 where the beam came back short, so a row that named
+    fewer than `beam_width` tuples counts fewer items without a special case at the
+    read side. The codes are raw (not packed) so `budget_match.py` can pack them with
+    its own radix and refuse a mismatch instead of silently reinterpreting them.
+    """
+    n = len(val_rows)
+    levels = len(sid_sizes)
+    if not (len(ranks) == len(targets) == len(cover0) == len(tuples) == n):
+        raise AssertionError("the per-row beam lists disagree in length")
+    arr = np.full((n, int(beam_width), int(levels)), -1, dtype=np.int32)
+    for i, kept in enumerate(tuples):
+        for j, codes in enumerate(kept):
+            if len(codes) != levels:
+                raise ValueError(f"row {i} tuple {j} has {len(codes)} codes, expected {levels}")
+            arr[i, j] = codes
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    np.savez_compressed(
+        path,
+        rows=np.asarray(val_rows, dtype=np.int64),
+        rank=np.asarray(ranks, dtype=np.int64),
+        targets=np.asarray(targets, dtype=np.int64),
+        covered0=np.asarray(cover0, dtype=bool),
+        tuples=arr,
+        beam_width=np.int64(beam_width),
+        sid_sizes=np.asarray(list(sid_sizes), dtype=np.int64),
+        n_rows=np.int64(n),
+        n_split=np.int64(n_split),
+    )
+    logger.info(f"  wrote {path} ({human_int(n)} rows, beam {beam_width}, "
+                f"{levels} levels)")
+    if n < n_split:
+        logger.warning(
+            f"  ! the dump covers {human_int(n)} of {human_int(n_split)} rows. "
+            "budget_match.py refuses a partial dump, because a per-row budget "
+            "from one row set and a rank from another cannot be paired."
+        )
 
 
 def _state_for_prefixes(model: TigerRetriever, ids: torch.Tensor, mask: torch.Tensor,
@@ -1481,6 +1546,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--beam_width", type=int, default=DEFAULT_BEAM_WIDTH)
     p.add_argument("--beam_rows", type=int, default=512,
                    help="val rows to decode in --mode beam (0 = all)")
+    p.add_argument("--dump_rows", type=str, default=None,
+                   help="write the per-row beam result as npz (rows, rank, targets, "
+                        "tuples). `budget_match.py` needs the tuples to know how many "
+                        "items the beam actually named on each row; nothing recovers "
+                        "them after the run")
     return p.parse_args(argv)
 
 

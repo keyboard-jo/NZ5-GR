@@ -144,3 +144,49 @@ def test_missing_vocab_is_rejected(tmp_path):
     with pytest.raises(SystemExit) as exc:
         E.check_data_dir_matches_checkpoint(_meta(), str(data_dir))
     assert "vocab.json" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# --dump_ranks: the file a matched-budget comparison reads
+# ---------------------------------------------------------------------------
+
+def _parts():
+    """Two batches, deliberately out of row order, covering rows 0..5."""
+    return [
+        (np.array([3, 4, 5]), np.array([30, 40, 50]), np.array([7, 10001, 1])),
+        (np.array([0, 1, 2]), np.array([10, 20, 21]), np.array([1, 2, 3])),
+    ]
+
+
+def test_write_ranks_scatters_by_row_index(tmp_path):
+    """Batches arrive in loader order, not row order, so the scatter must be by index."""
+    out = tmp_path / "ranks" / "digr_val.npz"      # directory does not exist yet
+    E.write_ranks(str(out), _parts(), 6, {"kind": "digr", "split": "val"}, _log())
+
+    with np.load(out) as z:
+        assert z["rows"].tolist() == [0, 1, 2, 3, 4, 5]
+        assert z["targets"].tolist() == [10, 20, 21, 30, 40, 50]
+        assert z["rank"].tolist() == [1, 2, 3, 7, 10001, 1]
+        assert int(z["n_rows"]) == 6
+        assert str(z["kind"]) == "digr", "budget_match.py needs to know which arm this is"
+
+
+def test_write_ranks_refuses_a_dump_that_misses_a_row(tmp_path):
+    """A gap would mis-align one arm's rows against another arm's, silently."""
+    parts = [(np.array([0, 2]), np.array([10, 30]), np.array([1, 1]))]
+    with pytest.raises(SystemExit) as exc:
+        E.write_ranks(str(tmp_path / "x.npz"), parts, 3, {}, _log())
+    assert "produced no rank" in str(exc.value)
+    assert not (tmp_path / "x.npz").exists(), "nothing is written on a refusal"
+
+
+def test_write_ranks_refuses_a_row_with_no_target(tmp_path):
+    parts = [(np.array([0, 1]), np.array([10, -1]), np.array([1, 2]))]
+    with pytest.raises(SystemExit) as exc:
+        E.write_ranks(str(tmp_path / "x.npz"), parts, 2, {}, _log())
+    assert "no target" in str(exc.value)
+
+
+def _log():
+    import logging
+    return logging.getLogger("test-write-ranks")

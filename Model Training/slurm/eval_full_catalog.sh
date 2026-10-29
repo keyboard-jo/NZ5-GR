@@ -35,6 +35,20 @@ DATA_DIR=${DATA_DIR:-/scratch/mscbdtspod2026/jksulaiman/data/digr_data}
 RUN_DIR=${RUN_DIR:-/scratch/mscbdtspod2026/jksulaiman/data/digr_runs/digr_0p6b_e3_full_sampled300k}
 CKPT=${CKPT:-final}
 KS=${KS:-1,10,100,1000,10000}
+DUMP_RANKS=${DUMP_RANKS:-}
+
+# Per-row ranks, one array of 98,304, so an arm can be scored at a budget nobody
+# fixed in advance. `budget_match.py` needs every arm scored at the same number of
+# items per row, and that number comes from the TIGER beam (20 tuples, ~1.5 items
+# each, so ~30 items but not 30 on any particular row). Without this dump the only
+# option is interpolating this arm's curve to k=30, which is what the table does
+# today and what a measured cell would replace. Costs nothing measurable.
+extra=()
+if [ -n "${DUMP_RANKS}" ]; then
+  mkdir -p "$(dirname "${DUMP_RANKS}")"
+  extra+=(--dump_ranks "${DUMP_RANKS}")
+fi
+echo "ranks dump: ${DUMP_RANKS:-none}"
 
 # Scores the 3-epoch full-label checkpoint over ALL 4,783,154 catalog items, the
 # same space the popularity baseline was measured in.  No training, one pass.
@@ -48,4 +62,5 @@ python eval_full_catalog.py \
   --ks "${KS}" \
   --batch_size 128 \
   --local_files_only \
-  --out_json "${RUN_DIR}/full_catalog_metrics_${CKPT}.json"
+  --out_json "${RUN_DIR}/full_catalog_metrics_${CKPT}.json" \
+  "${extra[@]}"

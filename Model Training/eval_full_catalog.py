@@ -35,6 +35,7 @@ import math
 import os
 import sys
 import time
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -108,6 +109,10 @@ def parse_cli() -> argparse.Namespace:
     p.add_argument("--device", default=None)
     p.add_argument("--local_files_only", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--out_json", default=None, help="write the metrics here as JSON")
+    p.add_argument("--dump_ranks", default=None,
+                   help="write one rank per row here as npz. `budget_match.py` needs "
+                        "these to compare two arms at a matched candidate budget, and "
+                        "nothing recovers them after the run")
     cli = p.parse_args()
 
     args.checkpoint = cli.checkpoint
@@ -194,6 +199,36 @@ def check_data_dir_matches_checkpoint(meta, data_dir: str) -> None:
         )
 
 
+def write_ranks(path: str, parts: List[Tuple[np.ndarray, np.ndarray, np.ndarray]],
+                n_rows: int, extra: Dict[str, Any], logger: logging.Logger) -> None:
+    """Scatter per-batch ranks into one `[n_rows]` array and save them.
+
+    The batch carries its split row index, so scatter by index rather than
+    concatenating and assuming order. A row left at -1 means the array does not
+    describe every row, which would silently mis-align one arm against another in
+    `budget_match.py`, so that fails instead of warning.
+    """
+    ranks = np.full(n_rows, -1, dtype=np.int64)
+    targets = np.full(n_rows, -1, dtype=np.int64)
+    for rows, tgt, rank in parts:
+        ranks[rows] = rank
+        targets[rows] = tgt
+    missing = int((ranks < 0).sum())
+    if missing:
+        raise SystemExit(
+            f"{missing:,} of {n_rows:,} rows produced no rank, so the dump would "
+            "describe a subset of the split. `--max_rows` is the usual cause, and "
+            "it makes this arm incomparable with any other arm's rows."
+        )
+    if (targets < 0).any():
+        raise SystemExit("a row was written with no target, so the dump is incomplete")
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    np.savez_compressed(path, rows=np.arange(n_rows, dtype=np.int64),
+                        targets=targets, rank=ranks, n_rows=np.int64(n_rows),
+                        **{k: np.asarray(v) for k, v in extra.items()})
+    logger.info(f"  wrote {path} ({n_rows:,} rows, split row order)")
+
+
 @torch.inference_mode()
 def main() -> int:
     args, cli = parse_cli()
@@ -233,6 +268,7 @@ def main() -> int:
     indices = np.arange(len(split), dtype=np.int64)
     if cli.max_rows is not None:
         indices = indices[: max(1, int(cli.max_rows))]
+    parts: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
 
     ds = T.TokenDataset(split, indices)
     loader = DataLoader(
@@ -266,8 +302,22 @@ def main() -> int:
     logger.info(f"  cut-offs     : {list(ks)}  (topk {max(ks)}, MRR@{T.MRR_K})")
     logger.info("  scoring full-catalog logits per row (no candidate list) ...")
 
-    m = T.evaluate(retriever, loader, device, amp_dtype, use_amp)
+    m = T.evaluate(retriever, loader, device, amp_dtype, use_amp, rank_sink=parts)
     elapsed = time.time() - t0
+
+    if cli.dump_ranks and parts:
+        # Recompute every cut-off from the ranks about to be written, so the file and
+        # the log line cannot disagree. Cheap, and it turns a wrong scatter into a
+        # message here instead of a plausible table two steps later.
+        flat = np.concatenate([rank for _, _, rank in parts])
+        for k in ks:
+            got = float((flat <= k).sum()) / max(1, int(flat.size))
+            if abs(got - m[f"recall@{k}"]) > 1e-9:
+                raise SystemExit(
+                    f"the ranks about to be dumped give R@{k} {100 * got:.4f}% but "
+                    f"this run reported {100 * m[f'recall@{k}']:.4f}%; refusing to "
+                    "write a file that disagrees with the metrics above"
+                )
 
     uniform = math.log(full_catalog)
     logger.info("-" * 78)
@@ -340,6 +390,12 @@ def main() -> int:
         with open(cli.out_json, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
         logger.info(f"  wrote {cli.out_json}")
+    if cli.dump_ranks:
+        write_ranks(cli.dump_ranks, parts, len(split),
+                    {"split": cli.split,
+                     "checkpoint": os.path.abspath(args.checkpoint),
+                     "catalog_size": int(full_catalog),
+                     "kind": "digr"}, logger)
     return 0
 
 
