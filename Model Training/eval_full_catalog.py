@@ -329,7 +329,7 @@ def main() -> int:
             f"loss {m['loss']:.4f} is above ln K = {uniform:.3f}, so the model is "
             "worse than a uniform guess and the checkpoint is not predicting these "
             "rows at all. That is a broken comparison, not a weak model (see "
-            "docs/results.md section 12). Nothing has been written."
+            "docs/archive/results.md section 12). Nothing has been written."
         )
     for k in ks:
         rec = m[f"recall@{k}"]

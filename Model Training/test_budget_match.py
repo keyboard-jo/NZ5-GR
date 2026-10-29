@@ -270,3 +270,45 @@ def test_a_directory_mixing_baselines_is_refused(tmp_path):
     with pytest.raises(SystemExit) as exc:
         _run(tmp_path, data, beam, [("mixed", chunk)])
     assert "more than one baseline" in str(exc.value)
+    # and the refusal points at the form that does work
+    assert "_*.npz" in str(exc.value)
+
+
+def test_a_glob_picks_one_baseline_out_of_a_shared_window_directory(tmp_path):
+    """The layout run_baselines.sh actually produces: both kinds in one directory.
+
+    A directory of chunks cannot be read there, so the glob is the supported form and
+    it has to select by name rather than by position.
+    """
+    data = _write_dataset(tmp_path)
+    beam = tmp_path / "beam.npz"
+    _write_beam(beam)
+    shared = tmp_path / "baselines" / "h20"
+    shared.mkdir(parents=True)
+    for kind, rank in (("coclick", ARM_RANK), ("popularity", [10001] * 4)):
+        for lo in (0, 2):
+            np.savez(shared / f"{kind}_{lo:06d}.npz",
+                     rows=np.arange(lo, lo + 2, dtype=np.int64),
+                     targets=np.asarray(VAL_TARGETS[lo:lo + 2], dtype=np.int64),
+                     rank=np.asarray(rank[lo:lo + 2], dtype=np.int64))
+
+    out = BM.main(["--data_dir", str(data), "--beam", str(beam),
+                   "--out_dir", str(tmp_path / "out"),
+                   "--arm", f"coclick_h20={shared}/coclick_*.npz",
+                   "--arm", f"popularity_h20={shared}/popularity_*.npz"])
+    assert out == 0
+    got = json.loads((tmp_path / "out" / "budget_match.json").read_text())
+    arms = {a["arm"]: a for a in got["arms"]}
+    assert set(arms) == {"TIGER (beam)", "coclick_h20", "popularity_h20"}
+    # the two chunks are reassembled in row order, so coclick scores and popularity does not
+    assert arms["coclick_h20"]["match_all"] == pytest.approx(0.5)
+    assert arms["popularity_h20"]["match_all"] == pytest.approx(0.0)
+
+
+def test_a_glob_that_matches_nothing_is_refused(tmp_path):
+    data = _write_dataset(tmp_path)
+    beam = tmp_path / "beam.npz"
+    _write_beam(beam)
+    with pytest.raises(SystemExit) as exc:
+        _run(tmp_path, data, beam, [("gone", tmp_path / "nope_*.npz")])
+    assert "matched no files" in str(exc.value)

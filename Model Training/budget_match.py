@@ -187,13 +187,19 @@ def load_rank_file(path: str, name: str) -> Arm:
 
 
 def load_arm(path: str, name: str, n_rows: int) -> Arm:
-    """One npz, or a directory of per-chunk npz for one baseline.
+    """One npz, a glob of per-chunk npz, or a directory of them for one baseline.
 
-    A directory is taken as already scoped to one arm, so every `*.npz` in it is read
-    and the `--arm` name is only a label. That is what lets two windows of the same
-    baseline be loaded side by side (`--arm coclick_h20=.../h20/coclick`), and the
-    duplicate-row check below still refuses a directory that holds more than one arm.
+    The glob is the form the slurm scripts actually produce: `run_baselines.sh` writes
+    every kind into the same window directory, so `baselines/h20/` holds 64
+    `coclick_*.npz` beside 64 `popularity_*.npz` and the pattern is what keeps them
+    apart. A directory is also accepted, but only when it holds a single baseline, so a
+    mixed one is refused instead of silently merged.
     """
+    if glob.has_magic(path):
+        files = sorted(glob.glob(path))
+        if not files:
+            raise SystemExit(f"--arm {name}={path} matched no files")
+        return _stack_chunks(files, name)
     if os.path.isdir(path):
         files = sorted(glob.glob(os.path.join(path, "*.npz")))
         if not files:
@@ -202,17 +208,21 @@ def load_arm(path: str, name: str, n_rows: int) -> Arm:
         if len(prefixes) > 1:
             raise SystemExit(
                 f"{path} holds more than one baseline ({', '.join(prefixes)}), so one "
-                "`--arm` would mix them. Point at a directory that holds one, e.g. "
-                "the `h20/coclick` subdirectory the baseline script writes."
+                "`--arm` would mix them. Pass a glob instead, e.g. "
+                f"`--arm {name}={os.path.join(path, prefixes[0])}_*.npz`."
             )
-        rows = np.concatenate([_as_int(np.load(f)["rows"]) for f in files])
-        targets = np.concatenate([_as_int(np.load(f)["targets"]) for f in files])
-        rank = np.concatenate([_as_int(np.load(f)["rank"]) for f in files])
-        order = np.argsort(rows, kind="stable")
-        return Arm(name, rows[order], targets[order], rank[order])
+        return _stack_chunks(files, name)
     if not os.path.isfile(path):
         raise SystemExit(f"--arm {name}={path} does not exist")
     return load_rank_file(path, name)
+
+
+def _stack_chunks(files: List[str], name: str) -> Arm:
+    rows = np.concatenate([_as_int(np.load(f)["rows"]) for f in files])
+    targets = np.concatenate([_as_int(np.load(f)["targets"]) for f in files])
+    rank = np.concatenate([_as_int(np.load(f)["rank"]) for f in files])
+    order = np.argsort(rows, kind="stable")
+    return Arm(name, rows[order], targets[order], rank[order])
 
 
 def scatter(arm: Arm, n_rows: int, label: str) -> Tuple[np.ndarray, np.ndarray]:

@@ -12,7 +12,8 @@
 # The ranking pass for a prefix-conditioned TIGER checkpoint. `--mode eval` refuses
 # this checkpoint on purpose (its score depends on the path taken, so it cannot be
 # computed for all 4.78M items in one forward), so the beam is the only way to turn
-# `cover@k` in the training log into an actual R@k for the table in docs/results.md.
+# `cover@k` in the training log into an actual R@k for the table in docs/archive/results.md.
+# The matched-budget reading of the result lives in docs/README.md section 1.
 #
 #   sbatch eval_tiger_beam.sh                      # beam 20 over all 98,304 val rows
 #   BEAM_ROWS=2048 sbatch eval_tiger_beam.sh       # smoke test, minutes not hours

@@ -30,7 +30,9 @@ Mock data, fake backbones, no GPU, and never a real training run.
 
 ## Where the numbers live
 
-- `../docs/results.md` frozen result tables
-- `../docs/math.md` formulas, and what each baseline actually optimises
-- `../docs/sid_results.md` codebook and embedding geometry
-- `../docs/tasks.md` what is left to do
+- `../docs/README.md` the live record: the matched-budget result and the direction
+- `../docs/archive/` everything written before 2026-10-29, frozen as history
+- `../docs/archive/results.md` older result tables (superseded in part, see `docs/README.md`)
+- `../docs/archive/math.md` formulas, and what each baseline actually optimises
+- `../docs/archive/sid_results.md` codebook and embedding geometry
+- `../docs/archive/tasks.md` the pre-archive task list

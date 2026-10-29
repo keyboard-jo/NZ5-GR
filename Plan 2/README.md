@@ -283,7 +283,7 @@ Full-catalogue evaluation of `best/`, same 98,304 rows and all 4,783,154 items,
 55.7058%, nDCG@10 0.02190, MRR@10 0.01742, loss 11.0133. That is 1.33x, 1.41x,
 1.45x, 1.28x and 1.12x the frozen run at the same cut-offs, and ahead of co-click
 window 20 at ranks 1, 1,000 and 10,000 while level at ranks 10 and 100. Full table
-and caveats in `docs/results.md` section 12.
+and caveats in `docs/archive/results.md` section 12.
 
 ## train_tiger.sh
 
@@ -300,7 +300,7 @@ Ran on v2, three epochs, 3.2 GPU-hours: **R@1 1.4400%, R@10 2.4500%, R@100 6.590
 R@1000 20.0800%, R@10000 45.7600%, nDCG@10 0.01870, MRR@10 0.01700**. That leads
 everything measured on this data at rank 1 (DiGR v2 1.0549%, co-click 0.8057%) and
 loses to both from rank 10 outwards (0.67x and 0.60x of DiGR at R@10 and R@100), so
-the arm clears the bar at neither. `docs/results.md` section 13 has the per-epoch
+the arm clears the bar at neither. `docs/archive/results.md` section 13 has the per-epoch
 table and the reading: at two levels with `PREFIX=0` the score is additive over the
 same two code rows as DiGR's, so the run compares two losses on one function class.
 
@@ -358,7 +358,7 @@ checkpoint by val loss, 13.2635 nats over two 8,192-way cross-entropies against
 
 Rank 1 belongs to TIGER. From rank 10 outwards it loses to both the model and the
 count table, so the bar is missed by a third and by a half. The reading is in
-`docs/results.md` section 13: with two levels and `PREFIX=0` the score is
+`docs/archive/results.md` section 13: with two levels and `PREFIX=0` the score is
 `log p(c1|h) + log p(c2|h)`, which is additive over the same two code rows that
 DiGR adds, so this run compares two losses on one function class. Denser
 supervision sharpens the marginals that decide the first guess and does nothing for

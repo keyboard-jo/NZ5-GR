@@ -30,7 +30,8 @@
 # content):
 #   *.npz with a `tuples` array                      the beam dump, required
 #   *.npz with `kind` or no `tuples`                 DiGR's per-row ranks
-#   baselines/<window>/<baseline>/*.npz              co-click and popularity chunks
+#   baselines/<window>/<baseline>_*.npz            co-click and popularity chunks
+#   baselines/<window>/<baseline>/*.npz            same, if a per-kind subdir exists
 #
 # Exit code 1 means nothing was written. That is deliberate: every guard in
 # budget_match.py refuses rather than warns, because a table built on misaligned rows
@@ -96,8 +97,19 @@ else
     [ -n "$found" ] && ARMS+=("DiGR=${found}")
 fi
 for kind in coclick popularity; do
-    dir="${DUMP_DIR}/baselines/${WINDOW}/${kind}"
-    [ -d "$dir" ] && ARMS+=("${kind}_${WINDOW}=${dir}")
+    # Two shapes are accepted, because run_baselines.sh writes the flat one: every kind
+    # lands in the same window directory, so `h20/` holds 64 coclick chunks beside 64
+    # popularity chunks and only the glob separates them. A per-kind subdirectory still
+    # works if one is ever created by hand.
+    dir="${DUMP_DIR}/baselines/${WINDOW}"
+    shopt -s nullglob
+    chunks=("${dir}/${kind}"_*.npz)
+    shopt -u nullglob
+    if [ ${#chunks[@]} -gt 0 ]; then
+        ARMS+=("${kind}_${WINDOW}=${dir}/${kind}_*.npz")
+    elif [ -d "${dir}/${kind}" ]; then
+        ARMS+=("${kind}_${WINDOW}=${dir}/${kind}")
+    fi
 done
 [ ${#ARMS[@]} -gt 0 ] || echo "  ! no rank dumps found, so only TIGER's own reach is reported" >&2
 

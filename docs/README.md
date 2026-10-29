@@ -1,42 +1,264 @@
-# Docs
+# NZ5-GR — current record
 
-Index only. Each file stands alone.
+This file is the live record for the project. Everything written before 2026-10-29 is in
+`docs/archive/` and stays there as history: it contains the measurements, derivations and
+retired plans that led here, including conclusions this file corrects. When the two
+disagree, this file wins.
 
-> **Read `direction.md` first.** It is the file that decides what the next GPU
-> hours are for, and it contradicts the ordering in `tasks.md`: the item-side
-> capacity axis has a measured slope of 0.15 (`log 1.41 / log 9.3`) and is spent,
-> the intra-list conditional `P(top10 | top1000)` is 13-15% for every method ever
-> measured here, and the remaining 2.5-3x is query-side information plus dose.
+The archived files refer to each other as `docs/x.md`. Those paths are now
+`docs/archive/x.md`; nothing else inside them was edited, so their text still reads as it
+did when it was written.
 
-| file | what is in it |
-|---|---|
-| `direction.md` | **where the next 5x can and cannot come from**: the coverage × precision decomposition, the 0.15 item-side slope, the co-click code prior, longer history, the mixture-of-intents head, TIGER's depth axis, and the three CPU measurements to run first |
-| `math.md` | the formulas: popularity, SID transition, co-click kNN, DiGR, and why each behaves the way it does |
-| `data.md` | the numbers behind them: catalog, splits, vocab, token layout, what a row of tokens is |
-| `sid_math.md` | how the item embeddings and the Semantic IDs are produced |
-| `sid_diagnostics.md` | how to judge a generated SID for our use of it: coverage, bucket lift, per-level value, tie ceiling, geometry, and the failure signatures |
-| `results.md` | the measured table, every method on the same 98,304 rows, with compute cost |
-| `problems.md` | what those results mean for the direction of the project, including what went wrong |
-| `tasks.md` | what is left to do, in order, with the reason each item exists |
-| `plan_v2.md` | the next SID release and the richer event stream: what a wider codebook buys, what the event stream is throwing away, and the predictions in advance |
-| `embedding_weakness.md` | why the Stage 1 item embeddings are behaviourally weak, and what OnePiece does differently |
-| `recap_supervisor.md` | a self-contained status snapshot for the co-supervisor, current as of 2026-10-26 |
-| `../Plan 2/README.md` | the SID diagnostic script, how to read bucket lift, and the content SID measured |
+Two things are recorded below. The measured result of the matched-budget pass, which is
+the first comparison in this project where every arm was allowed the same number of items
+per row. And the direction, which survived that result and is now sharper for it.
 
-Current state in one line: the three-arm table is complete on the endorsed 2 x 8,192
-SID, and the answer is split by cut-off. TIGER owns rank 1 (1.44% against DiGR's
-1.05% and co-click's 0.81%), DiGR owns ranks 10 to 10,000 (3.66% and 10.92% level
-with co-click, then 27.66% and 55.71% against 25.30% and 46.89%), and the count
-table stays in front of both from rank 10 to 1,000 for 47 seconds against 3.2 GPU
-hours. Widening the codebook is what moved DiGR: 18,684 items per level-0 code
-became 584 and bucket lift went from 46.9x to 463.3x on the same embedding, while
-the Stage 1 towers stay below a frequency count. At two levels a prefix-free score
-is additive over two shared code rows, so DiGR and prefix-free TIGER sit in one
-function class and their gap is a loss difference, not a factorisation. The
-prefix-conditioned arm has now run, and depth pays: at a matched 30-item candidate
-budget it names the target 12.58% of the time against DiGR's 7.12%, one conditional
-level for 1.77x, while two thirds of its level-0 coverage is still lost at the
-joint. Read
-`results.md` for the numbers, `problems.md` for what they imply, `plan_v2.md` for
-what changes next and what it is expected to buy, and `sid_diagnostics.md` before
-judging any new SID.
+---
+
+# 1. The result: matched budget, 2026-10-29
+
+## 1.1 Why a new pass was needed
+
+Every previous comparison in `archive/results.md` compared arms at the same *cut-off*
+(`R@10`, `R@1000`), which silently gives each arm a different sized shortlist. TIGER's
+beam names a fixed number of SID tuples; DiGR ranks the whole 4,783,154 item catalogue.
+`R@10` for TIGER means "target's tuple is among the first 10 tuples"; for DiGR it means
+"target is among the first 10 items". Those are different questions and the table they
+produced was unreadable in both directions.
+
+The pass was meant to fix that, and it started from a wrong assumption: that a beam of 20
+tuples names about 32 items, because the catalogue averages 1.593 items per tuple.
+
+## 1.2 The correction: the beam names 192 items, not 32
+
+| quantity | value |
+| --- | --- |
+| catalogue | 4,783,154 items, 2 levels of 8,192 |
+| distinct level-0+1 tuples | 3,002,708 |
+| catalogue mean items per tuple | 1.593 |
+| 20 tuples at the catalogue rate | 31.9 items |
+| **items actually named per row** | **mean 192.17, median 171, min 25, max 1439** |
+| implied items per *selected* tuple | 9.6 (6.0x the catalogue rate) |
+| the same, restricted to target-set items | mean 91.41, median 83, min 9, max 410 |
+
+A beam is a *scored* search, not a random sample of tuples. It walks into the level-0
+codes carrying the most next-item mass, and the categories holding popular items are
+exactly the fat ones. So it selects dense cells by construction, every row, with no short
+beams (min 20 tuples kept on all 98,304 rows).
+
+This is a real property of the method, not a bug. It also means a beam's width *understates*
+its coverage by about 6x, which nobody had accounted for.
+
+## 1.3 The table
+
+Same 98,304 validation rows, same 4,783,154 item catalogue, every arm scored by whether
+the single true target is inside the items that arm names. `matched @ N_r` allows each arm
+the exact number of items the beam named on that row.
+
+| arm | items named / row | matched @ N_r | @ k=171 | @ k=192 | @ k=1000 | @ k=10000 | cost |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **DiGR v2** | full catalogue | **13.9994%** | 13.8224% | 14.4989% | 27.6622% | 55.7058% | 1.8 min GPU |
+| coclick h20 | ~192 | ~13.68% *est* | 13.5824% | 14.1825% | 25.3021% | 46.8882% | 43 s CPU |
+| coclick h10 | ~192 | ~13.5% *est* | 13.4369% | 14.0371% | 24.8311% | — | 43 s CPU |
+| coclick h5 | ~192 | ~13.4% *est* | 12.8621% | 13.4145% | 23.6176% | — | 43 s CPU |
+| **TIGER prefix, beam 20** | **192.2** | **12.5804%** | 12.5804% | 12.5804% | n/a | n/a | 46.6 min GPU |
+| popularity | ~192 | ~6.5% *est* | 6.2083% | 6.6060% | 14.7288% | 36.8215% | < 1 s CPU |
+
+`matched @ N_r` is the only like-for-like column. `R@k` columns are comparable between the
+full-catalogue arms only: TIGER's rank is a tuple rank over ~9.6 items per position, so its
+`R@10` is not the same measurement as DiGR's `R@10`.
+
+The `est` cells are derived, not measured. DiGR loses 0.50 pp going from uniform k=192 to
+its per-row budget (14.4989 to 13.9994); the same shift is applied to each co-click window.
+Measure them by re-running the join with the fixed picker, which costs seconds.
+
+**Reading.** At the budget the beam actually uses, DiGR is 1.11x TIGER, and co-click sits
+between them. TIGER is **8-11% behind DiGR** and about 7% behind plain co-click h20. The
+earlier claim that TIGER was 1.77x ahead was an artefact of assuming a 30-item budget.
+
+## 1.4 The crossover
+
+Reach per item named is not a constant, so the ranking inverts with the budget:
+
+| named items | who leads |
+| --- | --- |
+| 10 | co-click h20 (3.7069%) over DiGR (3.6570%) |
+| ~100 | co-click h20 (10.9873%) over DiGR (10.9182%), a tie |
+| **138** | **DiGR passes TIGER's flat 12.5804% (12.5946%)** |
+| 192 | DiGR (14.4989%) over co-click (14.1825%) over TIGER (12.5804%) |
+| 1,000 | DiGR (27.6622%) over co-click (25.3021%), +9% |
+| 10,000 | DiGR (55.7058%) over co-click (46.8882%), +19% |
+
+There is no single winner. Below 138 items TIGER's reach per item is the best of the three;
+above it DiGR is. The beam lands at 192, on the losing side of its own crossover.
+
+Depth DiGR needs to match a competitor's k=192 reach: k=160 against coclick h5, k=178
+against h10, k=182 against h20, k=34 against popularity.
+
+## 1.5 Where TIGER loses: the second code
+
+| gate | value |
+| --- | --- |
+| level-0 `cover@20` | 42,578 / 98,304 rows = 43.31% |
+| conditional level-1 success | 12,367 / 42,578 = **29.0%** |
+| decoded rows landing at rank <= 10 of the beam | 8,749 / 12,367 = 70.75% |
+
+So in 71% of the rows where TIGER finds the right first code, the right second code is
+outside the top 20 of 8,192 candidates. That single gate is the whole loss. The ordering
+inside the shortlist works; not enough rows enter it.
+
+Beam log, 46.6 min, `logs/tiger_beam_728414.out`: `R@1 2.04%`, `R@5 6.10%`, `R@10 8.90%`,
+`nDCG@1 0.02041`, `nDCG@5 0.04090`, `nDCG@10 0.04993`, `MRR@10 0.03803`.
+
+## 1.6 The two factorisations fail on different rows
+
+| | rows | share |
+| --- | --- | --- |
+| rows TIGER decodes | 12,367 | 12.5804% |
+| ... of which DiGR also has the target inside 192 | 8,032 | 64.95% of TIGER's rows |
+| DiGR gets at 192, TIGER does not | 6,221 | 6.33% |
+| TIGER gets, DiGR does not | 4,335 | 4.41% |
+| **union** | **18,588** | **18.9087%** |
+
+The union is +31% over DiGR alone and +50% over TIGER alone. Explicit prefix conditioning
+and implicit vector superposition are complementary, not redundant. Note this is evidence,
+not a proposed arm: `archive/problems.md` section 1 excludes re-ranking, and a two-arm
+fusion would be a new method rather than a comparison.
+
+## 1.7 What this invalidates
+
+- **"Beam 20 is about R@30"** — off by 6x, 192 items not 32.
+- **"TIGER is 1.77x DiGR at matched budget"** — dead. At the real budget DiGR leads.
+- **Every interpolated cell in `archive/results.md` section 14** that assumed ~30 named
+  items, including DiGR 7.12%, co-click 7.18%, popularity 2.99%, prefix-free TIGER 4.43%.
+- **"The next run is beam 60"** — beam 60 pushes further past the crossover, into the
+  region where DiGR already leads. The informative runs are narrower, see section 2.5.
+
+Never compare `cover@k` with `R@k` either. `cover@1000` 91.55% is reach over roughly
+584,000 items (one level-0 code averages 584 items); DiGR's `R@1000` 27.66% is over 1,000
+items. The gap is the same mistake in a different column.
+
+## 1.8 How it was produced
+
+Four dumps, each carrying the split row index so they are joined positionally and any gap
+or duplicate is a hard failure.
+
+| dump | flag | cost |
+| --- | --- | --- |
+| beam rows, ranks, chosen tuples | `train_tiger.py --dump_rows` | 46.6 min GPU |
+| DiGR per-row target rank | `eval_full_catalog.py --dump_ranks` | 1.8 min GPU |
+| co-click and popularity per-row rank | `baselines_digr.py --dump_ranks` | 4 s + 43 s CPU |
+| join and count | `Model Training/budget_match.{py,sh}` | seconds |
+
+Guards that ran: `eval_full_catalog.py` recomputes every `R@k` from the dumped ranks before
+writing and exits on any disagreement; the join refuses a beam dump built on a different
+SID, tuple shapes that do not match the width, a dump that misses or repeats a row, tuples
+the catalogue does not own, an arm whose `targets` array is misaligned, any `rank == -1`,
+and a named tuple that carries no items. TIGER's own reach is computed as
+`mean(rank <= beam_width)`, never `rank <= N_r`, because a miss is stored as
+`beam_width + 1` and the naive test would score every miss as a hit and print 100%.
+
+Reproduced exactly, independently: DiGR `R@1/R@10/R@100` = 1.0549 / 3.6570 / 10.9182 and
+loss 11.0133; TIGER decoded 12,367 of 98,304.
+
+---
+
+# 2. The direction
+
+Unchanged by the result above, and now with a sharper first step.
+
+## 2.1 Where the headroom is, in one identity
+
+```
+R@10 = R@1000  x  P(target in top 10 | target in top 1000)
+     = 27.6622% x 13.22%
+```
+
+The second factor is the part a better ranker could still win. It is 13-15% for *every*
+arm, including co-click with exact per-item rows (14.65%) and popularity with no query at
+all (9.12%). No arm in this project is close to good at ordering the head; they differ in
+how deep they can reach.
+
+## 2.2 Capacity on the item side is spent
+
+Going from 4x256+731 (1,755 vectors, 1.80M parameters) to 2x8192 (16,386 vectors, 16.78M
+parameters) is 9.3x the parameters for 1.41x the `R@10`:
+
+```
+slope = log(1.41) / log(9.3) = 0.15
+```
+
+A 0.15 exponent means another 10x on the item side buys about 1.4x, and another 100x buys
+about 2x. Two of the three axes that moved in that step were query-side anyway (the action
+token and the 128 gap bins). The 53.51% of items sharing a 2-code tuple and the 315-item
+tie group are real, but the tie ceiling (`R@1` 53.57%, `R@10` 93.20%) is not the binding
+constraint at 3.66%.
+
+Consequence: a bigger codebook is not the big move. S9 at 16,384 is off the table.
+
+## 2.3 The three moves worth making
+
+**(a) A co-click code prior inside the score.** Legal under the content-only rule because it
+is a query-side prior, and a cold item gets zero.
+
+```
+s_i = h . V_i  +  sum_l  lambda_l * log p_hat_l[c_il]
+```
+
+The table in section 2.1 says the discriminative work to be done is inside the top 1,000,
+and the count table says behaviour knows something content does not: co-click reaches
+14.65% conditional where DiGR reaches 13.22%. This puts a measured quantity into the score
+instead of hoping the vector absorbs it.
+
+**(b) A mixture-of-intents head.** One vector per user cannot hold several reasons to click.
+
+```
+log sum_j pi_j exp(h_j . V_i)
+```
+
+Each component is a separator; the mixture is still one summation over the item vectors at
+serving time.
+
+**(c) More query information, not more item capacity.** Co-click's `R@10` climbs 2.5238 →
+3.3783 → 3.6011 → 3.6794 → 3.7069 at windows 1 / 3 / 5 / 10 / 20, and the sweep has
+asymptoted. Going to a 60-event window with 3 anchors is more information per row, not more
+compute per row.
+
+The linear-summation-to-concat-plus-MLP change is not on this list on its own: it is
+item-side capacity, and section 2.2 prices that at 0.15.
+
+## 2.4 TIGER's axis is depth, not width
+
+The factorisation the paper describes needs a real prefix tree. At two levels with
+`PREFIX=0` the arm sits in one function class with DiGR: both are additive over the same two
+shared code rows and both are linear in the separator state, so that run compared losses,
+not factorisations.
+
+The measured prize per extra level, from the prefix run: knowing the true `c1` removes 2.968
+of 7.6731 nats of level-2 entropy, **38.7%**. That is what a third level is worth, and it is
+larger than anything width has bought.
+
+## 2.5 The next four runs, in order
+
+1. **Re-run the join** (`sbatch Model Training/budget_match.sh`, seconds, cpu partition).
+   The picker bug is fixed: `run_baselines.sh` writes both kinds flat into
+   `dumps/baselines/h20/`, the picker wanted a per-kind subdirectory and skipped all three
+   windows. Turns the two `est` cells in section 1.3 into measurements. Nothing else needs
+   re-running; all four dumps are complete and were verified.
+2. **Beam 10 and beam 12** (~25 min each, about 96 and 115 items named). This is the real
+   test of depth, because it sits on the frontier: TIGER has to beat DiGR at 96 items
+   (10.6%) or 115, not at 192. Beam 60 would push the wrong way.
+3. **Three levels at 1,024 codes.** The loss is the 29% level-1 gate with 8,192 candidates.
+   Making each decision 8x cheaper to hit inside a 20-wide beam attacks it directly. Needs
+   a quantiser run of about 1 GPU-h.
+4. **The SASRec bound that was never run** (`archive/tasks.md` 3.5, about 15 min): a tiny
+   sequence model over raw item ids bounds what any SID method can hope for on this data.
+   Without it there is no way to say whether 14% is the data or the factorisation.
+
+## 2.6 What is out of scope, and stays out
+
+Re-ranking. The deliverable is a comparison of SID retrieval methods; a second stage measures
+the second stage and could be bolted onto any arm. ANN and continuous-vector retrieval are
+deferred, not cancelled. Behavioural SID was retired: content is the only input a cold item
+has, so behaviour inside the representation breaks cold start twice. A content encoder that
+ranks better while needing nothing but content at serving time still violates nothing.
