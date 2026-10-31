@@ -14,6 +14,11 @@ matched-budget construction and the guards that refuse a misaligned dump, is doc
 separately in [`evaluation.md`](evaluation.md). Read that before comparing anything here
 with a number from another paper.
 
+The SID itself has its own file, [`sid.md`](sid.md). Both vintages were diagnosed with the
+same instrument, and it records what that instrument can and cannot establish: bucket lift,
+items per code, the collision rate, the tie ceiling, and the fact that none of it is a
+claim about behaviour.
+
 Two things are recorded below. The measured result of the matched-budget pass, which is
 the first comparison in this project where every arm was allowed the same number of items
 per row. And the direction, which survived that result and is now sharper for it.
@@ -56,6 +61,43 @@ beams (min 20 tuples kept on all 98,304 rows).
 
 This is a real property of the method, not a bug. It also means a beam's width *understates*
 its coverage by about 6x, which nobody had accounted for.
+
+**The shape of $N_r$, over all 98,304 rows.**
+
+| statistic | items named per row |
+| --- | --- |
+| mean | 192.17 |
+| standard deviation | 105.76 (coefficient of variation 0.55) |
+| median | 171 |
+| interquartile range | 118 to 240 (122 wide) |
+| p1 / p99 | 47 / 548 |
+| p99.9 | 799 |
+| min / max | 25 / 1,439 |
+| skew | +1.65 |
+| Gini | 0.288 |
+| share of all named items held by the fattest 10% of rows | 22.0% |
+| rows whose 20 tuples are all collision free | 0 |
+
+Full percentile row: p5 67, p10 82, p25 118, p50 171, p75 240, p90 324, p95 393, p99 548.
+
+So a `k = 192` cell is honest about the average and wrong about any given row. The middle half
+of rows name between 118 and 240 items, a factor of 2, and the mean sits above the median
+because of the right tail. Only 1.4% of rows come in under 50 items and 87.2% under 300, while
+no row names fewer than 25. Every row carries at least one tuple with a collision in it.
+
+**The budget is not independent of difficulty.** Decode rate rises with $N_r$:
+
+| $N_r$ quartile | range | rows | mean $N_r$ | decoded |
+| --- | --- | --- | --- | --- |
+| 1 | 25 to 118 | 24,949 | 86.6 | 11.39% |
+| 2 | 118 to 171 | 24,241 | 144.9 | 11.95% |
+| 3 | 171 to 240 | 24,640 | 203.6 | 12.45% |
+| 4 | 240 to 1,439 | 24,474 | 335.1 | 14.55% |
+
+Decoded rows average 204.1 named items against 190.5 for the rows it missed. Fat cells are the
+popular ones, so a longer list correlates with an easier row. The per-row table stays fair,
+because both arms get the same budget on the same row, but the number is implicitly
+popularity-weighted relative to a fixed-$k$ table and that is worth knowing when it is quoted.
 
 ## 1.3 The table
 
@@ -261,7 +303,7 @@ constraint at 3.66%.
 
 Consequence: a bigger codebook is not the big move. S9 at 16,384 is off the table.
 
-## 2.3 The three moves worth making
+## 2.3 The four moves worth making
 
 **(a) A co-click code prior inside the score.** Legal under the content-only rule because it
 is a query-side prior, and a cold item gets zero.
@@ -289,6 +331,49 @@ serving time.
 asymptoted. Going to a 60-event window with 3 anchors is more information per row, not more
 compute per row.
 
+**(d) A content-side tie break.** The SID cannot order items that share a code tuple, and on
+this vocabulary that is 53.51% of the catalogue, mean group 6.39, largest 315. `V_i` is the
+mean of two shared rows, so two colliding items get bit-identical logits and `topk` orders
+them by catalogue index. The cost is not uniform across cut-offs, which is the reason this is
+worth a move rather than a caveat. With 46.49% of targets unique, the colliding ones average
+`(6.39 - 0.4649) / 0.5351 = 11.07` items per group, so
+
+```
+R@1  dilution = 0.4649 + 0.5351/11.07    = 0.513     49% of the skill is invisible
+R@10 dilution = 0.4649 + 0.5351*10/11.07 = 0.948     only 5%
+```
+
+The reported `R@1` of 1.0549% is therefore about 2.06% of tuple-level accuracy. Collision
+adjusted, v2 beats v1 by 2.6x at `R@1` rather than the 1.33x the table shows, so collisions
+have been hiding the SID change, not inflating it.
+
+Legal under the content-only rule, applied to exact ties only:
+
+```
+s_i = h . V_i  +  delta * h . u_i        when h . V_i ties
+```
+
+`u_i` is a per-item content vector, so cold items work, no codes change, the SID is not
+retrained, and the cost is one extra dot product on the tied items only. It is the smallest
+possible use of the clause section 2.6 leaves open.
+
+Ceiling: `R@1` 1.0549% to at most 2.06%, and nothing at `R@10` or beyond. This is a
+precision move and should not be sold as a recall move.
+
+**The check that decides whether the arithmetic holds.** `topk` returns bit-identical logits
+in catalogue index order, so if item ids correlate with anything at all, tie order is
+systematic rather than uniform, and the `1/g` model is wrong. Split DiGR's measured `R@1` by
+whether the target shares its tuple and compare against `1/11.07`. Above it, ties break
+favourably and 2.06% is a floor. Near it, the lottery model holds. Below it, the arm is being
+actively penalised and the fix is worth more than the bound suggests. Minutes on
+`local/2026-29-10-1-full-eval/dumps/digr_val.npz` plus `catalog_sid_codes.npy`; no GPU, no
+retraining.
+
+One caveat, so the number is not over-trusted: exact float ties are rarer than group sizes
+suggest, because the pooled vectors are bf16 sums and can differ in the last bits. The real
+behaviour is probably exact ties, near ties and kernel order mixed together, and only the
+split above can say in what proportion.
+
 The linear-summation-to-concat-plus-MLP change is not on this list on its own: it is
 item-side capacity, and section 2.2 prices that at 0.15.
 
@@ -303,20 +388,24 @@ The measured prize per extra level, from the prefix run: knowing the true `c1` r
 of 7.6731 nats of level-2 entropy, **38.7%**. That is what a third level is worth, and it is
 larger than anything width has bought.
 
-## 2.5 The next four runs, in order
+## 2.5 The next five runs, in order
 
 1. **Re-run the join** (`sbatch Model Training/budget_match.sh`, seconds, cpu partition).
    The picker bug is fixed: `run_baselines.sh` writes both kinds flat into
    `dumps/baselines/h20/`, the picker wanted a per-kind subdirectory and skipped all three
    windows. Turns the two `est` cells in section 1.3 into measurements. Nothing else needs
    re-running; all four dumps are complete and were verified.
-2. **Beam 10 and beam 12** (~25 min each, about 96 and 115 items named). This is the real
+2. **The tie-order check** (minutes, CPU, no GPU). Split DiGR's measured `R@1` by whether
+   the target shares its code tuple, compare against `1/11.07`, and print the curve by group
+   size. It decides whether move (d) is worth building and whether the 2.06% tuple-level
+   figure is real. Independent of everything else here, so it can run alongside.
+3. **Beam 10 and beam 12** (~25 min each, about 96 and 115 items named). This is the real
    test of depth, because it sits on the frontier: TIGER has to beat DiGR at 96 items
    (10.6%) or 115, not at 192. Beam 60 would push the wrong way.
-3. **Three levels at 1,024 codes.** The loss is the 29% level-1 gate with 8,192 candidates.
+4. **Three levels at 1,024 codes.** The loss is the 29% level-1 gate with 8,192 candidates.
    Making each decision 8x cheaper to hit inside a 20-wide beam attacks it directly. Needs
    a quantiser run of about 1 GPU-h.
-4. **The SASRec bound that was never run** (`archive/tasks.md` 3.5, about 15 min): a tiny
+5. **The SASRec bound that was never run** (`archive/tasks.md` 3.5, about 15 min): a tiny
    sequence model over raw item ids bounds what any SID method can hope for on this data.
    Without it there is no way to say whether 14% is the data or the factorisation.
 

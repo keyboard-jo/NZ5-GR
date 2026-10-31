@@ -304,6 +304,28 @@ with $\mathcal{T}$ the target set (10.55% of the catalogue), or the whole clicke
 (33.05%) when `--seen_items` is passed. The two views are reported in separate columns and
 labelled in the header, because they are not interchangeable.
 
+**The measured distribution.** $N_r$ is not a fixed budget with noise around it. Over the
+98,304 validation rows it has mean 192.17, standard deviation 105.76, median 171, interquartile
+range 118 to 240, minimum 25, maximum 1,439, and skew $+1.65$. The coefficient of variation is
+$0.55$, so the budget varies by about half its own size, and the mean sits 21 items above the
+median because of the right tail. Concentration is mild, a Gini of $0.288$ with the fattest
+decile of rows holding $22.0\%$ of all named items, so no small group of rows dominates the
+figure. The full percentile table is in `README.md` section 1.2.
+
+Two consequences for how the column should be read.
+
+1. **A single $k$ cannot stand in for it.** A fixed $k = 192$ overstates the budget on the
+   half of rows that name fewer than 171 items and understates it on the tail that reaches
+   1,439. That is the entire reason the per-row construction exists, rather than a matter of
+   tidiness.
+2. **$N_r$ is correlated with row difficulty, by construction.** Decode rate climbs with the
+   budget, from $11.39\%$ in the thinnest $N_r$ quartile to $14.55\%$ in the fattest, and
+   decoded rows average 204.1 named items against 190.5 for the rest. Fat tuples are the
+   popular ones, so a longer list goes with an easier row. The comparison stays fair because
+   both arms are given the same $N_r$ on the same row, but `match_all` is implicitly
+   popularity-weighted relative to a fixed-$k$ table, and quoting it without that caveat would
+   flatter whichever arm is stronger on popular rows.
+
 ### 8.2 The columns
 
 $$
