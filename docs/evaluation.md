@@ -246,8 +246,8 @@ worst rank) would report a worse number. The measured tie structure of the 2x819
 | --- | --- |
 | items sharing a 2-code tuple with at least one other item | 2,559,616 (53.51%) |
 | largest tie group | 315 items |
-| implied $\mathrm{R@1}$ ceiling if ranks were assigned per tuple | 53.57% |
-| implied $\mathrm{R@10}$ ceiling | 93.20% |
+| implied $\mathrm{R@1}$ ceiling if ranks were assigned per tuple | 62.78% |
+| implied $\mathrm{R@10}$ ceiling | 95.96% |
 
 At the observed 3.66% these ceilings are not binding, but they are the reason a
 tuple-level number can never be read as an item-level one.

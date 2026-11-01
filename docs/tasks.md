@@ -44,7 +44,9 @@ otherwise. Same rule for any further arm: dump at the first run or do the eval t
 it against v2 and add the collision check the supervisor asked for.
 
 **Known already, so do not re-measure from scratch.** 53.51% of items share a 2-code tuple,
-the largest group is 315 items, and the tie ceiling is R@1 53.57% / R@10 93.20%. Collisions
+the largest group is 315 items, and the tie ceiling is R@1 62.78% / R@10 95.96% (re-derived
+from `SID Diagnostics/index_rqvae_2x8192.json`; the archived 53.57% / 93.20% came from an
+earlier quantiser run with 2.56M distinct tuples rather than 3.00M). Collisions
 are structural at two levels, not a defect, so the useful question is not whether they exist
 but how much of the achieved R@k the ceiling already explains.
 
@@ -105,8 +107,11 @@ never been run at more than two levels.
 **Why (b) is the informative one.** Beam width is 20 in both vintages but the budget it buys
 is set entirely by the SID. At `2x8192` the beam named 192.2 items per row on average, because
 a two-code tuple holds 1.593 items and the beam concentrates on the fat cells. At
-`4x256+731` the 731-wide suffix level makes a full tuple near-unique, 27.67% share a 4-code
-prefix but the suffix separates them, so 20 tuples name about 20 items. Same width, roughly
+`4x256+731` the 731-wide suffix level makes a full tuple near-unique: 3,459,854 distinct 5-tuples
+over 4,783,154 items, a mean of 1.3825 items per tuple, so 20 tuples name about 27.6 items.
+(The other two figures are easy to confuse. 27.67% of items are *excess*, beyond one per
+distinct tuple. 39.28% of items sit in a tuple that holds more than one, which is what
+1,878,898 means in the v1 log. Neither is the list length.) Same width, roughly
 ten times the list. This run is the second point on the budget curve, and it is what says
 whether TIGER's advantage is a property of the factorisation or an artefact of being allowed
 to name 192 items.

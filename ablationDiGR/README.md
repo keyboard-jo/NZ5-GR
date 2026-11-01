@@ -47,6 +47,21 @@ ARM=a sbatch ablationDiGR/eval_arm.sh      # after its training succeeds
 ARM=b sbatch ablationDiGR/eval_arm.sh
 ```
 
+To resume an interrupted training run:
+
+```bash
+ARM=a RESUME=auto sbatch ablationDiGR/train_arm.sh
+```
+
+`RESUME=auto` picks that arm's own `runs/<run_name>/final`, which is rewritten
+atomically every 300 micro-batches, so it is the newest state including a
+mid-epoch save. `--resume` skips the micro-batches of the current epoch that were
+already consumed, and `--epochs 2` stays the total target rather than the number
+left. The trainer takes the vocabulary, level count, temperature and window from
+the checkpoint and refuses a data dir whose manifest disagrees, so a resume cannot
+silently turn into a different arm. Naming a directory explicitly works too; it
+must contain `head_config.json`.
+
 The resources each script asks for:
 
 | script | partition | time | cpus | mem | gpus |
@@ -161,9 +176,9 @@ cut-off from 1 to 10,000 and feeds the matched-budget join.
 
 ## Known ways this bites
 
-- **A wall-clock kill mid-epoch** is resumable with `--resume` because
-  `--save_steps 300` keeps mid-epoch checkpoints. Pass it through as
-  `ARM=a sbatch ablationDiGR/train_arm.sh --resume`.
+- **A wall-clock kill mid-epoch** is resumable: `--save_steps 300` keeps
+  mid-epoch checkpoints, and `RESUME=auto` picks up the newest one.
+  `ARM=a RESUME=auto sbatch ablationDiGR/train_arm.sh`.
 - **Re-running prep invalidates training.** `--overwrite` replaces the data dir
   and the rows will not match the checkpoint's expectations.
 - **Each arm has its own SID**, so a matched-budget join needs one invocation per

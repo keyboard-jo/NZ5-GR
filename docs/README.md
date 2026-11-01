@@ -23,6 +23,9 @@ Two things are recorded below. The measured result of the matched-budget pass, w
 the first comparison in this project where every arm was allowed the same number of items
 per row. And the direction, which survived that result and is now sharper for it.
 
+A third is now measured and sits at the end of the first part: what the two SIDs can and
+cannot express, read straight from the quantiser output (§1.9).
+
 What to do next is in [`tasks.md`](tasks.md): an ablation that separates the new SID from the
 new features, a redone SID diagnosis, and a bigger-backbone run that is deliberately last.
 
@@ -268,6 +271,56 @@ and a named tuple that carries no items. TIGER's own reach is computed as
 Reproduced exactly, independently: DiGR `R@1/R@10/R@100` = 1.0549 / 3.6570 / 10.9182 and
 loss 11.0133; TIGER decoded 12,367 of 98,304.
 
+## 1.9 The two SIDs, measured from the quantiser output
+
+Both vintages were re-diagnosed straight from the json the quantiser wrote, with
+`SID Diagnostics/diagnose_sid.py`. No preprocessing, no GPU, 35 s for both files. This is the
+only measurement in this file that is not about a model: it is about what the codes can and
+cannot express, so it bounds every arm equally.
+
+| SID | depth | buckets | items/bkt | largest group | `R@1` ceiling | `R@10` ceiling | lift | lift/1k |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2x8192 | 1 | 8,192 | 583.88 | 3,838 | 0.17% | 1.71% | 463.3x | 7.589 |
+| 2x8192 | 2 | 3,002,708 | 1.59 | 315 | 62.78% | 95.96% | 7,880.6x | 42.486 |
+| 4x256+731 | 1 | 256 | 18,684.20 | 39,883 | 0.01% | 0.05% | 46.9x | 0.949 |
+| 4x256+731 | 2 | 57,122 | 83.74 | 5,086 | 1.19% | 9.93% | 1,437.6x | 7.276 |
+| 4x256+731 | 3 | 1,506,041 | 3.18 | 1,405 | 31.49% | 76.14% | 8,257.6x | 19.946 |
+| 4x256+731 | 4 | 3,459,854 | 1.38 | 731 | 72.33% | 96.42% | 4,505.0x | 29.389 |
+| 4x256+731 | 5 | 4,783,154 | 1.00 | 1 | 100.00% | 100.00% | 827.2x | 17.293 |
+
+`lift` is `recall / uniform hit rate` on the same 98,304 val rows, so it rises mechanically as
+buckets shrink and is not comparable across widths. `lift/1k` normalises by candidates,
+`recall / (query bucket / 1000)` in percent, which is comparable but only meaningful at the
+depth whose bucket is not far from 1,000 items.
+
+Coverage: `2x8192` uses all 8,192 codes in both levels at 12.8110 and 12.7668 of 13 bits
+(98.5% and 98.2%), spending 26.00 bits against the 22.19 an identity needs. `4x256+731` uses
+all 256 in each of the first four levels (98.4% to 99.8% of 8 bits) but the last level is 731
+dense values holding only 1.7644 of 9.5137 bits, a ratio of 18.5%.
+
+Four things follow.
+
+**The last level of v1 is a collision rank, and it owns a fifth of every item vector.** 731
+dense values at 18.5% of their own `log2(size)` is the `--add_unique_id` signature. `V_i`
+for v1 is the mean of five rows, so 20% of it is a rank inside a collision group, which
+carries no semantics. Level 5 is a different waste: it makes the catalogue injective
+(`R@1` ceiling 100%), so it is near-identity and also owns a fifth. `2x8192` has no such
+level; both its levels are 98%+ dense codes.
+
+**v1's codes peak at depth 3 and then fall 90%.** Lift runs 46.9x, 1,437.6x, 8,257.6x, then
+4,505.0x and 827.2x. Levels 4 and 5 split density, not behaviour. So the usable depth of
+`4x256+731` is three, and the depth at which DiGR v1 was trained is two levels past it.
+
+**`2x8192` is still rising at its only usable depth**, 7,880.6x at depth 2, and it is never
+injective, so on this catalogue it is a partition whose last level is doing real work. That
+is the case for width here: not more bits, but a second level that has not run out.
+
+**The tie ceiling does not bind.** 62.78% and 95.96% against measured 1.05% and 3.66%, so
+ties cost nothing yet. The archived figures of 53.57% and 93.20% came from an earlier
+quantiser run with 2.56M distinct tuples rather than the 3.00M in this artefact; the
+collision share (53.51%) and the 315-item largest group that the earlier note also quotes do
+belong to this file, so only the ceiling moved.
+
 ---
 
 # 2. The direction
@@ -298,7 +351,7 @@ slope = log(1.41) / log(9.3) = 0.15
 A 0.15 exponent means another 10x on the item side buys about 1.4x, and another 100x buys
 about 2x. Two of the three axes that moved in that step were query-side anyway (the action
 token and the 128 gap bins). The 53.51% of items sharing a 2-code tuple and the 315-item
-tie group are real, but the tie ceiling (`R@1` 53.57%, `R@10` 93.20%) is not the binding
+tie group are real, but the tie ceiling (`R@1` 62.78%, `R@10` 95.96%) is not the binding
 constraint at 3.66%.
 
 Consequence: a bigger codebook is not the big move. S9 at 16,384 is off the table.

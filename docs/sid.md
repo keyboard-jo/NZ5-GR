@@ -22,7 +22,7 @@ Everything here is measured on the same 98,304 val rows.
 | peak lift | 8,257.6x at depth 3 | 7,880.6x at depth 2 |
 | depth-1 candidate bucket | 19,308 | 745 |
 | collision share | 27.67% share a 4-code prefix | 53.51% share a 2-code tuple, largest 315 |
-| tie ceiling, R@1 / R@10 | not computed | 53.57% / 93.20% |
+| tie ceiling, R@1 / R@10 | not computed | 62.78% / 95.96% |
 | event stream | 9.11 feature tokens per row, no action token, 64 gap bins | 4 tokens per event, action token, 128 gap bins |
 | what it produced | DiGR v1 R@10 2.5940% | DiGR v2 R@10 3.6570% |
 
@@ -93,10 +93,12 @@ are instead of spreading evenly.
 
 **That turned out not to matter, and the tie ceiling is why.** Two items with the same
 codes get the same score from any scorer that reads the SID, so a tie group of size `g`
-caps recall at `1/g` at rank 1 and `min(1, k/g)` at rank `k`. Measured mean tie group is
-5.55 for 3 x 1,024 and 6.39 for 2 x 8,192, capping R@1 at 64.10% and 53.57% and R@10 at
-94.85% and 93.20%. DiGR sat at 0.79% and 2.59% on the v1 SID, so the ceiling is not
-remotely binding and the remaining collisions cost nothing yet.
+caps recall at `1/g` at rank 1 and `min(1, k/g)` at rank `k`. Measured for 2 x 8,192 the mean
+tie group is 4.71 (median 2, p90 8, largest 315), capping R@1 at 62.78% and R@10 at 95.96%.
+DiGR sat at 1.05% and 3.66% on that SID, so the ceiling is not remotely binding and the
+remaining collisions cost nothing yet. The 3 x 1,024 figures in the archived table (mean
+group 5.55, R@1 64.10%, R@10 94.85%) predate this measurement and that json is not in the
+repo, so they are quoted as recorded rather than re-derived.
 
 **The flat-lift prediction failed twice, and the failure is instructive.** The original
 argument was geometric: 4.78M points of effective dimension about 17 have a bounded
