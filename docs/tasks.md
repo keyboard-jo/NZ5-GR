@@ -55,28 +55,24 @@ cut-off; items per level-0 code against the 39-195 the DiGR paper's own catalogu
 and the unrun cells in `archive/sid_results.md` (`2x16384`, `3x16384`) if they are still
 wanted.
 
-**The tie measurement, which is the part that is still conjecture.** Currently the claim that
-collisions cost nothing rests on a `1/g` model (a tie group of size `g` caps `R@k` at
-`min(1, k/g)`) that has never been checked against what the model actually does. Three
-checks, all CPU, all on the dumps already in `local/2026-29-10-1-full-eval/dumps` plus
-`catalog_sid_codes.npy`.
+**The tie measurement: answered by reading the code, so nothing to run.**
 
-1. **Do exact ties even happen.** A colliding item's score is `h . (E[c1] + E[c2]) / 2`, and
-the order `topk` returns inside a group is catalogue index order only if those floats collide
-exactly. If they differ in the last bits, the group is a near-tie group and the `1/g` model is
-the wrong model. This check decides the shape of the other two.
-2. **Rank within group.** For colliding targets, histogram `rank - group_start`. Under the
-lottery model this is uniform. Skewed toward the start means ties break in the arm's favour,
-skewed toward the end means it is being penalised.
-3. **`R@k` split by group size, and `R@k` restricted to unique-tuple targets.** The second is
-the collision-free skill number. `README.md` 2.3(d) predicts `R@1` about 2.06% from a 0.513
-dilution factor; if the unique-target subset does not land near the same figure, that
-arithmetic is wrong and the tie break it justifies is not worth building.
+1. **Exact ties do happen, by construction.** `V_i` is the same sum of the same level rows for
+every member of a tuple, so their `s_i` is bit-identical rather than nearly equal. There is no
+near-tie mixture to disentangle.
+2. **The break inside a group is arbitrary, not favourable.** `evaluate()` ranks by the
+target's position in `topk`, so a tied target is placed by catalogue index, and item id
+carries no behavioural signal. The consequences are asymmetric across arms: DiGR is charged
+for its ties while TIGER's prefix-free arm is not. `evaluation.md` section 6 records the three
+conventions and the direction of the bias.
+3. **The `R@k` split by group size was measured** and is in `README.md` 2.3(d): unique-tuple
+targets reach `R@1` 2.427% against 1.055% overall, and the gap survives inside every
+popularity quintile while co-click, which has no codebook, shows 1.1x on the same rows.
 
-**Why this is a task and not a footnote.** `README.md` 2.3(d) proposes a content-side tie
-break worth up to 2x on `R@1`, and its entire value depends on checks 1 and 2. Under a
-near-tie reading, the fix is not a tie break at all but a re-ranker over roughly 11 items per
-row, which is different work at a different cost.
+Consequence for the fix that 2.3(d) proposed: a content-side *index* cannot help. A break by
+catalogue index is arbitrary, so a third code carrying that index is unlearnable, and the
+favourable-tie reading that made it look worth 2x does not hold. What remains is the
+counting-versus-scoring split, which moved to section 4 and to `Plan 3/`.
 
 **Cost.** Seconds to minutes, CPU. Deferred only because item 1 is what changes the claims.
 

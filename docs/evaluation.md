@@ -154,9 +154,18 @@ rank = where(match.any(1), match.int().argmax(1) + 1, kmax + 1)
 bounded, and takes a global top-$k$ over the concatenated chunks, so chunking changes
 nothing about the result.
 
-$\rho_r$ is therefore a **clean prefix of an exact total order over all 4,783,154 items.**
+$\rho_r$ is therefore a **clean prefix of a total order over all 4,783,154 items.**
 There is no approximation, no candidate pool, no backfill. The evaluation loss is likewise
 the exact full-softmax NLL, not the sampled estimate, so losses are comparable across arms.
+
+The order is total, but it is not the score's own order, and that is worth being precise
+about. Items in one code tuple have bit-identical $s_i$, since $V_i$ is the same sum of the
+same rows for every member. `topk` still has to emit them one after another, so their
+relative order is whatever the sort kernel produces, in practice ascending catalogue index.
+$\rho_r$ is therefore the target's **position in that list**, not
+$1 + \#\{i : s_i > s_{t_r}\}$, and the two differ by up to $g-1$ positions when the target
+shares its tuple with $g-1$ others. Section 6(a) covers what that costs and which arms it is
+charged to; section 5.2 is the mirror case, where ties are free.
 
 ### 5.2 TIGER prefix-free: rank by counting, not by sorting
 
@@ -172,8 +181,10 @@ $$
 it is exact and needs no giant tensor.
 
 Note the strict inequality: **items tied with the target are not counted as higher**, so a
-tied target is reported at the best rank it could hold. This is favourable to the arm
-(see [section 6](#6-ties-and-what-they-cost)).
+tied target is reported at the best rank it could hold. This is favourable to the arm and it
+is the opposite of how DiGR is scored
+(see [section 6](#6-ties-and-what-they-cost)), which is why the two columns are not the same
+quantity.
 
 ### 5.3 TIGER prefix-conditioned: the beam is the only path
 
@@ -234,13 +245,27 @@ magnitude `TIE_EPS = 1e-6` (`baselines_digr.py:496-497`). It is not in the recor
 
 ## 6. Ties, and what they cost
 
-There are three distinct places where ties enter. Only one of them is generous to an arm,
-and it is stated here rather than buried.
+Ties enter in three places and the arms do not all handle them the same way. That is a
+comparability problem rather than a cosmetic one, so it is stated here rather than buried.
+The short version: **DiGR is charged for its ties, TIGER's prefix-free arm is given them for
+free, and the count baselines break them deliberately. The bias therefore runs against the
+arm that collides.** No published number is wrong; comparing the columns as if they were
+scored the same way is what is wrong.
 
-**(a) TIGER prefix-free ties are resolved in the arm's favour.** Section 5.2 counts only
-strictly higher scores, so if 300 items share the target's tuple, the target is reported at
-the best of those 300 positions instead of the average. Any alternative (average rank,
-worst rank) would report a worse number. The measured tie structure of the 2x8192 SID:
+**(a) DiGR charges the target for its own tie.** Section 5.1 ranks by the target's position
+in a `topk` list. Items inside one code tuple have *bit-identical* scores, because $V_i$ is
+the same sum of the same rows for every member, so `topk` must order them by something
+other than the score, in practice the sort kernel's index order. A target in a 315-item
+group is therefore reported at whichever position its catalogue index gives it, and not at
+the best one. This is the correct definition for a retrieval metric, since a list that puts
+a tie-mate above the target is a list where the target was not in slot 1, but it means
+DiGR's $\mathrm{R@1}$ carries a tie penalty that TIGER's does not.
+
+**(b) TIGER prefix-free gets its ties for free.** Section 5.2 counts only strictly higher
+scores, so if 300 items share the target's tuple, the target is reported at the best of
+those 300 positions instead of the average. Any alternative (average rank, worst rank) would
+report a worse number. The measured tie structure of the 2x8192 SID, which is the structure
+DiGR is charged for and TIGER is not:
 
 | quantity | value |
 | --- | --- |
@@ -252,14 +277,22 @@ worst rank) would report a worse number. The measured tie structure of the 2x819
 At the observed 3.66% these ceilings are not binding, but they are the reason a
 tuple-level number can never be read as an item-level one.
 
-**(b) The beam's rank is a bucket rank.** All items in a bucket share a position. That is
+**(c) The beam's rank is a bucket rank.** All items in a bucket share a position. That is
 the method's own resolution limit, not an evaluation choice, and it is why the beam arm is
 reported against a budget rather than against $\mathrm{R@10}$.
 
-**(c) The count baselines have a deterministic tie-break.** co-click accumulates into
+**(d) The count baselines have a deterministic tie-break.** co-click accumulates into
 `np.unique`-sorted candidate ids and then does a stable sort, so equal totals are ordered by
-ascending item id; `sid_transition` adds the popularity epsilon explicitly. No arm gets a
-free tie.
+ascending item id; `sid_transition` adds the popularity epsilon explicitly. These charge a
+tie too, but consistently and by a stated rule, not by whatever the sort kernel does.
+
+**How to read the tables in light of this.** The penalty in (a) is concentrated where the
+rank spacing is finest. A shift of one or two positions decides $\mathrm{R@1}$ outright and
+is almost irrelevant by $\mathrm{R@1000}$, so the inconsistency between (a) and (b) inflates
+TIGER and deflates DiGR most at the shallow cut-offs and barely at all at the deep ones.
+Until it is measured, a DiGR lead over another arm is a **lower bound**. The size is
+measurable from one pass over an existing checkpoint rather than arguable: `Plan 3/region_rank.py` reports each row's rank under both conventions, the strict count as
+`fav_item_rank` and the `topk` position as `item_rank`.
 
 ## 7. `cover@k` is not recall
 
@@ -409,7 +442,7 @@ Guards that refuse rather than warn:
 | sampling the validation rows | a 512-row table read as 98,304 | `--beam_rows 0` on every recorded run |
 | a candidate pool | a shorter list for every arm | full-catalogue ranking only |
 | prefix-free score reported for a conditioned model | a rule the model was never trained on | refusal at `train_tiger.py:1230` |
-| ties resolved at the average rank | a number no arm can beat or compare against | strict inequality, stated in section 6 |
+| ties handled differently per arm | a comparison between conventions, not models | section 6, and `fav_item_rank` in `Plan 3/region_rank.py` |
 
 ## 11. What this benchmark does not measure
 

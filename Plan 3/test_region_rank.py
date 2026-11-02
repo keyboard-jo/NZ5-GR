@@ -3,12 +3,22 @@
 
 `run()` itself needs a real checkpoint and a real preprocessed dir, so it cannot
 run here. What CAN run here is the part that would silently produce a plausible
-table: the count of tuples and items above a threshold, and the per-tuple vector.
+table: the count of tuples and items above a threshold, and the brute-force rank
+that count is checked against.
 
-`count_above` is checked against a brute-force full matrix, including chunk sizes
-that cut the tuple list and the row list at uneven boundaries, because an
-accumulator that is reset or mis-sliced at a boundary would still return a
-monotone-looking number.
+`count_above` is compared with a literal double loop, and over chunk sizes that
+cut the tuple list at uneven boundaries, because an accumulator that is reset or
+mis-sliced at a boundary still returns a monotone-looking number.
+
+Two mistakes in this file have already produced a full, plausible, wrong table,
+so both now have a test that fails on them:
+
+1. Scoring tuples from an averaged embedding vector built out of raw SID codes
+   instead of token ids. The old test asserted the raw-code answer, which is how
+   it survived. The scores now come from `model.item_logits`, and
+   `test_brute_force_agrees_with_the_counted_rank` is what pins that down.
+2. Treating `item_rank` and `region_rank` as independent at rank 1. They are not:
+   rank 1 needs *no* tuple above, so a tie can never separate them.
 """
 from __future__ import annotations
 
@@ -28,170 +38,181 @@ import region_lib as RL  # noqa: E402
 import region_rank as RR  # noqa: E402
 
 
-class _Backbone(torch.nn.Module):
-    def __init__(self, vocab: int, d: int) -> None:
-        super().__init__()
-        self.tok = torch.nn.Embedding(vocab, d)
+def _fixture(n_rows=37, n_reg=53, seed=0):
+    """Region scores, target scores and tuple sizes on a small integer grid.
 
-    def get_input_embeddings(self):
-        return self.tok
-
-
-class _Model(torch.nn.Module):
-    def __init__(self, vocab: int, d: int, l2_normalize: bool = False,
-                 logit_chunk: int = 8) -> None:
-        super().__init__()
-        self.backbone = _Backbone(vocab, d)
-        self.l2_normalize = l2_normalize
-        self.logit_chunk = logit_chunk
-        self.temperature = 0.07
-
-
-def _fixture(n_rows=37, n_reg=53, d=6, seed=0):
-    """Integer-valued H and V so every dot product is exact in fp32.
-
-    With continuous values a few pairs land within one ulp of the threshold and
-    flip between GEMM blockings, which is a property of float ordering and not of
-    this code. Keeping the values on a small integer grid removes that noise so
-    the test can demand exact equality across chunk sizes.
+    Integer values keep every comparison exact, so a tie is a real tie and not a
+    one-ulp coincidence that flips between chunkings. `counts` sums to a
+    plausible catalogue size and contains ones, twos and a fat tuple.
     """
     g = torch.Generator().manual_seed(seed)
-    H = torch.randint(-2, 3, (n_rows, d), generator=g).float()
-    V = torch.randint(-2, 3, (n_reg, d), generator=g).float()
-    tgt = torch.randint(0, n_reg, (n_rows,), generator=g)
-    counts = torch.randint(1, 6, (n_reg,), generator=g).float()
-    temp = 1.0
-    tgt_score = (H @ V.t())[torch.arange(n_rows), tgt] / temp
-    return H, V, tgt_score, counts, temp
+    S = torch.randint(-4, 5, (n_rows, n_reg), generator=g).float()
+    tgt_score = torch.randint(-4, 5, (n_rows,), generator=g).float()
+    counts = torch.randint(1, 5, (n_reg,), generator=g)
+    counts[:3] = torch.tensor([1, 1, 7], dtype=counts.dtype)
+    return S, tgt_score, counts
 
 
-def _brute(H, V, tgt_score, counts, temp):
-    scores = (H @ V.t()) / temp
-    hit = scores > tgt_score.unsqueeze(1)
-    above_regions = hit.sum(dim=1)
-    above_items = (hit.to(counts.dtype) @ counts).to(torch.int64)
-    return above_regions, above_items
+def _brute_force(S, tgt_score, counts):
+    """The definition, written out: loop over every row and every tuple."""
+    S = np.asarray(S)
+    tgt_score = np.asarray(tgt_score)
+    counts = np.asarray(counts, dtype=np.int64)
+    ar = np.zeros(S.shape[0], dtype=np.int64)
+    ai = np.zeros(S.shape[0], dtype=np.int64)
+    for r in range(S.shape[0]):
+        for c in range(S.shape[1]):
+            if S[r, c] > tgt_score[r]:
+                ar[r] += 1
+                ai[r] += counts[c]
+    return ar, ai
 
 
-def test_count_above_matches_a_brute_force_full_matrix():
-    H, V, tgt_score, counts, temp = _fixture()
-    got_r, got_i = RR.count_above(H, V, tgt_score, counts, temp,
-                                  region_chunk=53, row_batch=37)
-    want_r, want_i = _brute(H, V, tgt_score, counts, temp)
-    assert torch.equal(got_r, want_r)
-    assert torch.equal(got_i, want_i)
+def test_count_above_matches_a_brute_force_double_loop():
+    S, tgt_score, counts = _fixture()
+    ar, ai = RR.count_above(S, tgt_score, counts, region_chunk=53)
+    want_ar, want_ai = _brute_force(S, tgt_score, counts)
+    assert np.array_equal(ar.cpu().numpy(), want_ar)
+    assert np.array_equal(ai.cpu().numpy(), want_ai)
 
 
 def test_count_above_is_unchanged_by_chunk_boundaries():
-    H, V, tgt_score, counts, temp = _fixture(n_rows=37, n_reg=53)
-    want_r, want_i = _brute(H, V, tgt_score, counts, temp)
-    for ck in (1, 5, 17, 53, 200):
-        for rb in (1, 4, 37, 100):
-            got_r, got_i = RR.count_above(H, V, tgt_score, counts, temp,
-                                          region_chunk=ck, row_batch=rb)
-            assert torch.equal(got_r, want_r), f"chunk {ck} rows {rb}"
-            assert torch.equal(got_i, want_i), f"chunk {ck} rows {rb}"
+    S, tgt_score, counts = _fixture(n_rows=9, n_reg=97, seed=4)
+    want_ar, want_ai = _brute_force(S, tgt_score, counts)
+    for chunk in (1, 2, 3, 5, 31, 96, 97, 1000):
+        ar, ai = RR.count_above(S, tgt_score, counts, region_chunk=chunk)
+        assert np.array_equal(ar.cpu().numpy(), want_ar), f"chunk {chunk}"
+        assert np.array_equal(ai.cpu().numpy(), want_ai), f"chunk {chunk}"
 
 
-def test_count_above_never_charges_a_tie_to_the_target():
-    """Every tuple scores identically, so nothing is above and every rank is 1.
+def test_a_tie_is_never_charged_to_the_target():
+    """Strict `>`, the favourable convention every number here is reported under.
 
-    This is the property the project reports under: `rank = 1 + #{s_i > s_t}`.
-    If the comparison ever became `>=`, a shared tuple would count itself and the
-    measured ranks would collapse, which is the single easiest way to get this
-    wrong.
+    A tuple scoring exactly the target's score is not above it, so the target
+    keeps the first position of its own tie group. `>=` would move the target to
+    the end of the group and, with a 315-item group, could cost tens of positions.
     """
-    H, V, _, counts, temp = _fixture()
-    V = torch.ones_like(V)
-    # Same arithmetic as the scorer, so "identical" is identical and not one ulp
-    # apart: the point of the test is the comparison, not the rounding.
-    tgt_score = (H @ V.t())[:, 0] / temp
-    got_r, got_i = RR.count_above(H, V, tgt_score, counts, temp,
-                                  region_chunk=17, row_batch=8)
-    assert int(got_r.max()) == 0
-    assert int(got_i.max()) == 0
+    S = torch.tensor([[5.0, 5.0, 5.0, 4.0]])
+    tgt_score = torch.tensor([5.0])
+    counts = torch.tensor([1, 3, 9, 1])
+    ar, ai = RR.count_above(S, tgt_score, counts, region_chunk=4)
+    assert int(ar[0]) == 0
+    assert int(ai[0]) == 0
+    # tying at the bottom of the range: the two 5.0 tuples and nothing else
+    ar, ai = RR.count_above(S, torch.tensor([4.0]), counts, region_chunk=4)
+    assert int(ar[0]) == 3
+    assert int(ai[0]) == 13
 
 
-def test_count_above_weights_the_item_count_by_tuple_size():
-    """A single tuple above the target must add its whole size, not 1."""
-    H = torch.tensor([[0.0, 0.0, 1.0]])   # picks the third coordinate of each row
-    V = torch.tensor([[0.0, 0.0, -1.0],   # the target sits here, score -1
-                      [0.0, 0.0, 2.0]])   # this one scores +2, so it is above
-    counts = torch.tensor([4.0, 7.0])
-    tgt_score = torch.zeros(1)            # threshold 0, so only V[1] clears it
-    got_r, got_i = RR.count_above(H, V, tgt_score, counts, 1.0,
-                                  region_chunk=2, row_batch=1)
-    assert int(got_r[0]) == 1             # one tuple above
-    assert int(got_i[0]) == 7             # but seven items above
-
-
-def test_region_vectors_average_the_codes_of_the_first_member():
-    vocab, d = 40, 5
-    model = _Model(vocab, d, l2_normalize=False)
-    with torch.no_grad():
-        model.backbone.tok.weight.copy_(
-            torch.arange(vocab * d, dtype=torch.float32).reshape(vocab, d) / 100.0
-        )
-    codes = np.array([[1, 2], [1, 2], [3, 4], [1, 5]], dtype=np.int64)
-    reg = RL.Regions(codes, [8, 8])
-    V = RR.region_vectors(model, reg, torch.float32)
-    w = model.backbone.tok.weight
-    for i in range(reg.n_regions):
-        c = reg.codes[i]
-        want = (w[int(c[0])] + w[int(c[1])]) / 2.0
-        assert torch.allclose(V[i], want, atol=1e-6), f"region {i}"
-
-
-def test_region_vectors_honour_l2_normalize():
-    """With `l2_normalize` the codes are normalised BEFORE the sum.
-
-    That is what `precompute_vectors` does, and the item ranks this script has to
-    reproduce were produced by that path, so normalising after the sum instead
-    would quietly disagree with the dump.
-    """
-    vocab, d = 40, 5
-    model = _Model(vocab, d, l2_normalize=True)
-    with torch.no_grad():
-        model.backbone.tok.weight.copy_(
-            torch.randn(vocab, d, generator=torch.Generator().manual_seed(3))
-        )
-    codes = np.array([[1, 2], [3, 4]], dtype=np.int64)
-    reg = RL.Regions(codes, [8, 8])
-    V = RR.region_vectors(model, reg, torch.float32)
-    w = model.backbone.tok.weight
-    for i in range(reg.n_regions):
-        c = reg.codes[i]
-        want = (torch.nn.functional.normalize(w[int(c[0])], dim=-1)
-                + torch.nn.functional.normalize(w[int(c[1])], dim=-1)) / 2.0
-        assert torch.allclose(V[i], want, atol=1e-6)
+def test_the_item_count_is_weighted_by_tuple_size():
+    S = torch.tensor([[4.0, 3.0, 2.0]])
+    counts = torch.tensor([1, 1, 250])
+    ar, ai = RR.count_above(S, torch.tensor([1.0]), counts, region_chunk=3)
+    assert int(ar[0]) == 3
+    assert int(ai[0]) == 252, "the fat tuple must contribute 250 items, not 1"
 
 
 def test_item_rank_is_never_below_the_region_rank():
-    """`region_rank <= item_rank` always, since every region above adds >=1 item."""
-    H, V, tgt_score, counts, temp = _fixture(n_rows=200, n_reg=80)
-    a_r, a_i = RR.count_above(H, V, tgt_score, counts, temp,
-                              region_chunk=13, row_batch=64)
-    assert bool((a_r <= a_i).all())
+    S, tgt_score, counts = _fixture(n_rows=200, n_reg=80)
+    ar, ai = RR.count_above(S, tgt_score, counts, region_chunk=13)
+    assert bool((ar <= ai).all())
+
+
+def test_rank_one_is_identical_for_both_axes():
+    """A tie cannot separate the two ranks at rank 1, so `R@1` cannot show a gain.
+
+    This is not a bug, it is the shape of the question: rank 1 requires that no
+    tuple scores above the target's, which is the same condition whether a tuple
+    holds one item or 315. Any verdict that reads a counterfactual gain at `R@1`
+    is reading the same number twice.
+    """
+    S, tgt_score, counts = _fixture(n_rows=120, n_reg=64, seed=7)
+    ar, ai = RR.count_above(S, tgt_score, counts, region_chunk=17)
+    region_rank = (ar + 1).numpy()
+    item_rank = (ai + 1).numpy()
+    assert np.array_equal(region_rank == 1, item_rank == 1)
+
+
+def test_brute_force_item_rank_agrees_with_the_counted_rank():
+    """The end-to-end invariant, on a tiny catalogue with real collisions.
+
+    `item_rank` is `1 + sum of sizes above`, while `brute_force_item_rank` walks a
+    materialised item-level logits row. They share nothing but the scores, so
+    agreement means the item->tuple map, the sizes and the weights all line up.
+    This is the check that catches a mis-aligned catalogue, and it needs no
+    reference file.
+    """
+    codes = np.array([[1, 2], [1, 2], [3, 4], [1, 5], [3, 4], [1, 2]], dtype=np.int64)
+    reg = RL.Regions(codes, [8, 8])
+    rows, n_reg = 5, reg.n_regions
+    S = torch.randint(-3, 4, (rows, n_reg), generator=torch.Generator().manual_seed(11)).float()
+    # A region's score is its members' score, which is why the tuple factorisation
+    # is exact rather than approximate.
+    item_logits = S.index_select(1, torch.as_tensor(reg.region_of_item))
+    tgt_items = np.array([0, 3, 5, 1, 4])
+    tgt_score = item_logits[torch.arange(rows), torch.as_tensor(tgt_items)]
+    ar, ai = RR.count_above(S, tgt_score, torch.as_tensor(reg.counts), region_chunk=2)
+    for r in range(rows):
+        want = RR.brute_force_item_rank(item_logits[r], int(tgt_items[r]))
+        assert int(ai[r]) + 1 == want, f"row {r}"
+        assert int(ar[r]) + 1 <= want, f"row {r}"
+
+
+def test_brute_force_item_rank_counts_strictly_above():
+    logits = torch.tensor([0.5, 2.0, 2.0, -1.0])
+    assert RR.brute_force_item_rank(logits, 1) == 1
+    assert RR.brute_force_item_rank(logits, 2) == 1
+    assert RR.brute_force_item_rank(logits, 0) == 3
+    assert RR.brute_force_item_rank(logits, 3) == 4
 
 
 def test_summarise_accepts_the_ranks_this_produces():
     """The two modules agree on conventions: rank arrays, 1-based, >= 1."""
-    H, V, tgt_score, counts, temp = _fixture(n_rows=120, n_reg=60)
-    a_r, a_i = RR.count_above(H, V, tgt_score, counts, temp,
-                              region_chunk=11, row_batch=32)
-    item_rank = (a_i + 1).numpy()
-    region_rank = (a_r + 1).numpy()
-    g = torch.randint(1, 6, (120,),
-                      generator=torch.Generator().manual_seed(9)).numpy().astype(np.int64)
-    s = RL.summarise(item_rank, region_rank, g, ks=(1, 10))
-    assert s["n_rows"] == 120
-    assert s["item_r1"] <= s["region_r1"] + 1e-12
-    # nan when no row is at rank 1, which this integer fixture often is; the
-    # invariant worth pinning is that the ceiling is never below the measured
-    # value, never that it is above zero.
-    gain = s["counterfactual_gain_1"]
-    assert gain != gain or gain >= 1.0 - 1e-12
+    S, tgt_score, counts = _fixture(n_rows=120, n_reg=60)
+    ar, ai = RR.count_above(S, tgt_score, counts, region_chunk=11)
+    g = counts[torch.as_tensor(tgt_score.long().abs() % int(counts.numel()))]
+    out = RL.summarise((ai + 1).numpy(), (ar + 1).numpy(), g.numpy(), ks=(1, 10))
+    assert out["n_rows"] == 120
+    assert 0.0 <= out["item_r1"] <= 1.0
+    assert all(row["inflation"] >= 0 for row in out["groups"])
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-q"]))
+    raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_topk_rank_matches_the_evaluators_own_expression():
+    """`topk_rank` must be the same operation `evaluate()` performs, not a rewrite."""
+    scores = torch.tensor([[0.5, 3.0, 1.0, 2.0, -1.0]])
+    col = torch.tensor([3])
+    # Written out the way `Model Training/train_digr.py` writes it.
+    top = scores.topk(scores.shape[1], dim=1).indices
+    match = top == col.unsqueeze(1)
+    expected = int(match.to(torch.int64).argmax(dim=1)) + 1
+    got = int(RR.topk_rank(scores, col, kmax=10)[0])
+    assert got == expected == 2
+
+
+def test_topk_rank_charges_the_target_for_its_own_tie():
+    """The published convention is `topk` position, so a tie-mate can land ahead.
+
+    With two columns at exactly the same score and a column index order that puts
+    the mate first, the target is rank 2 here even though nothing scores strictly
+    above it. This is the difference that made run 3 disagree with the dump, so it
+    is pinned rather than left to whichever `topk` the GPU happens to have.
+    """
+    scores = torch.tensor([[1.0, 1.0, 0.0]])
+    assert int(RR.topk_rank(scores, torch.tensor([1]), kmax=10)[0]) == 2
+    assert int(RR.topk_rank(scores, torch.tensor([0]), kmax=10)[0]) == 1
+    # `count_above` reports 0 for both columns, which is why the two are not
+    # interchangeable: it cannot see the tie, and the evaluator charges for it.
+    ar, ai = RR.count_above(scores, torch.tensor([1.0]), torch.tensor([1, 1, 1]),
+                             region_chunk=64)
+    assert int(ar[0]) == 0 and int(ai[0]) == 0
+
+
+def test_topk_rank_stores_a_miss_as_kmax_plus_one():
+    scores = torch.tensor([[9.0, 8.0, 7.0, 6.0]])
+    # Column 1 is inside the top 2 (second), column 3 falls outside it.
+    assert int(RR.topk_rank(scores, torch.tensor([1]), kmax=2)[0]) == 2
+    assert int(RR.topk_rank(scores, torch.tensor([3]), kmax=2)[0]) == 3

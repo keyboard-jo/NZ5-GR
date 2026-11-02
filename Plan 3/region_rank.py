@@ -97,22 +97,25 @@ def parse_cli() -> argparse.Namespace:
                    help="the preprocessed dir the checkpoint was trained on")
     p.add_argument("--split", default="val", choices=["val", "train"])
     p.add_argument("--ks", default=",".join(str(k) for k in DEFAULT_KS))
-    p.add_argument("--batch_size", type=int, default=256,
-                   help="rows per score block; the [B, region_chunk] fp32 tensor "
-                        "is B * chunk * 4 bytes (256 x 131072 -> ~134 MB)")
+    p.add_argument("--batch_size", type=int, default=128,
+                   help="rows per scoring block. One block materialises the full "
+                        "[B, |I|] logit matrix (128 x 4,783,154 fp32 -> 2.4 GB) "
+                        "because that is what item_logits returns")
     p.add_argument("--region_chunk", type=int, default=131072,
-                   help="distinct tuples per GEMM block")
+                   help="distinct tuples per comparison block")
     p.add_argument("--max_rows", type=int, default=None,
                    help="score only the first N rows (smoke test; makes the "
                         "numbers not comparable to anything)")
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--device", default=None)
     p.add_argument("--local_files_only", action=argparse.BooleanOptionalAction, default=False)
-    p.add_argument("--region_dtype", default="fp32", choices=["fp32", "bf16"],
-                   help="bf16 halves the tuple matrix (6.1 GB instead of 12.3 for "
-                        "3.0M x 1024) and is what the inferences path uses, but it "
-                        "rounds near-ties between distinct tuples; fp32 matches the "
-                        "fp32 item_logits path that produced the dumps")
+    p.add_argument("--kmax", type=int, default=10000,
+                   help="rank cut-off. Must match the reference dump: a miss is "
+                        "stored as kmax+1, so a smaller value cannot reproduce a "
+                        "dump made with 10,000 and R@1000 stops being comparable")
+    p.add_argument("--sanity_rows", type=int, default=4,
+                   help="rows to re-rank by brute force straight off the logits "
+                        "before trusting anything (0 disables)")
     p.add_argument("--out_json", default=None)
     p.add_argument("--dump_path", default=None,
                    help="write per-row item_rank / region_rank / g here as npz, so "
@@ -176,42 +179,27 @@ def report(summary: Dict[str, object], logger) -> None:
     print_table(summary, logger)
     logger.info("  " + RL.verdict(summary))
     logger.info("-" * 96)
+    # A trained arm never puts zero targets first, so an all-zero R@1 means the
+    # scores are noise and the table below it must not be read as a measurement.
+    if float(summary.get("item_r1", 0.0)) == 0.0:
+        logger.warning(
+            "  WARNING: no row put its target at rank 1, which a trained arm does "
+            "not do. Treat the table as broken until this run reproduces the "
+            "checkpoint's own R@k, e.g. with --check_dump against its --dump_ranks."
+        )
 
 
 # --------------------------------------------------------------------------
 # region vectors
 # --------------------------------------------------------------------------
-def region_vectors(model, regions: RL.Regions, dtype: torch.dtype) -> torch.Tensor:
-    """`V` over the DISTINCT tuples, so a 3.0M-row GEMM instead of 4.78M.
-
-    Same arithmetic as `SequentialRecModel.precompute_vectors`, including the
-    per-level normalisation when the checkpoint used `l2_normalize`, because the
-    item rank this script reproduces was produced by that exact path. The only
-    change is which rows the codes are taken from.
-    """
-    w = T._embedding_weight(model.backbone)
-    codes = torch.as_tensor(regions.codes, device=w.device, dtype=torch.long)
-    d = int(w.shape[1])
-    out = torch.zeros(int(regions.n_regions), d, dtype=dtype, device=w.device)
-    step = max(1, min(int(model.logit_chunk), 65536))
-    n = int(regions.n_regions)
-    for level in range(codes.shape[1]):
-        idx = codes[:, level]
-        for start in range(0, n, step):
-            block = w.index_select(0, idx[start:start + step]).float()
-            if getattr(model, "l2_normalize", False):
-                block = torch.nn.functional.normalize(block, dim=-1)
-            out[start:start + step] += block.to(dtype)
-    out /= float(codes.shape[1])
-    return out
-
-
-def count_above(H: torch.Tensor, V: torch.Tensor, tgt_score: torch.Tensor,
-                counts: torch.Tensor, temperature: float,
-                region_chunk: int, row_batch: int, logger=None):
+def count_above(S: torch.Tensor, tgt_score: torch.Tensor, counts: torch.Tensor,
+                region_chunk: int, logger=None):
     """Count tuples, and items, scoring strictly above each row's target.
 
-    Two counts from one pass, because they differ only in the weight:
+    `S` is `[B, n_regions]` of already-scored tuples and `tgt_score` is the
+    target's own tuple score, so this is a comparison and two reductions, not a
+    second pass over the model. Two counts from one comparison, because they
+    differ only in the weight:
 
         above_regions = #{r : s_r > s_t}
         above_items   = sum over those r of size_r
@@ -224,27 +212,70 @@ def count_above(H: torch.Tensor, V: torch.Tensor, tgt_score: torch.Tensor,
     Strict `>` on both: the favourable tie convention every number in this
     project is reported under, where a tie is never charged to the target.
 
-    Chunked over tuples and rows so the largest live tensor is
-    `row_batch * region_chunk` floats.
+    Chunked over tuples so the largest live tensor is `row_batch * chunk` bools.
     """
-    n_rows = int(H.shape[0])
-    n_reg = int(V.shape[0])
-    above_regions = torch.zeros(n_rows, dtype=torch.int64, device=H.device)
-    above_items = torch.zeros(n_rows, dtype=torch.int64, device=H.device)
+    n_rows, n_reg = int(S.shape[0]), int(S.shape[1])
+    above_regions = torch.zeros(n_rows, dtype=torch.int64, device=S.device)
+    above_items = torch.zeros(n_rows, dtype=torch.int64, device=S.device)
     chunk = max(1, int(region_chunk))
     for c, start in enumerate(range(0, n_reg, chunk)):
         stop = min(start + chunk, n_reg)
-        block = V[start:stop]
-        blk_counts = counts[start:stop]
-        for b0 in range(0, n_rows, row_batch):
-            b1 = min(b0 + row_batch, n_rows)
-            scores = (H[b0:b1] @ block.t()) / temperature
-            hit = scores > tgt_score[b0:b1].unsqueeze(1)
-            above_regions[b0:b1] += hit.sum(dim=1).to(torch.int64)
-            above_items[b0:b1] += (hit.to(block.dtype) @ blk_counts).to(torch.int64)
+        hit = S[:, start:stop] > tgt_score.unsqueeze(1)
+        above_regions += hit.sum(dim=1).to(torch.int64)
+        # int64 multiply-and-sum, not a float matmul: a chunk of 131,072 tuples at
+        # up to 315 items each is 4.1e7, past the 2^24 where float32 stops counting
+        # integers exactly, and the item rank is an exact integer by definition.
+        above_items += (hit.to(torch.int64) * counts[start:stop]).sum(dim=1)
         if logger is not None and (c % 4 == 0 or stop == n_reg):
             logger.info(f"  tuples {stop:,}/{n_reg:,}")
     return above_regions, above_items
+
+
+def topk_rank(scores: torch.Tensor, col: torch.Tensor, kmax: int) -> torch.Tensor:
+    """The rank this project actually reports: the column's position in `topk`.
+
+    `evaluate()` in `train_digr.py` does
+
+        topk  = logits.topk(min(kmax, n), dim=1).indices
+        match = topk == targets.unsqueeze(1)
+        rank  = match.argmax(dim=1) + 1        # else kmax + 1
+
+    which is NOT `1 + #{i : s_i > s_t}`. Two items with equal scores are ordered
+    by whatever `topk` does with ties, so a target that shares its tuple with 314
+    others lands somewhere inside that block, not necessarily at its start. On a
+    shrunk codebook that difference is large at the top of the list: it is worth
+    18% of `R@1` on the 2x8192 arm, and under 1% by `R@1000`.
+
+    Reproducing the published convention is the point, so this is the same
+    operation, with the same `kmax + 1` miss rule. Comparing against a
+    `--dump_ranks` file then has to agree exactly rather than approximately.
+
+    Note what it implies about ties: a crowded bucket is charged to the target
+    here, because its tie-mates can sort ahead of it. That is a real part of the
+    cost of a non-injective SID, and applying the same rule to the tuple axis is
+    what keeps the counterfactual like-for-like.
+    """
+    k = int(min(int(kmax), int(scores.shape[1])))
+    top = scores.topk(k, dim=1).indices
+    match = top == col.unsqueeze(1)
+    found = match.any(dim=1)
+    return torch.where(
+        found,
+        match.to(torch.int64).argmax(dim=1) + 1,
+        torch.full_like(col, int(kmax) + 1),
+    )
+
+
+def brute_force_item_rank(logits_row: torch.Tensor, target_item: int) -> int:
+    """`1 + #{items strictly above the target}` computed the slow, obvious way.
+
+    This is the definition `item_logits` plus `evaluate()` implement, written out
+    with no tuple factorisation in it. It shares only the logits vector with
+    `count_above`, so agreement between the two is evidence that the region
+    weights, the representative slice and the item->tuple map are all consistent.
+    """
+    tgt = logits_row[int(target_item)]
+    return 1 + int((logits_row > tgt).sum().item())
 
 
 @torch.inference_mode()
@@ -302,67 +333,116 @@ def run(cli: argparse.Namespace, logger) -> Dict[str, object]:
     t0 = time.time()
     logger.info(f"  split        : {cli.split} ({len(indices):,} rows), "
                 f"mean tuple size seen by the target {g.mean():.2f}")
-    logger.info("  building region vectors ...")
-    vdtype = torch.float32 if cli.region_dtype == "fp32" else torch.bfloat16
-    V = region_vectors(model, regions, vdtype)
-    logger.info(f"  region matrix: {tuple(V.shape)} {V.dtype} "
-                f"({V.numel() * V.element_size() / 1e9:.1f} GB)")
+    logger.info("  scoring through model.item_logits, the same path the dump used ...")
 
-    # Pass 1: encode every row once and keep the separator states. 98,304 x 1024
-    # fp32 is 0.4 GB, which buys an outer loop over region chunks instead of
-    # re-reading the region matrix for every batch.
+    # Nothing is re-derived here. The scores come from `model.item_logits`, which
+    # is the exact function that produced the item ranks in every other number in
+    # this project, and a tuple's score is read off one of its own members. That
+    # is what makes `item_rank` below reproducible against a `--dump_ranks` file
+    # instead of merely close to it: an averaged tuple vector, a bf16 projection
+    # or a different autocast path all shift ranks by a few positions and turn an
+    # exact check into an approximate one.
     ds = T.TokenDataset(split, indices)
     loader = DataLoader(
         ds, batch_size=cli.batch_size, shuffle=False,
         collate_fn=T.make_collate(meta.vocab.pad_id),
         num_workers=cli.num_workers, pin_memory=(device.type == "cuda"),
     )
-    d = int(V.shape[1])
-    H = torch.zeros(len(indices), d, dtype=torch.float32, device=device)
-    tgt_score = torch.zeros(len(indices), dtype=torch.float32, device=device)
-    tgt_region = torch.as_tensor(target_region, device=device, dtype=torch.long)
-    vf = V.float()
+    first_t = torch.as_tensor(np.asarray(regions.first), device=device, dtype=torch.long)
+    counts_t = torch.as_tensor(regions.counts.astype(np.int64), device=device)
+    # Scattered into a split-length array so it can be indexed by the split row
+    # index the collate hands back, which is not a position inside `indices` when
+    # --max_rows narrows the run.
+    _full_region = np.zeros(int(np.asarray(split.targets).shape[0]), dtype=np.int64)
+    _full_region[indices] = regions.region_of_item[targets]
+    tgt_region_t = torch.as_tensor(_full_region, device=device, dtype=torch.long)
+    kmax = int(cli.kmax)
+    item_rank = torch.zeros(len(indices), dtype=torch.int64, device=device)
+    region_rank = torch.zeros(len(indices), dtype=torch.int64, device=device)
+    fav_item_rank = torch.zeros(len(indices), dtype=torch.int64, device=device)
+    above_regions = torch.zeros(len(indices), dtype=torch.int64, device=device)
+    above_items = torch.zeros(len(indices), dtype=torch.int64, device=device)
+    sanity_done = 0
     done = 0
     for ids, mask, tgts, rows in loader:
         ids = ids.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             h = model.encode(ids, mask)
-        h = h.float()
-        if getattr(model, "l2_normalize", False):
-            h = torch.nn.functional.normalize(h, dim=-1)
-        H[rows] = h
-        # The target's own region score defines the threshold for every count.
-        tgt_score[rows] = (h * vf.index_select(0, tgt_region[rows])).sum(-1) / model.temperature
+            logits = model.item_logits(h)
+        rows_d = rows.to(device, non_blocking=True)
+        tgt_items = tgts.to(device, non_blocking=True)
+        # The tuple's score IS its members' score: every member gathers the same
+        # code columns out of the same projection, so this is exact, not a proxy.
+        s_rep = logits.index_select(1, first_t)
+        tgt_score = s_rep.gather(1, tgt_region_t[rows_d].unsqueeze(1)).squeeze(1)
+
+        # Two ranks under the project's own convention (`topk` position), so the
+        # item column reproduces `--dump_ranks` and the tuple column is the same
+        # question asked of a codebook that cannot collide.
+        item_rank[rows_d] = topk_rank(logits, tgt_items, kmax)
+        region_rank[rows_d] = topk_rank(s_rep, tgt_region_t[rows_d], kmax)
+
+        # The generous convention, kept only as a diagnostic: 1 + #{strictly above}.
+        ar, ai = count_above(s_rep, tgt_score, counts_t, cli.region_chunk,
+                             logger if done == 0 else None)
+        above_regions[rows_d] += ar
+        above_items[rows_d] += ai
+        fav_item_rank[rows_d] = ai + 1
+
+        # On a row whose bucket holds one item there are no ties to reorder, so the
+        # two conventions must agree exactly. That is the check that separates
+        # "different but equivalent definitions" from "the sizes are wrong".
+        if sanity_done < int(cli.sanity_rows):
+            single = (regions.counts[np.asarray(_full_region)[np.asarray(rows)]] == 1)
+            for i in np.nonzero(single)[0][:8]:
+                if sanity_done >= int(cli.sanity_rows):
+                    break
+                if int(item_rank[rows_d[i]]) != int(fav_item_rank[rows_d[i]]):
+                    raise SystemExit(
+                        f"row {int(rows[i])} holds its target in a one-item tuple, so "
+                        f"the two rank definitions must agree, but topk says "
+                        f"{int(item_rank[rows_d[i]]):,} and counting says "
+                        f"{int(fav_item_rank[rows_d[i]]):,}. The tuple sizes or their "
+                        f"order do not match the catalogue."
+                    )
+                sanity_done += 1
+            if sanity_done >= int(cli.sanity_rows):
+                logger.info(f"  sanity check on {sanity_done} one-item tuples: "
+                            f"both rank definitions agree")
+
         done += int(ids.shape[0])
         if done % (cli.batch_size * 16) == 0 or done == len(indices):
-            logger.info(f"  encoded {done:,}/{len(indices):,} rows "
+            logger.info(f"  scored {done:,}/{len(indices):,} rows "
                         f"({(time.time() - t0) / 60:.1f} min)")
 
-    # Pass 2: count regions and items above each row's threshold.
-    counts = torch.as_tensor(regions.counts, device=device, dtype=torch.float32)
-    logger.info(f"  counting over {int(regions.n_regions):,} tuples in "
-                f"{math.ceil(int(regions.n_regions) / max(1, cli.region_chunk))} "
-                f"chunks of {int(cli.region_chunk):,} ...")
-    above_regions, above_items = count_above(
-        H, vf, tgt_score, counts, float(model.temperature),
-        cli.region_chunk, cli.batch_size, logger)
-    del vf, V
-
-    region_rank = (above_regions + 1).cpu().numpy().astype(np.int64)
-    item_rank = (above_items + 1).cpu().numpy().astype(np.int64)
+    item_rank = item_rank.cpu().numpy().astype(np.int64)
+    region_rank = region_rank.cpu().numpy().astype(np.int64)
+    fav_item_rank = fav_item_rank.cpu().numpy().astype(np.int64)
     if (region_rank > item_rank).any():
-        raise SystemExit(
-            "a region rank came out larger than the item rank, which cannot "
-            "happen: every region ranked above the target adds at least one item "
-            "to the count. The sizes are not aligned with the tuples."
+        bad = int((region_rank > item_rank).sum())
+        msg = (
+            f"{bad:,} rows ({100.0 * bad / len(item_rank):.3f}%) have a tuple rank "
+            "larger than their item rank, which should be impossible: every tuple "
+            "ranked above the target contributes at least one item above it."
         )
+        # A handful of rows can invert when two DISTINCT tuples tie exactly: the two
+        # `topk` calls then order the tied columns by index, so a tuple can sort ahead
+        # in one axis and its items behind in the other. Widespread inversions are a
+        # different animal and mean the sizes are not aligned with the tuples.
+        if bad > max(16, int(0.001 * len(item_rank))):
+            raise SystemExit(msg + " That is too many to explain by exact ties between "
+                            "distinct tuples, so the sizes are not aligned with "
+                            "the tuples.")
+        logger.warning(f"  note: {msg} Explained by exact ties between distinct "
+                       "tuples, which the two `topk` calls order differently.")
 
     summary = RL.summarise(item_rank, region_rank, g, cli.ks)
     return {
         "summary": summary,
         "item_rank": item_rank,
         "region_rank": region_rank,
+        "fav_item_rank": fav_item_rank,
         "g": g,
         "targets": targets,
         "n_rows": n_rows,
@@ -416,15 +496,17 @@ def main() -> int:
                     f"{100 * frac:.5f}% of rows ({int((~same).sum()):,} differ)")
         if not same.all():
             diff = np.abs(ref_rank[~same] - out["item_rank"][~same])
-            logger.info(f"  the differing rows sit within {int(diff.max())} positions, "
-                        "which is fp32 rounding between a summed tuple vector and a "
-                        "summed projection; exact ties are unaffected because every "
-                        "member of a tuple gets the same vector")
+            logger.info(f"  the differing rows sit within {int(diff.max())} positions. "
+                        "Both sides now rank by `topk` position with the same "
+                        "kmax, so a residual gap is a different checkpoint, a "
+                        "different --data_dir, or a different autocast path, not "
+                        "a different definition")
         if frac < 0.95:
             raise SystemExit(
-                f"only {100 * frac:.2f}% of item ranks reproduce, which is too few to "
-                "be rounding. The region sizes are probably misaligned with the "
-                "catalogue, and every number above is then wrong."
+                f"only {100 * frac:.2f}% of item ranks reproduce. The rank "
+                "convention now matches the evaluator exactly, so this points at "
+                "the checkpoint, the --data_dir, or the reference dump's kmax "
+                "rather than at this script's arithmetic."
             )
 
     if cli.out_json:

@@ -37,8 +37,24 @@ Two opposite fixes fit that fact:
 The region rank is computable on its own. With `s_r` the score of tuple `r`,
 `region_rank = 1 + #{r : s_r > s_rt}` is exactly the item rank an **injective** codebook
 would produce from the same scores. So the counterfactual "what if every tuple held one
-item" costs nothing extra: same scores, sizes set to 1. Both counts come out of one GEMM
-pass, because they differ only in the weight.
+item" costs nothing extra: same scores, sizes set to 1. Both counts come out of one pass,
+because they differ only in the weight.
+
+**Which tie convention is used, and why it matters.** Two ranks are reported for each row and
+they are not interchangeable:
+
+- `region_rank` and `item_rank` both use the evaluator's own convention, the target's
+  **position in a `topk` list**, including the `kmax + 1` miss rule. `item_rank` therefore
+  reproduces a `--dump_ranks` file exactly, which is what makes `--check_dump` a hard test
+  rather than an approximate one.
+- `fav_item_rank` uses the generous convention, `1 + #{items scoring strictly higher}`. It is
+  a diagnostic only: every member of a tuple has a bit-identical score, so the generous
+  convention hands the target the first slot of its whole tie group while the evaluator
+  places it by catalogue index. The gap between the two is the price of collisions in the
+  metric itself, separate from the price in the loss.
+
+Report `item_rank` beside published numbers and `fav_item_rank` only as the `1/g` bound.
+Mixing them across arms is the mistake `docs/evaluation.md` section 6 documents.
 
 ## Run it
 

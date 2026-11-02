@@ -26,9 +26,8 @@ CKPT="${CKPT:-${HOME}/NZ5/ablation/runs/digr_abl_sidv2_featv1_e2/best}"
 DATA_DIR="${DATA_DIR:-${HOME}/NZ5/ablation/digr_data_a}"
 SPLIT="${SPLIT:-val}"
 KS="${KS:-1,10,100,1000}"
-BATCH_SIZE="${BATCH_SIZE:-256}"
+BATCH_SIZE="${BATCH_SIZE:-128}"
 REGION_CHUNK="${REGION_CHUNK:-131072}"
-REGION_DTYPE="${REGION_DTYPE:-fp32}"
 OUT_JSON="${OUT_JSON:-${DUMP_PATH:-}}"
 DUMP_PATH="${DUMP_PATH:-}"
 CHECK_DUMP="${CHECK_DUMP:-}"
@@ -64,7 +63,7 @@ fi
 
 ARGS=(--checkpoint "${CKPT}" --data_dir "${DATA_DIR}" --split "${SPLIT}"
       --ks "${KS}" --batch_size "${BATCH_SIZE}"
-      --region_chunk "${REGION_CHUNK}" --region_dtype "${REGION_DTYPE}")
+      --region_chunk "${REGION_CHUNK}")
 [ -n "${OUT_JSON}"  ] && ARGS+=(--out_json "${OUT_JSON}")
 [ -n "${DUMP_PATH}" ] && ARGS+=(--dump_path "${DUMP_PATH}")
 [ -n "${CHECK_DUMP}" ] && ARGS+=(--check_dump "${CHECK_DUMP}")
@@ -79,7 +78,7 @@ echo "  region multiplicity: counting versus scoring"
 echo "  ckpt        : ${CKPT}"
 echo "  data_dir    : ${DATA_DIR}"
 echo "  split       : ${SPLIT}   ks: ${KS}"
-echo "  dtype/chunk : ${REGION_DTYPE} / ${REGION_CHUNK}   batch: ${BATCH_SIZE}"
+echo "  chunk/batch : ${REGION_CHUNK} / ${BATCH_SIZE}"
 echo "  dump        : ${DUMP_PATH:-<none>}"
 echo "  check_dump  : ${CHECK_DUMP:-<none>}"
 echo "=================================================================="

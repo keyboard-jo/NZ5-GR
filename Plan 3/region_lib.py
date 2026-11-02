@@ -240,32 +240,36 @@ def summarise(item_rank: np.ndarray, region_rank: np.ndarray, g: np.ndarray,
 def verdict(summary: Dict[str, object], tolerance: float = 0.15) -> str:
     """Say which of the two causes the numbers point at, in one sentence.
 
-    The test is the counterfactual gain: if ranking the same regions injectively
-    recovers most of the early-k loss, the arithmetic of counting was the problem
-    and a finer codebook is the fix. If it recovers almost nothing, the scores
-    themselves are wrong on crowded rows and no amount of splitting helps.
+    The test is the counterfactual gain at `R@10`: if ranking the same regions
+    injectively recovers much of the early-k loss, the arithmetic of counting was
+    the problem and a finer codebook is the fix. If it recovers almost nothing,
+    the scores themselves are wrong on crowded rows and no amount of splitting
+    helps.
+
+    `R@1` is deliberately not part of the test. Rank 1 means no tuple scores above
+    the target, which is the same condition whether a tuple holds one item or 315,
+    so the counterfactual gain at `R@1` is 1.00x by construction and carries no
+    information at all.
     """
-    g1 = float(summary.get("counterfactual_gain_1", float("nan")))
     g10 = float(summary.get("counterfactual_gain_10", float("nan")))
-    if not (g1 == g1) or not (g10 == g10):
+    if not (g10 == g10):
         return "not enough shared-bucket rows to separate the two causes"
-    best = max(g1, g10)
-    if best < 1.0 + tolerance:
+    if g10 < 1.0 + tolerance:
         return (
             f"scoring: an injective codebook with these same region scores would "
-            f"gain only {g1:.2f}x at R@1 and {g10:.2f}x at R@10, so the loss on "
-            "crowded rows is in the scores, not in the counting. A finer SID will "
-            "not fix it."
+            f"gain only {g10:.2f}x at R@10, so the loss on crowded rows is in the "
+            "scores, not in the counting. A finer SID will not fix it."
         )
-    if best >= 1.0 + 3 * tolerance:
+    if g10 >= 1.0 + 3 * tolerance:
         return (
             f"counting: the same region scores ranked injectively would gain "
-            f"{g1:.2f}x at R@1 and {g10:.2f}x at R@10, so most of the loss is fat "
-            "tuples donating their size to every rank. A finer codebook is the fix; "
-            "better item scoring will not find it."
+            f"{g10:.2f}x at R@10, so most of the loss is fat tuples donating their "
+            "size to every rank. A finer codebook is the fix; better item scoring "
+            "will not find it."
         )
     return (
-        f"mixed: an injective codebook would gain {g1:.2f}x at R@1 and {g10:.2f}x "
-        f"at R@10. Part of the loss is counting and part is scoring, so both moves "
-        "are worth something and neither is worth everything."
+        f"mixed: an injective codebook would gain {g10:.2f}x at R@10, while R@1 "
+        "cannot move at all because a tie is never charged to the target. Part of "
+        "the loss is counting and part is scoring, so both moves are worth "
+        "something and neither is worth everything."
     )

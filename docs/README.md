@@ -413,12 +413,11 @@ possible use of the clause section 2.6 leaves open.
 Ceiling: `R@1` 1.0549% to at most 2.06%, and nothing at `R@10` or beyond. This is a
 precision move and should not be sold as a recall move.
 
-**The check that decides whether the arithmetic holds.** `topk` returns bit-identical logits
-in catalogue index order, so if item ids correlate with anything at all, tie order is
-systematic rather than uniform, and the `1/g` model is wrong. Split DiGR's measured `R@1` by
-whether the target shares its tuple and compare against `1/11.07`. Above it, ties break
-favourably and 2.06% is a floor. Near it, the lottery model holds. Below it, the arm is being
-actively penalised and the fix is worth more than the bound suggests. Minutes on
+**The check that decides whether the arithmetic holds.** The tie order is not a lottery and it
+is not chosen in the arm's favour: `evaluate()` ranks by the target's position in `topk`, which
+for items that share a tuple means ascending catalogue index, and item id carries no
+behavioural signal ([`evaluation.md`](evaluation.md) section 6). Split DiGR's measured `R@1` by
+whether the target shares its tuple and compare against `1/11.07`. Minutes on
 `local/2026-29-10-1-full-eval/dumps/digr_val.npz` plus `catalog_sid_codes.npy`; no GPU, no
 retraining.
 
@@ -440,25 +439,27 @@ tuple targets against 0.777% on shared ones). So the gap belongs to DiGR's item
 representation, not to the items or the queries.
 
 Against the `1/11.07` prediction, shared targets imply `0.262% x 11.26 = 2.95%` tuple-level
-accuracy against `2.427%` measured directly on unique targets, so ties break slightly
-favourably: the lottery branch fired, not the penalised one, and the 2.06% above is the right
-order (the measured version is 2.47%).
+accuracy against `2.427%` measured directly on unique targets. That is **below** the
+prediction, which is what an arbitrary break gives rather than what a favourable one would:
+the evaluator places a tied target at its `topk` position, i.e. by catalogue index, so the
+model gets neither the best nor the average position inside a group as a matter of rule. The
+2.06% is therefore the right order and the measured 2.47% is the figure to quote.
 
-**What this still does not say, and why it matters.** The loss is either *counting* --
-`rank = 1 + #{i : s_i > s_t}` counts items, so every tuple above the target donates its whole
-size to the count and a crowded code space inflates the rank arithmetically -- or *scoring*
--- the model does not put a crowded region on top often enough. The fixes are opposite: a
-finer SID versus a better item vector. `Plan 3/region_rank.py` separates them in one GPU
-pass, because the region rank is exactly the item rank an *injective* codebook would produce
-from the same scores. If that ceiling lands near 2.43% the gap is counting and a deeper SID
-is justified; if it lands near 1.06% the gap is scoring and item-side surgery is the lever.
-Neither should be built before that run. See `tasks.md` section 4, and `Plan 3/README.md`
-for the run command.
+**What this still does not say, and why it matters.** The loss is either *counting* -- the
+rank is the target's position in the sorted list, so every item inside every tuple ranked
+above the target is counted, and a crowded code space inflates the rank arithmetically -- or
+*scoring* -- the model does not put a crowded region on top often enough. The fixes are
+opposite: a finer SID versus a better item vector. `Plan 3/region_rank.py` separates them in
+one GPU pass, because the region rank is exactly the item rank an *injective* codebook would
+produce from the same scores, measured under the same tie convention. If the ceiling lands
+near the unique-tuple accuracy the gap is counting and a deeper SID is justified; if it
+barely moves the gap is scoring and item-side surgery is the lever. Neither should be built
+before that run. See `tasks.md` section 4, and `Plan 3/README.md` for the run command.
 
-One caveat, so the number is not over-trusted: exact float ties are rarer than group sizes
-suggest, because the pooled vectors are bf16 sums and can differ in the last bits. The real
-behaviour is probably exact ties, near ties and kernel order mixed together, and only the
-split above can say in what proportion.
+One point that simplifies it: the ties are **exact**, not near-ties. Every member of a tuple
+gets the same $V_i$ row, so their scores are bit-identical and there is no last-bit spread to
+disentangle. The only thing deciding a target's position inside its group is the sort order,
+which is catalogue index.
 
 The linear-summation-to-concat-plus-MLP change is not on this list on its own: it is
 item-side capacity, and section 2.2 prices that at 0.15.
