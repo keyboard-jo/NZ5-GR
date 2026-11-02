@@ -1,6 +1,6 @@
 # Tasks
 
-Four things, in the order that changes what we can claim. The first is the one the
+Five things, in the order that changes what we can claim. The first is the one the
 co-supervisor's review asks for and the only one that is blocking.
 
 ## 1. Ablation: the new SID versus the new features (do this first)
@@ -161,7 +161,33 @@ v1 already beats DiGR v1 by a wide margin, the factorisation is doing real work 
 comparison understated it. If TIGER v1 loses to DiGR v1, the v2 win came from the SID change
 and `README.md` section 2.4 needs rewriting.
 
-## 4. Bigger backbone (deferred, last)
+## 4. Region multiplicity: counting or scoring (gate for any item-side move)
+
+**Why.** Measured 2026-11-02 on the v2 dump: `R@1` is 2.427% when the target is alone in
+its SID tuple and 0.262% when it shares one, a 9.3x gap that is monotone in group size and
+that survives popularity controls. Co-click, which has no codebook, shows 1.1x on the same
+rows, so the gap is DiGR's item representation rather than the items. `README.md` 2.3(d) has
+the table.
+
+**What.** `Plan 3/region_rank.py`, one GPU pass, no training. It scores the 3.0M *distinct
+tuples* instead of the 4.78M items and reports two ranks per row:
+
+- `item_rank = 1 + sum over tuples above of size`, which is what `item_logits` computes;
+- `region_rank = 1 + #{tuples above}`, which is the item rank an injective codebook would
+give from the *same* scores.
+
+The gap between them is the whole counting effect. Everything else is scoring.
+
+**The decision.** Injective `R@1` near 2.43% means the loss is arithmetic and a finer SID is
+justified. Near 1.06% means the scores are wrong on crowded rows and the lever is the item
+vector (per-level weights, non-linear composition), not the codebook. In between, both, and
+the table says in what proportion. Either way it gates two things that are otherwise pure
+guesswork: move (d) in `README.md` 2.3 and any revisit of SID depth.
+
+**Cost.** A few minutes of one GPU. `DUMP_PATH` writes per-row ranks, so `--report_only`
+re-derives the table with no GPU afterwards.
+
+## 5. Bigger backbone (deferred, last)
 
 **Why last.** DiGR's ceiling looks like signal rather than capacity: P(top10|top1000) sits at
 13-15% for every arm, including popularity at 9.12% with no query at all. TIGER is the more

@@ -422,6 +422,39 @@ actively penalised and the fix is worth more than the bound suggests. Minutes on
 `local/2026-29-10-1-full-eval/dumps/digr_val.npz` plus `catalog_sid_codes.npy`; no GPU, no
 retraining.
 
+**Measured, 2026-11-02.** That split, on the v2 dump:
+
+| tuple size | rows | share | `R@1` | `R@10` |
+| --- | --- | --- | --- | --- |
+| 1 | 36,017 | 36.64% | **2.427%** | **5.703%** |
+| 2 | 17,275 | 17.57% | 0.590% | 3.757% |
+| 3-4 | 16,451 | 16.73% | 0.310% | 3.210% |
+| 5-8 | 12,441 | 12.66% | 0.040% | 1.953% |
+| 9-16 | 7,639 | 7.77% | 0.039% | 1.217% |
+| 17-315 | 8,481 | 8.63% | 0.024% | 0.330% |
+
+9.3x at `R@1`, monotone in group size, and it is not popularity: the gap survives inside
+every popularity quintile, at 1.6x, 3.4x, 8.7x, 8.9x and 3.0x. The control that settles it is
+co-click, which has no codebook at all and shows **1.1x** on the same rows (0.855% on unique
+tuple targets against 0.777% on shared ones). So the gap belongs to DiGR's item
+representation, not to the items or the queries.
+
+Against the `1/11.07` prediction, shared targets imply `0.262% x 11.26 = 2.95%` tuple-level
+accuracy against `2.427%` measured directly on unique targets, so ties break slightly
+favourably: the lottery branch fired, not the penalised one, and the 2.06% above is the right
+order (the measured version is 2.47%).
+
+**What this still does not say, and why it matters.** The loss is either *counting* --
+`rank = 1 + #{i : s_i > s_t}` counts items, so every tuple above the target donates its whole
+size to the count and a crowded code space inflates the rank arithmetically -- or *scoring*
+-- the model does not put a crowded region on top often enough. The fixes are opposite: a
+finer SID versus a better item vector. `Plan 3/region_rank.py` separates them in one GPU
+pass, because the region rank is exactly the item rank an *injective* codebook would produce
+from the same scores. If that ceiling lands near 2.43% the gap is counting and a deeper SID
+is justified; if it lands near 1.06% the gap is scoring and item-side surgery is the lever.
+Neither should be built before that run. See `tasks.md` section 4, and `Plan 3/README.md`
+for the run command.
+
 One caveat, so the number is not over-trusted: exact float ties are rarer than group sizes
 suggest, because the pooled vectors are bf16 sums and can differ in the last bits. The real
 behaviour is probably exact ties, near ties and kernel order mixed together, and only the
@@ -448,10 +481,14 @@ larger than anything width has bought.
    `dumps/baselines/h20/`, the picker wanted a per-kind subdirectory and skipped all three
    windows. Turns the two `est` cells in section 1.3 into measurements. Nothing else needs
    re-running; all four dumps are complete and were verified.
-2. **The tie-order check** (minutes, CPU, no GPU). Split DiGR's measured `R@1` by whether
-   the target shares its code tuple, compare against `1/11.07`, and print the curve by group
-   size. It decides whether move (d) is worth building and whether the 2.06% tuple-level
-   figure is real. Independent of everything else here, so it can run alongside.
+2. **The tie-order check: run 2026-11-02** (minutes, CPU). Result in section 2.3(d): 9.3x at
+   `R@1` between unique-tuple and shared-tuple targets, and 1.1x for co-click on the same
+   rows, which puts the gap on DiGR's representation rather than on the data. What it
+   opened, and what now goes ahead of moves (d) and any revisit of SID depth:
+   `Plan 3/region_rank.py`, one GPU pass. It reports the rank the *same* tuple scores would
+   give an injective codebook, so it says whether the remaining early-k loss is counting
+   (finer SID) or scoring (better item vector). Cheap, decides the direction of two moves,
+   and cannot be inferred from anything already measured.
 3. **Beam 10 and beam 12** (~25 min each, about 96 and 115 items named). This is the real
    test of depth, because it sits on the frontier: TIGER has to beat DiGR at 96 items
    (10.6%) or 115, not at 192. Beam 60 would push the wrong way.
