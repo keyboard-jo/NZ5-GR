@@ -320,11 +320,18 @@ level; both its levels are 98%+ dense codes.
 injective, so on this catalogue it is a partition whose last level is doing real work. That
 is the case for width here: not more bits, but a second level that has not run out.
 
-**The tie ceiling does not bind.** 62.78% and 95.96% against measured 1.05% and 3.66%, so
-ties cost nothing yet. The archived figures of 53.57% and 93.20% came from an earlier
-quantiser run with 2.56M distinct tuples rather than the 3.00M in this artefact; the
-collision share (53.51%) and the 315-item largest group that the earlier note also quotes do
-belong to this file, so only the ceiling moved.
+**The tie ceiling does not bind, and that is not the same as collisions being free.** 62.78%
+and 95.96% against measured 1.05% and 3.66%. Read on its own that says the codes are fine,
+which does not follow: a hash is injective with a 100% ceiling and carries no behaviour, and
+`4x256+731` at depth 5 is exactly that case, injective at 827.2x lift. The rows that settle it
+are the 36.64% whose target sits alone in its tuple, where no tie can be charged and `R@1` is
+still 2.43% against a ceiling of 100%. Collisions are not the binding constraint at 3.66%
+`R@10`; the ranking is. The size of the remainder is measured in [`sid.md`](sid.md) 4: holding
+the scores fixed and ranking the same tuples injectively gains 1.34x at `R@10`. `sid.md` 4
+states the joint test with lift. The archived figures of
+53.57% and 93.20% came from an earlier quantiser run with 2.56M distinct tuples rather than
+the 3.00M in this artefact; the collision share (53.51%) and the 315-item largest group that
+the earlier note also quotes do belong to this file, so only the ceiling moved.
 
 ---
 
@@ -356,8 +363,10 @@ slope = log(1.41) / log(9.3) = 0.15
 A 0.15 exponent means another 10x on the item side buys about 1.4x, and another 100x buys
 about 2x. Two of the three axes that moved in that step were query-side anyway (the action
 token and the 128 gap bins). The 53.51% of items sharing a 2-code tuple and the 315-item
-tie group are real, but the tie ceiling (`R@1` 62.78%, `R@10` 95.96%) is not the binding
-constraint at 3.66%.
+tie group are real. The tie ceiling is not the binding constraint at 3.66%, but that is an
+argument about tie resolution and not about whether the representation is adequate: the
+36.64% of targets sitting alone in a tuple, where no tie operates, still reach only 2.43%
+`R@1`.
 
 Consequence: a bigger codebook is not the big move. S9 at 16,384 is off the table.
 
@@ -401,9 +410,9 @@ R@1  dilution = 0.4649 + 0.5351/11.07    = 0.513     49% of the skill is invisib
 R@10 dilution = 0.4649 + 0.5351*10/11.07 = 0.948     only 5%
 ```
 
-The reported `R@1` of 1.0549% is therefore about 2.06% of tuple-level accuracy. Collision
-adjusted, v2 beats v1 by 2.6x at `R@1` rather than the 1.33x the table shows, so collisions
-have been hiding the SID change, not inflating it.
+The reported `R@1` of 1.0549% is therefore about 2.06% of tuple-level accuracy. That figure
+assumes the favourable break, where the target wins its block, and it is now withdrawn: see
+the measured ceiling below.
 
 Legal under the content-only rule, applied to exact ties only:
 
@@ -415,8 +424,14 @@ s_i = h . V_i  +  delta * h . u_i        when h . V_i ties
 retrained, and the cost is one extra dot product on the tied items only. It is the smallest
 possible use of the clause section 2.6 leaves open.
 
-Ceiling: `R@1` 1.0549% to at most 2.06%, and nothing at `R@10` or beyond. This is a
-precision move and should not be sold as a recall move.
+Ceiling, measured rather than derived: [`Plan 3/region_rank.py`](../Plan%203/region_rank.py)
+ranks the same scores over distinct tuples, and on arm a that is `R@1` 0.9705% to 1.1414%, a
+**1.18x** cap. A tie break that always put the target first inside its block would still be
+working inside that ceiling, so the 2.06% above is too high and is withdrawn. The one clean
+stratum comparison replaces it: on unique-tuple rows only, v2 reaches 2.427% `R@1` against arm
+a's 2.254%, which is the same 1.08x the arms show overall, so collisions have been spreading
+the gap out rather than hiding it. Nothing at `R@10` or beyond either way: this is a precision
+move and should not be sold as a recall move.
 
 **The check that decides whether the arithmetic holds.** The tie order is not a lottery and it
 is not chosen in the arm's favour: `evaluate()` ranks by the target's position in `topk`, which
@@ -437,18 +452,24 @@ retraining.
 | 9-16 | 7,639 | 7.77% | 0.039% | 1.217% |
 | 17-315 | 8,481 | 8.63% | 0.024% | 0.330% |
 
-9.3x at `R@1`, monotone in group size, and it is not popularity: the gap survives inside
-every popularity quintile, at 1.6x, 3.4x, 8.7x, 8.9x and 3.0x. The control that settles it is
-co-click, which has no codebook at all and shows **1.1x** on the same rows (0.855% on unique
-tuple targets against 0.777% on shared ones). So the gap belongs to DiGR's item
-representation, not to the items or the queries.
+9.3x at `R@1` between unique and shared targets, monotone in group size, and it is not
+popularity: the gap survives inside every popularity quintile, at 1.6x, 3.4x, 8.7x, 8.9x and
+3.0x. The control that settles it is co-click, which has no codebook at all and shows **1.1x**
+on the same rows (0.855% on unique tuple targets against 0.777% on shared ones). So the gap
+belongs to DiGR's item representation, not to the items or the queries.
+
+That 9.3x is a description of the population, not a forecast of the fix: unique-tuple rows are
+also the easier rows, so it mixes "no tie" with "easier". The controlled figure, holding the
+scores fixed and ranking the same tuples injectively, is **1.18x at `R@1` and 1.34x at
+`R@10`** (section 2.3(d) below and [`sid.md`](sid.md) 4).
 
 Against the `1/11.07` prediction, shared targets imply `0.262% x 11.26 = 2.95%` tuple-level
 accuracy against `2.427%` measured directly on unique targets. That is **below** the
 prediction, which is what an arbitrary break gives rather than what a favourable one would:
 the evaluator places a tied target at its `topk` position, i.e. by catalogue index, so the
-model gets neither the best nor the average position inside a group as a matter of rule. The
-2.06% is therefore the right order and the measured 2.47% is the figure to quote.
+model gets neither the best nor the average position inside a group as a matter of rule. So
+the measured `2.427%` is the figure to quote and the derived `2.06%` above is too high, with the
+`1.18x` injective cap as the limit on what any tie break can recover from it.
 
 **What this still does not say, and why it matters.** The loss is either *counting* -- the
 rank is the target's position in the sorted list, so every item inside every tuple ranked
@@ -456,10 +477,15 @@ above the target is counted, and a crowded code space inflates the rank arithmet
 *scoring* -- the model does not put a crowded region on top often enough. The fixes are
 opposite: a finer SID versus a better item vector. `Plan 3/region_rank.py` separates them in
 one GPU pass, because the region rank is exactly the item rank an *injective* codebook would
-produce from the same scores, measured under the same tie convention. If the ceiling lands
-near the unique-tuple accuracy the gap is counting and a deeper SID is justified; if it
-barely moves the gap is scoring and item-side surgery is the lever. Neither should be built
-before that run. See `tasks.md` section 4, and `Plan 3/README.md` for the run command.
+produce from the same scores, measured under the same tie convention.
+
+The answer is **mixed, and mostly scoring.** On arm a, with the scores held fixed, ranking the
+same tuples injectively takes `R@10` from 3.2725% to 4.3742% and `R@1` from 0.9705% to 1.1414%,
+so **a quarter of what these scores can already reach at `R@10` and 15% at `R@1` is lost to
+counting** and the rest is the model's own ranking. Counting is therefore real and worth
+collecting through a finer codebook, and it is not the lever that turns 3.66% into 8-11%. The
+row-by-row version is in [`sid.md`](sid.md) section 4, and the run command in
+`Plan 3/README.md`.
 
 One point that simplifies it: the ties are **exact**, not near-ties. Every member of a tuple
 gets the same $V_i$ row, so their scores are bit-identical and there is no last-bit spread to
@@ -489,12 +515,15 @@ larger than anything width has bought.
    re-running; all four dumps are complete and were verified.
 2. **The tie-order check: run 2026-11-02** (minutes, CPU). Result in section 2.3(d): 9.3x at
    `R@1` between unique-tuple and shared-tuple targets, and 1.1x for co-click on the same
-   rows, which puts the gap on DiGR's representation rather than on the data. What it
-   opened, and what now goes ahead of moves (d) and any revisit of SID depth:
-   `Plan 3/region_rank.py`, one GPU pass. It reports the rank the *same* tuple scores would
-   give an injective codebook, so it says whether the remaining early-k loss is counting
-   (finer SID) or scoring (better item vector). Cheap, decides the direction of two moves,
-   and cannot be inferred from anything already measured.
+   rows, which puts the gap on DiGR's representation rather than on the data. It opened
+   `Plan 3/region_rank.py`, which has now also run (1.7 min, 100.00000% of the dumped ranks
+   reproduced): the same tuple scores ranked injectively reach **1.34x at `R@10`, 1.32x at
+   `R@100`, 1.24x at `R@1000`, 1.18x at `R@1`**. So a quarter of what these scores can already
+   reach at `R@10` is lost to counting and three quarters is the model's own ranking. Three
+   consequences: move (d), a content-side tie break, is capped at 1.18x at `R@1` and drops down
+   the list; a finer codebook keeps its place, because that quarter is real and a finer code is
+   the only way to collect it; and none of this changes the 0.15 slope for item-side capacity,
+   which is why concat-plus-MLP stays off the list.
 3. **Beam 10 and beam 12** (~25 min each, about 96 and 115 items named). This is the real
    test of depth, because it sits on the frontier: TIGER has to beat DiGR at 96 items
    (10.6%) or 115, not at 192. Beam 60 would push the wrong way.

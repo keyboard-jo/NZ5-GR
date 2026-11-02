@@ -28,8 +28,14 @@ SPLIT="${SPLIT:-val}"
 KS="${KS:-1,10,100,1000}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
 REGION_CHUNK="${REGION_CHUNK:-131072}"
-OUT_JSON="${OUT_JSON:-${DUMP_PATH:-}}"
 DUMP_PATH="${DUMP_PATH:-}"
+# The json report and the npz dump are two different artefacts. Deriving the report
+# path from the dump path without changing the suffix would point both flags at one
+# file, and --dump_path is written last, so the table would vanish silently.
+OUT_JSON="${OUT_JSON:-${DUMP_PATH:+${DUMP_PATH%.npz}.json}}"
+if [ -n "${OUT_JSON}" ] && [ "${OUT_JSON}" = "${DUMP_PATH}" ]; then
+    OUT_JSON="${DUMP_PATH}.json"
+fi
 CHECK_DUMP="${CHECK_DUMP:-}"
 MAX_ROWS="${MAX_ROWS:-}"
 

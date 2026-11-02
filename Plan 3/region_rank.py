@@ -231,6 +231,21 @@ def count_above(S: torch.Tensor, tgt_score: torch.Tensor, counts: torch.Tensor,
     return above_regions, above_items
 
 
+def sanity_agrees(counted_rank, topk_value, kmax) -> bool:
+    """Do the two conventions agree on a row whose tuple holds one item?
+
+    They rank the same thing there, so they must. The catch is that they do not
+    return the same *number* once the row is deep: `topk_rank` stores a miss as
+    `kmax + 1`, while `1 + #{strictly above}` keeps counting. A row at true rank
+    66,503 therefore reads 10,001 under one convention and 66,503 under the
+    other, and that difference is the cap, not misalignment.
+
+    Comparing the capped value is still a real check. If the sizes or their order
+    were wrong, `topk` would report a rank inside `kmax` and this would fail.
+    """
+    return int(topk_value) == min(int(counted_rank), int(kmax) + 1)
+
+
 def topk_rank(scores: torch.Tensor, col: torch.Tensor, kmax: int) -> torch.Tensor:
     """The rank this project actually reports: the column's position in `topk`.
 
@@ -391,20 +406,26 @@ def run(cli: argparse.Namespace, logger) -> Dict[str, object]:
         fav_item_rank[rows_d] = ai + 1
 
         # On a row whose bucket holds one item there are no ties to reorder, so the
-        # two conventions must agree exactly. That is the check that separates
-        # "different but equivalent definitions" from "the sizes are wrong".
+        # two conventions describe the same ranking. That is the check that separates
+        # "different but equivalent definitions" from "the sizes are wrong". The
+        # comparison is against the CAPPED count, because `topk_rank` flattens a miss
+        # to `kmax + 1` while the count keeps going; on this arm about half the rows
+        # rank past 10,000, so comparing raw would fail on almost every deep row.
         if sanity_done < int(cli.sanity_rows):
             single = (regions.counts[np.asarray(_full_region)[np.asarray(rows)]] == 1)
             for i in np.nonzero(single)[0][:8]:
                 if sanity_done >= int(cli.sanity_rows):
                     break
-                if int(item_rank[rows_d[i]]) != int(fav_item_rank[rows_d[i]]):
+                got = int(item_rank[rows_d[i]])
+                counted = int(fav_item_rank[rows_d[i]])
+                if not sanity_agrees(counted, got, kmax):
                     raise SystemExit(
                         f"row {int(rows[i])} holds its target in a one-item tuple, so "
                         f"the two rank definitions must agree, but topk says "
-                        f"{int(item_rank[rows_d[i]]):,} and counting says "
-                        f"{int(fav_item_rank[rows_d[i]]):,}. The tuple sizes or their "
-                        f"order do not match the catalogue."
+                        f"{got:,} and counting says {counted:,} "
+                        f"(which caps at {kmax + 1:,}). Either the tuple sizes or "
+                        f"their order do not match the catalogue, or two distinct "
+                        f"tuples scored bit-identically by chance."
                     )
                 sanity_done += 1
             if sanity_done >= int(cli.sanity_rows):

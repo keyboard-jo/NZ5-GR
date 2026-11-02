@@ -274,8 +274,13 @@ DiGR is charged for and TIGER is not:
 | implied $\mathrm{R@1}$ ceiling if ranks were assigned per tuple | 62.78% |
 | implied $\mathrm{R@10}$ ceiling | 95.96% |
 
-At the observed 3.66% these ceilings are not binding, but they are the reason a
-tuple-level number can never be read as an item-level one.
+At the observed 3.66% these ceilings are not binding. That is not evidence that collisions are
+harmless: an injective code, such as a hash of the item id, has a ceiling of 100% and no
+behavioural content, so a ceiling qualifies a number rather than recommending a representation.
+Its use is to say how much of a gap a tie mechanism could possibly explain, which here is a
+few percent, and it is the reason a tuple-level number can never be read as an item-level one.
+Read it beside lift: a distant ceiling with high lift says the scorer is the constraint, a
+close ceiling with high lift says the codes are.
 
 **(c) The beam's rank is a bucket rank.** All items in a bucket share a position. That is
 the method's own resolution limit, not an evaluation choice, and it is why the beam arm is

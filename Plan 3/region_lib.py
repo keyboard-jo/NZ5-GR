@@ -246,10 +246,13 @@ def verdict(summary: Dict[str, object], tolerance: float = 0.15) -> str:
     the scores themselves are wrong on crowded rows and no amount of splitting
     helps.
 
-    `R@1` is deliberately not part of the test. Rank 1 means no tuple scores above
-    the target, which is the same condition whether a tuple holds one item or 315,
-    so the counterfactual gain at `R@1` is 1.00x by construction and carries no
-    information at all.
+    `R@1` is deliberately not part of the test. Under the convention this code counts
+    with (`1 + #{strictly above}`) rank 1 means no tuple scores above the target, the
+    same condition whether a tuple holds one item or 315, so that counterfactual gain
+    is 1.00x by construction. The region column is ranked with `topk_rank`, though, and
+    `train_digr.evaluate()` charges a target for its own tie-mates, so the measured
+    gain at `R@1` is real and slightly above 1.0. It stays out of the test because it
+    is small and it has the noisiest denominator.
     """
     g10 = float(summary.get("counterfactual_gain_10", float("nan")))
     if not (g10 == g10):
@@ -264,12 +267,13 @@ def verdict(summary: Dict[str, object], tolerance: float = 0.15) -> str:
         return (
             f"counting: the same region scores ranked injectively would gain "
             f"{g10:.2f}x at R@10, so most of the loss is fat tuples donating their "
-            "size to every rank. A finer codebook is the fix; better item scoring "
-            "will not find it."
+            "size to every rank. A finer codebook is the fix, provided the new levels "
+            "carry information at the same lift as the ones already there; this "
+            "counterfactual assumes they do, so treat the gain as an upper bound."
         )
     return (
-        f"mixed: an injective codebook would gain {g10:.2f}x at R@10, while R@1 "
-        "cannot move at all because a tie is never charged to the target. Part of "
-        "the loss is counting and part is scoring, so both moves are worth "
-        "something and neither is worth everything."
+        f"mixed: an injective codebook would gain {g10:.2f}x at R@10, so part of the "
+        "loss is counting and part is scoring. Both moves are worth something and "
+        "neither is worth everything. The gain is an upper bound, because it credits "
+        "the extra resolution with the information of the levels already present."
     )

@@ -216,3 +216,30 @@ def test_topk_rank_stores_a_miss_as_kmax_plus_one():
     # Column 1 is inside the top 2 (second), column 3 falls outside it.
     assert int(RR.topk_rank(scores, torch.tensor([1]), kmax=2)[0]) == 2
     assert int(RR.topk_rank(scores, torch.tensor([3]), kmax=2)[0]) == 3
+
+
+def test_the_one_item_tuple_sanity_check_compares_capped_ranks():
+    """A deep row must not be reported as misalignment.
+
+    The failing case in production: row 5 of arm a had its target in a one-item
+    tuple at true rank 66,503. `topk_rank` stores that as `kmax + 1 = 10,001`,
+    so comparing the raw count aborted the run with a message blaming the
+    catalogue. About half of this arm's rows rank past `kmax`, so the check has
+    to compare the capped value.
+    """
+    assert RR.sanity_agrees(counted_rank=66_503, topk_value=10_001, kmax=10_000)
+    assert RR.sanity_agrees(counted_rank=5, topk_value=5, kmax=10_000)
+    # No cap in play, still exact.
+    assert RR.sanity_agrees(counted_rank=3, topk_value=3, kmax=10_000)
+
+
+def test_the_sanity_check_still_catches_a_real_misalignment():
+    """Capping must not make the check vacuous."""
+    # topk found the target near the top while the count says it is far down:
+    # different tuple sizes or a shuffled catalogue.
+    assert not RR.sanity_agrees(counted_rank=66_503, topk_value=5, kmax=10_000)
+    # topk missed it entirely while the count says it wins: also impossible.
+    assert not RR.sanity_agrees(counted_rank=1, topk_value=10_001, kmax=10_000)
+    # Off by one in either direction is still a failure.
+    assert not RR.sanity_agrees(counted_rank=7, topk_value=6, kmax=10_000)
+    assert not RR.sanity_agrees(counted_rank=6, topk_value=7, kmax=10_000)

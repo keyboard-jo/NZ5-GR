@@ -123,14 +123,96 @@ group of two or more, largest group 315. The uniform birthday bound for 67.1M ce
 7.13%, so the measured rate is 7.5x the prediction. k-means cells cluster where the items
 are instead of spreading evenly.
 
-**That turned out not to matter, and the tie ceiling is why.** Two items with the same
-codes get the same score from any scorer that reads the SID, so a tie group of size `g`
+**The reading that collisions cost nothing is wrong, and it was mine.** Two items with the
+same codes get the same score from any scorer that reads the SID, so a tie group of size `g`
 caps recall at `1/g` at rank 1 and `min(1, k/g)` at rank `k`. Measured for 2 x 8,192 the mean
-tie group is 4.71 (median 2, p90 8, largest 315), capping R@1 at 62.78% and R@10 at 95.96%.
-DiGR sat at 1.05% and 3.66% on that SID, so the ceiling is not remotely binding and the
-remaining collisions cost nothing yet. The 3 x 1,024 figures in the archived table (mean
-group 5.55, R@1 64.10%, R@10 94.85%) predate this measurement and that json is not in the
-repo, so they are quoted as recorded rather than re-derived.
+tie group over val targets is 4.71 (median 2, p90 8, largest 315), so the ceilings are 62.78%
+and 95.96%. DiGR sits at 1.05% and 3.66%, and the old conclusion from that gap was that ties
+cost nothing yet.
+
+Two things are wrong with it. A high ceiling is not health: a hash of the item id is
+injective and its ceiling is 100%, and `4x256+731` is already that case here, because depth 5
+is injective by construction, carries a 100.00% ceiling, and drops lift to 827.2x.
+Distinguishability bought with levels that carry no information is how the narrow codebook
+became the worse representation.
+
+And the real reason to park collisions is not the distance to the ceiling. It is the rows
+where the tie cannot operate at all: 36.64% of val targets sit alone in their tuple, so no
+tie-break applies, and their `R@1` is 2.43% against a ceiling of 100%. Where the model has
+every advantage the ceiling can offer it still misses 97.6% of the time. That puts the loss in
+the ranking, which is the item representation, and not in the tie mechanism.
+
+So the ceiling is half of a joint test and on its own it says nothing about whether a
+representation is good enough. Read it beside lift, as a rough guide rather than a threshold:
+
+| measured `R@k` against its ceiling | lift | reading | what to change |
+| --- | --- | --- | --- |
+| far below, under roughly 20% | low | coarse and uninformative | the codes carry almost nothing; change the objective, or widen |
+| far below | high | informative, and the head cannot exploit it | the codes are not the constraint, the scorer is |
+| close, over roughly 80% | high | at the resolution limit | a finer SID buys the remainder |
+| close | low | injective and useless, which is a hash | fewer or re-aimed codes, not finer ones |
+
+`2x8192` is the second row today: lift 7,880.6x at depth 2, with `R@10` at 3.81% of its
+ceiling. The codes carry information and the ranking is not using it, which is an argument
+about the head and the query side. It is not an argument that the representation is adequate.
+
+One consequence for `Plan 3/`: its injective-counterfactual column answers "what would a free,
+perfect tie-break buy", and treats the extra resolution as carrying the same information as
+the levels already there. That makes it an upper bound rather than a forecast, and the narrow
+codebook is the measured test of it.
+
+The 3 x 1,024 figures in the archived table (mean group 5.55, R@1 64.10%, R@10 94.85%)
+predate this measurement and that json is not in the repo, so they are quoted as recorded
+rather than re-derived.
+
+**Where the collisions cost you, measured.** Wording aside, the size of the effect is now a
+measurement rather than an implication. `Plan 3/region_rank.py` scores one checkpoint twice,
+once over the 4.78M items and once over the 3.00M distinct tuples, both through the model's
+own `item_logits`, so the two columns differ only in how many positions a fat tuple occupies.
+On arm a (the `2x8192` codes with v1 features) the item column reproduces the `--dump_ranks`
+file on 100.00000% of the 98,304 rows, so the left side of the table is the leaderboard measure
+itself and not an approximation of it.
+
+| target's tuple size | rows | share | `g` | item `R@1` | item `R@10` | item `R@100` | injective `R@1` | injective `R@10` | injective `R@100` | inflation |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 36,017 | 36.64% | 1.00 | 2.254% | 5.228% | 11.467% | 2.254% | 6.094% | 14.013% | 652.9 |
+| 2 | 17,275 | 17.57% | 2.00 | 0.463% | 3.294% | 9.777% | 0.822% | 4.185% | 12.544% | 687.6 |
+| 3-4 | 16,451 | 16.73% | 3.38 | 0.334% | 2.705% | 8.966% | 0.681% | 3.665% | 12.005% | 716.1 |
+| 5-8 | 12,441 | 12.66% | 6.17 | 0.024% | 1.825% | 9.332% | 0.193% | 3.271% | 13.005% | 769.4 |
+| 9-16 | 7,639 | 7.77% | 11.68 | 0.052% | 0.995% | 8.417% | 0.314% | 2.710% | 12.593% | 786.6 |
+| 17 and over | 8,481 | 8.63% | 39.66 | 0.000% | 0.200% | 7.098% | 0.094% | 1.946% | 12.109% | 857.0 |
+| all rows | 98,304 | 100% | 6.39 | 0.9705% | 3.2725% | 9.8674% | 1.1414% | 4.3742% | 13.0168% | |
+
+| metric | measured | same scores, injective | gain |
+| --- | --- | --- | --- |
+| `R@1` | 0.9705% | 1.1414% | 1.18x |
+| `R@10` | 3.2725% | 4.3742% | 1.34x |
+| `R@100` | 9.8674% | 13.0168% | 1.32x |
+| `R@1000` | 25.5239% | 31.5450% | 1.24x |
+
+`inflation` is the mean of `item rank − region rank` within the band, with both capped at
+`kmax + 1`, so the cap censors it heavily and it should be read as an ordering hint rather
+than a count.
+
+Three things follow. The effect is real and it is **not** the 2.3x that the singleton
+subpopulation suggests, because that comparison confounds "no ties" with "those rows are
+easier"; the controlled question, holding the scores fixed, is 1.34x at `R@10`. It is also
+uneven: the 36.64% of rows with a unique tuple reach 2.254% `R@1` on merit, while the 8.63%
+in tuples of 17 or more reach 0.000%, and the 58.87% of rows with at least one tuple ranked
+above the target is where the whole loss lives. And it decays with depth, 1.34x at `R@10`
+down to 1.24x at `R@1000`, which is the signature of a positional penalty rather than a
+missing signal.
+
+So "counting" is worth about 1.3x at the head, conditional on the extra resolution carrying
+information. That is smaller than the 1.57x the codebook already bought, and much smaller than
+the 2.3x to 3x the direction needs. It is a remainder to collect, not the big move, and it
+belongs to a third code from a finer quantiser rather than to a collision index, since an
+index in catalogue order is unlearnable and v1 carries that level already.
+
+One detail worth recording because it looked like a bug: 6 rows (0.006%) report a tuple rank
+larger than their item rank, which cannot happen if both count the tuples above. The cause is
+that two distinct tuples can score bit-identically and the two `topk` calls break that tie
+differently.
 
 **The flat-lift prediction failed twice, and the failure is instructive.** The original
 argument was geometric: 4.78M points of effective dimension about 17 have a bounded
@@ -180,8 +262,11 @@ replaced it.
 - **Items per code is the number to quote, not bits.** Ours is 584 at v2. The DiGR paper's
   catalogues sit at 39 to 195 items per level-0 code, and that gap, not the vocabulary
   bits, is the scale difference between its numbers and ours.
-- **The tie ceiling is the check to run on any future SID.** One run of the instrument
-  prints it, and it is the only bound that does not require training a model to find.
+- **The tie ceiling is half a check, and lift is the other half.** A ceiling cannot separate a
+good representation from a hash, because a hash is injective. Read the two together: high
+lift with a distant ceiling means the scorer is the constraint, and high lift with a close
+ceiling means the codes are. The rows where no tie can operate are the cleanest single test,
+because they remove the tie mechanism instead of arguing about it.
 - **The width axis is closed by decision.** The next SID question is not wider codes but
   behaviour-aware codes, and that work is bounded by the rules in `README.md` 2.6: the
   representation stays a function of content at serving time, so a co-occurrence vector
