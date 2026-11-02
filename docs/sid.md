@@ -21,13 +21,45 @@ Everything here is measured on the same 98,304 val rows.
 | depth-1 lift | 46.9x | 463.3x |
 | peak lift | 8,257.6x at depth 3 | 7,880.6x at depth 2 |
 | depth-1 candidate bucket | 19,308 | 745 |
-| collision share | 27.67% share a 4-code prefix | 53.51% share a 2-code tuple, largest 315 |
-| tie ceiling, R@1 / R@10 | not computed | 62.78% / 95.96% |
+| collision share | 1.38 items per full 5-code tuple; 39.28% of items share one (27.67% excess), largest 731 | 1.59 items per 2-code tuple; 53.51% share one (37.22% excess), largest 315 |
+| tie ceiling, R@1 / R@10 | none needed, injective at depth 5 (100.00% / 100.00%) | 62.78% / 95.96% |
 | event stream | 9.11 feature tokens per row, no action token, 64 gap bins | 4 tokens per event, action token, 128 gap bins |
 | what it produced | DiGR v1 R@10 2.5940% | DiGR v2 R@10 3.6570% |
 
 The catalogue is 4,783,154 items in both cases. The last row is the only one that mixes
 two changes, and Section 5 treats it as such.
+
+### Every level, measured
+
+The instrument reports one row per depth, and this is the full record for both vintages. It is
+read straight from the json the quantiser wrote, with `SID Diagnostics/diagnose_sid.py`, so it
+involves no preprocessing and no model, and it bounds every arm equally.
+
+| SID | depth | level size | codes used | entropy (bits) | entropy / log2 size | buckets | items per bucket | largest bucket | `R@1` ceiling | `R@10` ceiling | lift | lift/1k |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `2x8192` | 1 | 8,192 | 8,192 | 12.8110 | 0.9855 | 8,192 | 583.88 | 3,838 | 0.17% | 1.71% | 463.3x | 7.589 |
+| `2x8192` | 2 | 8,192 | 8,192 | 12.7668 | 0.9821 | 3,002,708 | 1.59 | 315 | 62.78% | 95.96% | 7,880.6x | 42.486 |
+| `4x256+731` | 1 | 256 | 256 | 7.9243 | 0.9905 | 256 | 18,684.20 | 39,883 | 0.01% | 0.05% | 46.9x | 0.949 |
+| `4x256+731` | 2 | 256 | 256 | 7.8739 | 0.9842 | 57,122 | 83.74 | 5,086 | 1.19% | 9.93% | 1,437.6x | 7.276 |
+| `4x256+731` | 3 | 256 | 256 | 7.9337 | 0.9917 | 1,506,041 | 3.18 | 1,405 | 31.49% | 76.14% | 8,257.6x | 19.946 |
+| `4x256+731` | 4 | 256 | 256 | 7.9804 | 0.9976 | 3,459,854 | 1.38 | 731 | 72.33% | 96.42% | 4,505.0x | 29.389 |
+| `4x256+731` | 5 | 731 | 731 | 1.7644 | **0.1855** | 4,783,154 | 1.00 | 1 | 100.00% | 100.00% | 827.2x | 17.293 |
+
+Bits: `2x8192` spends 26.00 against the 22.19 an identity needs, so 3.81 redundant;
+`4x256+731` spends 41.51, so 19.32 redundant, and it is injective at depth 5. Both spend
+their budget densely at every level except the last of `4x256+731`, where 731 dense values
+hold 1.7644 of 9.5137 bits, the `--add_unique_id` collision-rank signature at 18.5%.
+
+Two notes on reading it. `lift` is bucket recall divided by the bucket's share of the
+catalogue, so it rises mechanically as buckets shrink and is **not** comparable across
+widths; comparing vintages needs `lift/1k`, `recall / (query bucket / 1000)` in percent,
+which is only meaningful at a depth whose bucket is not far from 1,000 items. And a ceiling
+is a hard cap, not a measurement: two items sharing a tuple receive the same score from any
+scorer that reads only the SID, so a group of size `g` cannot be told apart and caps `R@k`
+at `min(1, k/g)` averaged over the split.
+
+The four conclusions drawn from this table are in `README.md` 1.9. If the two ever disagree,
+derive from the json again rather than reconciling the text.
 
 ---
 
@@ -85,9 +117,9 @@ candidates is 0.949 for 4 x 256, 2.204 for 3 x 1,024, and 7.589 for 2 x 8,192, w
 **The quantiser stayed healthy.** 8,192 of 8,192 codes active at both levels, best val
 loss 0.001523, 516 s for the whole pipeline.
 
-**Collisions did not improve, and the prediction of how many was wrong.** Only 62.78% of
-items hold a two-code tuple of their own, so 53.51% of the catalogue sits in a group of
-two or more, largest group 315. The uniform birthday bound for 67.1M cells predicts
+**Collisions did not improve, and the prediction of how many was wrong.** 46.49% of items
+hold a two-code tuple of their own (2,223,538 of them), so 53.51% of the catalogue sits in a
+group of two or more, largest group 315. The uniform birthday bound for 67.1M cells predicts
 7.13%, so the measured rate is 7.5x the prediction. k-means cells cluster where the items
 are instead of spreading evenly.
 

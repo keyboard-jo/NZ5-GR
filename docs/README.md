@@ -26,8 +26,13 @@ per row. And the direction, which survived that result and is now sharper for it
 A third is now measured and sits at the end of the first part: what the two SIDs can and
 cannot express, read straight from the quantiser output (§1.9).
 
-What to do next is in [`tasks.md`](tasks.md): an ablation that separates the new SID from the
-new features, a redone SID diagnosis, and a bigger-backbone run that is deliberately last.
+And the attribution question is answered. [`ablation.md`](ablation.md) has the 2x2 that
+separates the new SID from the new features, and it corrects two things this file used to
+imply: the two effects are not additive, and the 1.41x is a popular-item gain rather than a
+cold-start one.
+
+What to do next is in [`tasks.md`](tasks.md): a bigger-backbone run that is deliberately last,
+and the two open items ahead of it.
 
 ---
 

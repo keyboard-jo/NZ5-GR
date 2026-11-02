@@ -1,9 +1,10 @@
 # Tasks
 
-Five things, in the order that changes what we can claim. The first is the one the
-co-supervisor's review asks for and the only one that is blocking.
+Five things, in the order that changes what we can claim. The first is closed and its result
+is in [`ablation.md`](ablation.md); the second is closed too, in [`sid.md`](sid.md) and
+`README.md` §2.3. What remains is ordered below.
 
-## 1. Ablation: the new SID versus the new features (do this first)
+## 1. Ablation: the new SID versus the new features — **done**
 
 **Why.** S4 moved three axes at once: the codebook went from `4x256+731` to `2x8192`, the
 action token was added, and the gap bins went from 64 to 128. DiGR v2 is 1.41x v1 on R@10
@@ -32,6 +33,28 @@ same negatives, same 0.6B backbone.
 is already near 3.66%, the codebook is the whole story and the features are noise. If it sits
 near 2.59%, the codebook did nothing and the features did the work. A result in between means
 both, and the 2x2 gives the split without needing an interaction term.
+
+**Result, 2026-11-01.** Both mixed cells are measured and none of the three expectations above
+holds. `2x8192` with v1 features lands at 3.2725%, in between, so neither "the codebook is the
+whole story" nor "the features did the work" is right. The in-between conclusion is also
+wrong: the 2x2 does not give a split, because the two axes interact and the feature step
+reverses sign with the codebook.
+
+| cell | SID | features | R@1 | R@10 | R@100 | R@1000 | R@10000 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `v1sid_v1feat` | `4x256+731` | v1 | 0.7924% | 2.5940% | 7.5094% | 21.6003% | 49.7691% |
+| `v1sid_v2feat` | `4x256+731` | v2 | 0.6958% | 2.3275% | 7.3059% | 21.5291% | 50.2177% |
+| `v2sid_v1feat` | `2x8192` | v1 | 0.9705% | 3.2725% | 9.8674% | 25.5239% | 53.1972% |
+| `v2sid_v2feat` | `2x8192` | v2 | 1.0549% | 3.6570% | 10.9182% | 27.6622% | 55.7058% |
+
+Codebook 1.2616x at v1 features and 1.5712x at v2 features. Features 0.8973x at the v1
+codebook and 1.1175x at the v2 codebook. All six paired tests are `p < 1e-12`, so the epoch
+asymmetry is settled, and the arm that trained most is not the winner. The codebook gain is
+concentrated in popular targets: 1.35x on the hottest popularity quintile and 0.79x on
+targets that never appear in train.
+
+Full breakdown, including the interaction, the popularity strata and what not to claim, is in
+[`ablation.md`](ablation.md). Do not quote a single multiplier per axis anywhere.
 
 **Launch both arms with `--dump_ranks`.** These two cells are trained with the v2 SID and v1
 features, which is a combination no arm has been dumped for, and `budget_match.py` only reads
