@@ -1,8 +1,10 @@
 # Tasks
 
-Five things, in the order that changes what we can claim. The first is closed and its result
-is in [`ablation.md`](ablation.md); the second is closed too, in [`sid.md`](sid.md) and
-`README.md` §2.3. What remains is ordered below.
+Five things, in the order that changes what we can claim. Four are closed: the ablation is in
+[`ablation.md`](ablation.md); the SID diagnosis and the tie measurement are in [`sid.md`](sid.md),
+`README.md` §2.3 and `Plan 3/`; the TIGER-on-v1 comparison is in `README.md` §1.10; and the
+region multiplicity gate is §4 below. What remains is one missing dump and the bigger
+backbone.
 
 ## 1. Ablation: the new SID versus the new features — **done**
 
@@ -99,7 +101,7 @@ counting-versus-scoring split, which moved to section 4 and to `Plan 3/`.
 
 **Cost.** Seconds to minutes, CPU. Deferred only because item 1 is what changes the claims.
 
-## 3. TIGER on SID v1, so the method comparison stops crossing two changes at once
+## 3. TIGER on SID v1, so the method comparison stops crossing two changes at once — done
 
 **Why.** DiGR has a v1 cell and a v2 cell. TIGER has only a v2 cell. Every "TIGER beats
 DiGR" sentence therefore crosses the SID change and the feature change as well as the
@@ -110,7 +112,7 @@ evidence.
 
 | SID | features | DiGR | TIGER |
 | --- | --- | --- | --- |
-| `4x256+731` | v1: no action token, 64 gap bins | 2.5940% `R@10` | **to run** |
+| `4x256+731` | v1: no action token, 64 gap bins | 2.5940% `R@10` | beam 27.6 items/row, 10.0677% reach |
 | `2x8192` | v2: action token, 128 gap bins | 3.6570% `R@10` | beam 192.2 items/row |
 
 **What.** Two TIGER runs on the archived v1 data,
@@ -180,8 +182,41 @@ v1 already beats DiGR v1 by a wide margin, the factorisation is doing real work 
 comparison understated it. If TIGER v1 loses to DiGR v1, the v2 win came from the SID change
 and `README.md` section 2.4 needs rewriting.
 
-## 4. Region multiplicity: counting or scoring (gate for any item-side move) — done
+**Result, 2026-11-03.** Only arm **(b)** was run, and it is the informative one. Data is the
+archived v1 dir (`4x256+731`, v1 features, 3 epochs, `tiger_v1_sid4x256_e3_prefix`); one
+`--mode beam` pass over all 98,304 rows at width 20, 89.9323% of rows missing.
 
+| arm | items named | reach |
+| --- | --- | --- |
+| TIGER v1 prefix, beam 20 | **27.6** | **10.0677%** `R@20 tuples` |
+| coclick h20 | 27.6 | 6.9625% (interpolated) |
+| DiGR v1 | 27.6 | 4.7920% (interpolated, archive JSON) |
+| DiGR arm b | 27.6 | 4.5536% (interpolated) |
+
+So the **second branch** fired, and not the one this task anticipated: at equal budget TIGER
+is 2.10x DiGR v1, where the two-level arm in the v2 table was 1.11x behind DiGR. `R@1
+1.7558%` is the best in the project and, because a v1 tuple holds 1.3825 items, its item-level
+value lies in a narrow interval, 1.27% to 1.76%, so unlike the v2 row it can be compared at
+rank 1. `nDCG@10 0.04217`, `MRR@10 0.03223`, effective rank 4.69.
+
+The arm also loses somewhere, and badly: cold-target recall is one row in 15,715, against
+0.1400% for co-click and 0.1973% for DiGR, a 4,276x coldest-to-hottest ratio against 93x and
+46x. Twenty named cells out of 4,783,154 make a target unreachable when its cell is never
+visited, and the cells visited are the fat ones.
+
+**What this run does not establish.** Three things, each of which changes how the sentence
+above may be written. It does not isolate depth, because v1 differs from v2 in depth, width
+and injectivity at once, and its head is 9.3x smaller. It does not say TIGER's *lists* are
+popularity lists, because the strata measure whether cold targets are found, not what the 27.6
+named items are, and the lists are in fact highly personalised (67,007 distinct cells over
+98,304 rows, mean pairwise Jaccard 0.004). And arm **(a)**, prefix-free at five levels, was
+never run, so the five-level SID as read by the plain oracle is still unmeasured.
+
+**Still missing for the matched-budget join:** DiGR v1's `--dump_ranks` pass, about 1.8 min of
+GPU. Its cells above come from the archive JSON with an interpolation in between, so the v1
+table in `README.md` §1.10 is one dump short of being fully measured.
+
+## 4. Region multiplicity: counting or scoring (gate for any item-side move) — done
 **Result, 2026-11-02.** Run on arm a in 1.7 min, and the item column reproduces the
 `--dump_ranks` file on 100.00000% of 98,304 rows, so the left side is the leaderboard measure
 itself. Same tuple scores ranked injectively: `R@1` 0.9705% to 1.1414% (**1.18x**), `R@10`

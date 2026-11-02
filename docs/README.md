@@ -31,8 +31,15 @@ separates the new SID from the new features, and it corrects two things this fil
 imply: the two effects are not additive, and the 1.41x is a popular-item gain rather than a
 cold-start one.
 
-What to do next is in [`tasks.md`](tasks.md): a bigger-backbone run that is deliberately last,
-and the two open items ahead of it.
+The depth question now has an answer too. TIGER at full depth on the v1 SID, at the 27.6
+items its beam names, reaches 10.07% against DiGR's 4.79% on the same data, so it wins its
+own comparison where the two-level arm lost its own (§1.10). Read that with its caveats: the
+two vintages differ in more than depth, and the strata table says the win is heavily
+popularity-weighted.
+
+What to do next is in [`tasks.md`](tasks.md): four of the five items are closed, and what is
+left is one missing rank dump, which would make §1.10 fully measured instead of three parts
+measured and three interpolated, and then the bigger-backbone run that is deliberately last.
 
 ---
 
@@ -335,6 +342,75 @@ the earlier note also quotes do belong to this file, so only the ceiling moved.
 
 ---
 
+## 1.10 TIGER on the v1 SID: the depth arm wins its own comparison
+
+The arm in §1.3 is the one that lost, and it lost at two levels. This is the same model at
+full depth, on the archived v1 data, so it is a matched pair with DiGR v1 rather than with
+DiGR v2.
+
+**The budget is 27.6 items, not 192.** At `4x256+731` a full tuple holds 1.3825 items on
+average (3,459,854 distinct 5-tuples over 4,783,154 items), so twenty tuples name 27.6. The
+v2 beam named 192.2 from the same width, because there a tuple holds 1.593 items and the beam
+concentrates on the fat cells. Same beam, seven times the list.
+
+| arm | SID | items named | reach at 27.6 items |
+| --- | --- | --- | --- |
+| **TIGER prefix, beam 20** | `4x256+731` | **27.6** | **10.0677%** |
+| coclick h20 | none | 27.6 | 6.9625% |
+| DiGR v1 | `4x256+731` | 27.6 | 4.7920% |
+| DiGR arm b | `4x256+731`, v2 features | 27.6 | 4.5536% |
+
+TIGER's cell is measured (`R@20 tuples`, 89.9323% of rows missing). The other three are
+interpolated log-linearly between each arm's measured `R@10` and `R@100` with weight
+`log(27.65/10) / log(100/10) = 0.4472`, because no dump records `R@28`; the shape chosen is
+the one this project's own curves support, and §1.4 exists because that choice matters.
+DiGR v1's row is the archived JSON, not a dump, because that dump has not been made.
+
+So at equal budget TIGER is **2.10x DiGR v1**, 1.45x co-click h20 and 2.21x arm b. In §1.3
+the same architecture at two levels was 1.11x **behind** DiGR at its own 192-item budget. Both
+comparisons are internally budget-matched; what differs between them is the SID.
+
+**`R@1` is comparable here, unlike in §1.3.** A v1 tuple holds 1.3825 items, so the item-level
+`R@1` lies between `1.7558 / 1.3825 = 1.27%` and `1.7558%` depending on how a tie inside a
+bucket is broken. Both ends beat every other arm in this file: DiGR v2 1.0549%, prefix-free
+TIGER v2 1.4400%, co-click 0.8057%, DiGR v1 0.7924%. For the v2 beam the same interval was
+0.21% to 2.04%, which is why that row's short cut-offs are refused and this one's are not.
+The rank-aware columns travel with it: `nDCG@10 0.04217` and `MRR@10 0.03223` on this axis,
+against DiGR v2's item-axis 0.02190 and 0.01742, and effective rank 4.69 for hits against
+co-click's 481 and DiGR's 857.
+
+**Where it loses, it loses badly.** `R@10` by target popularity quintile, tail to head:
+
+| arm | coldest fifth | hottest fifth | ratio |
+| --- | --- | --- | --- |
+| TIGER v1 beam | 0.0064% | 27.3696% | **4,276x** |
+| coclick h20 | 0.1400% | 12.9951% | 93x |
+| DiGR arm b | 0.1973% | 9.1198% | 46x |
+
+On the coldest fifth the beam finds one target in 15,715 rows. Co-click, with the same
+number of slots, finds 22x more, so this is not arithmetic. Naming twenty cells out of
+4,783,154 means a target whose cell the beam never visits is unreachable, and the cells it
+visits are the fat ones. DiGR scores every item, so it cannot have a coverage hole.
+
+Beam against DiGR at `R@10` is b = 5,539, c = 470, chi-squared 4,273.9, so the difference is
+not in doubt (the printed `p = 0` is `erfc` underflow, not a zero probability). Row by row
+the beam contains DiGR: DiGR finds 470 rows the beam misses and the beam finds 5,539 rows
+DiGR misses, for a union of 7.9603%. Against co-click the union is 9.4135% with 1.9294% of
+it co-click-only, so co-click contributes far more than DiGR does.
+
+**Two caveats that belong beside the number.**
+
+1. **This is an association, not an attribution to depth.** v1 differs from v2 in three ways
+   at once: five levels instead of two, narrower levels (256 against 8,192), and injectivity
+   at full depth. The head is also 9.3x smaller, so capacity is not the explanation. Depth is
+   the most plausible single lever, and this is the run that makes that worth testing, but
+   the clean test is a third vintage: three levels at 8,192, or v1 truncated to its first
+   three.
+2. **This measures reach, not what the arm recommends.** The strata say the beam misses cold
+   targets. They do not say the 27.6 items it names are popular items. Those are different
+   claims and only the first is measured. Its lists are in fact highly personalised: 67,007
+   distinct cells across 98,304 rows, and mean pairwise Jaccard 0.004 between two rows.
+
 # 2. The direction
 
 Unchanged by the result above, and now with a sharper first step.
@@ -506,13 +582,24 @@ The measured prize per extra level, from the prefix run: knowing the true `c1` r
 of 7.6731 nats of level-2 entropy, **38.7%**. That is what a third level is worth, and it is
 larger than anything width has bought.
 
+**Measured, 2026-11-03.** The five-level arm settles the direction of this section: at its own
+27.6-item budget it reaches 10.0677% against DiGR v1's 4.7920%, 2.10x, where the two-level arm
+was 1.11x behind DiGR at its own 192-item budget (§1.10). So the factorisation does work once
+the tree is deep enough to localise, and the v2 shortfall was a property of a two-level code,
+not of the architecture. Two limits on that reading: v1 changes depth, width and injectivity
+together, so depth is implicated rather than isolated; and the arm is the most popularity-
+weighted in the file (4,276x coldest to hottest quintile), so the win is concentrated where
+the data is dense. A three-level SID at 8,192 is the run that would separate them, and it is
+the same run §2.5 item 4 asks for.
+
 ## 2.5 The next five runs, in order
 
 1. **Re-run the join** (`sbatch Model Training/budget_match.sh`, seconds, cpu partition).
    The picker bug is fixed: `run_baselines.sh` writes both kinds flat into
    `dumps/baselines/h20/`, the picker wanted a per-kind subdirectory and skipped all three
-   windows. Turns the two `est` cells in section 1.3 into measurements. Nothing else needs
-   re-running; all four dumps are complete and were verified.
+   windows. It has since been re-run and the `est` cells in section 1.3 are measurements.
+   What is still missing for the v1 vintage is DiGR v1's own dump, 1.8 min of GPU, which is
+   the last gap in §1.10.
 2. **The tie-order check: run 2026-11-02** (minutes, CPU). Result in section 2.3(d): 9.3x at
    `R@1` between unique-tuple and shared-tuple targets, and 1.1x for co-click on the same
    rows, which puts the gap on DiGR's representation rather than on the data. It opened
@@ -524,12 +611,16 @@ larger than anything width has bought.
    the list; a finer codebook keeps its place, because that quarter is real and a finer code is
    the only way to collect it; and none of this changes the 0.15 slope for item-side capacity,
    which is why concat-plus-MLP stays off the list.
-3. **Beam 10 and beam 12** (~25 min each, about 96 and 115 items named). This is the real
-   test of depth, because it sits on the frontier: TIGER has to beat DiGR at 96 items
-   (10.6%) or 115, not at 192. Beam 60 would push the wrong way.
-4. **Three levels at 1,024 codes.** The loss is the 29% level-1 gate with 8,192 candidates.
-   Making each decision 8x cheaper to hit inside a 20-wide beam attacks it directly. Needs
-   a quantiser run of about 1 GPU-h.
+3. **Beam 10 and beam 12** (~25 min each, about 96 and 115 items named), on the **v2** arm.
+   This was the frontier test on the v2 budget: TIGER had to beat DiGR at 96 items (10.6%) or
+   115, not at 192. Beam 60 would push the wrong way. §1.10 has since answered the depth
+   question on the v1 arm, where TIGER is 2.10x DiGR at its own budget, so these two runs are
+   now about whether the *two-level* arm can be rescued rather than about whether depth works.
+   Worth doing only if a 2-level SID stays in the plan.
+4. **Three levels at 8,192 codes.** This is now the run that settles the caveat in §1.10,
+   because it changes depth alone and holds width and injectivity fixed. It also attacks the
+   29% level-1 gate, since a third level makes each decision 8x cheaper to hit inside a
+   20-wide beam. Needs a quantiser run of about 1 GPU-h.
 5. **The SASRec bound that was never run** (`archive/tasks.md` 3.5, about 15 min): a tiny
    sequence model over raw item ids bounds what any SID method can hope for on this data.
    Without it there is no way to say whether 14% is the data or the factorisation.

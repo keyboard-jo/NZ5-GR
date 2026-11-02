@@ -109,9 +109,39 @@ tuples, so `fp32` is the default and matches the `item_logits` path that produce
 | `test_region_lib.py` | 16 tests, brute-force cross-checks, no torch |
 | `test_region_rank.py` | 8 tests on the counting and vector arithmetic |
 | `run_region_rank.sh` | sbatch, one GPU |
+| `tie_break.py` | numpy only, CPU: what popularity inside a block buys, and the true ceiling |
+| `test_tie_break.py` | 12 tests on a 9-item catalogue checked by hand |
 
 `bash -n "Plan 3/run_region_rank.sh"` and `python -m pytest "Plan 3" -q` are the two checks
 worth running before a submission.
+
+## The tie break, and why its ceiling is lower than it looks
+
+`region_rank.py` prints an **injective** column: the same scores with each tuple holding one
+item. That is not the ceiling of a tie break. It puts a whole tuple in a single position, so it
+credits the fix for skipping every other item in a tuple ranked above the target, which no
+within-block reordering can do.
+
+`tie_break.py` writes the rank of a row as `rank = base + offset + 1`, where `base` is how many
+items sit in tuples that scored strictly higher and `offset` is the target's place inside its
+own block. `base` is fixed by the scores. A tie break can only drive `offset` to 0, so the real
+ceiling is `base + 1`. On the v2 dump that is `R@1` 1.0549% to 1.2909% and `R@10` 3.6570% to
+4.0070%, against the injective 1.3414% and 4.3742%.
+
+```bash
+python "Plan 3/tie_break.py"   --arm DiGR_v2=local/2026-29-10-1-full-eval/dumps/digr_val.npz   --data_dir local/2026-27-10-1-pre/digr_data
+```
+
+`base` comes from a dump carrying `fav_item_rank` (written by `region_rank.py`). Without it the
+script assumes the tie order is ascending catalogue row, recovers `base` from the measured rank,
+and prints which of the two it did. The guard is `base >= 0` on every row: an arm whose scores
+are not one-value-per-tuple fails it, because reordering such an arm moves every row instead of
+resolving a tie. `Plan 3/tie_break.py` refuses co-click and popularity for exactly this reason.
+
+Measured on the v2 dump, popularity inside the block takes `R@1` from 1.0549% to 1.2065% and
+`R@10` from 3.6570% to 3.9286%, which is about two thirds of the ceiling at `R@1` and three
+quarters at `R@10`. It also costs something: the target is the most clicked item in its block on
+80.31% of rows, so 19.69% of rows trade a lucky break for a worse one.
 
 ## What this does not settle
 

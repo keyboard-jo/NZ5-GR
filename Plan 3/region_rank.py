@@ -551,6 +551,7 @@ def main() -> int:
             rows=np.arange(len(out["item_rank"]), dtype=np.int64),
             targets=out["targets"], item_rank=out["item_rank"],
             region_rank=out["region_rank"], g=out["g"],
+            fav_item_rank=out["fav_item_rank"],
             n_rows=np.int64(out["n_rows"]), sid_sizes=np.asarray(out["sid_sizes"]),
             n_regions=np.int64(out["n_regions"]), split=out["split"],
             checkpoint=out["checkpoint"],
