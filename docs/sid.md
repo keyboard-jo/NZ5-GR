@@ -39,15 +39,15 @@ involves no preprocessing and no model, and it bounds every arm equally.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `2x8192` | 1 | 8,192 | 8,192 | 12.8110 | 0.9855 | 8,192 | 583.88 | 3,838 | 0.17% | 1.71% | 463.3x | 7.589 |
 | `2x8192` | 2 | 8,192 | 8,192 | 12.7668 | 0.9821 | 3,002,708 | 1.59 | 315 | 62.78% | 95.96% | 7,880.6x | 42.486 |
-
-Both ceilings in this table average over the **catalogue**. Averaged over the val targets, which
-is the population a row metric averages over, the `2x8192` depth-2 pair is `53.57%` / `93.20%`,
-with mean group 6.39 rather than 4.71. See section 4.
 | `4x256+731` | 1 | 256 | 256 | 7.9243 | 0.9905 | 256 | 18,684.20 | 39,883 | 0.01% | 0.05% | 46.9x | 0.949 |
 | `4x256+731` | 2 | 256 | 256 | 7.8739 | 0.9842 | 57,122 | 83.74 | 5,086 | 1.19% | 9.93% | 1,437.6x | 7.276 |
 | `4x256+731` | 3 | 256 | 256 | 7.9337 | 0.9917 | 1,506,041 | 3.18 | 1,405 | 31.49% | 76.14% | 8,257.6x | 19.946 |
 | `4x256+731` | 4 | 256 | 256 | 7.9804 | 0.9976 | 3,459,854 | 1.38 | 731 | 72.33% | 96.42% | 4,505.0x | 29.389 |
 | `4x256+731` | 5 | 731 | 731 | 1.7644 | **0.1855** | 4,783,154 | 1.00 | 1 | 100.00% | 100.00% | 827.2x | 17.293 |
+
+Both ceilings in this table average over the **catalogue**. Averaged over the val targets, which
+is the population a row metric averages over, the `2x8192` depth-2 pair is `53.57%` / `93.20%`,
+with mean group 6.39 rather than 4.71. See section 4.
 
 Bits: `2x8192` spends 26.00 against the 22.19 an identity needs, so 3.81 redundant;
 `4x256+731` spends 41.51, so 19.32 redundant, and it is injective at depth 5. Both spend
