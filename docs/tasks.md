@@ -13,14 +13,14 @@ action token was added, and the gap bins went from 64 to 128. DiGR v2 is 1.41x v
 and we cannot say which of the three bought it. That is the gap the supervisor flagged, and
 it is a real gap: the current write-up implies the codebook did it, and that is unproven.
 
-**The 2x2.** Two cells are already measured, two need a run.
+**The 2x2.** All four cells are measured.
 
 | SID | features | data dir | run | R@10 |
 | --- | --- | --- | --- | --- |
 | `4x256+731` | v1: no action token, 64 gap bins | archive v1 | measured | 2.5940% |
 | `2x8192` | v2: action token, 128 gap bins | plan2 v2 | measured | 3.6570% |
-| `2x8192` | v1 | new | **to run** | ? |
-| `4x256+731` | v2 | new | **to run** | ? |
+| `2x8192` | v1 | `digr_data_a` | measured | 3.2725% |
+| `4x256+731` | v2 | `digr_data_b` | measured | 2.3275% |
 
 **How.** `Plan 2/preprocess_digr_v2.py` owns both switches, so each mixed arm is one
 preprocessing pass plus one training run. The SID is an input (`--catalog_path` plus
@@ -63,7 +63,7 @@ features, which is a combination no arm has been dumped for, and `budget_match.p
 ranks that were written at evaluation time. The flag costs one file per arm and a rerun
 otherwise. Same rule for any further arm: dump at the first run or do the eval twice.
 
-## 2. Diagnose the new SID, and measure whether the tie groups actually cost anything
+## 2. Diagnose the new SID, and measure whether the tie groups actually cost anything — **done**
 
 **Why.** Already done once in `archive/sid_results.md` and `archive/sid_diagnostics.md`; redo
 it against v2 and add the collision check the supervisor asked for.
@@ -75,10 +75,27 @@ earlier quantiser run with 2.56M distinct tuples rather than 3.00M). Collisions
 are structural at two levels, not a defect, so the useful question is not whether they exist
 but how much of the achieved R@k the ceiling already explains.
 
-**To do.** Full-tuple and per-level collision sizes; the tie ceiling for every arm at its own
-cut-off; items per level-0 code against the 39-195 the DiGR paper's own catalogues sit at;
-and the unrun cells in `archive/sid_results.md` (`2x16384`, `3x16384`) if they are still
-wanted.
+**Done, 2026-11-01 to 2026-11-02.** Where each item landed:
+
+1. **Full-tuple and per-level collision sizes**: [`sid.md`](sid.md) §1.9, *Every level,
+   measured*, has all five v1 levels and both v2 levels with buckets, items per bucket, entropy
+   and share of the level's own `log2 size`. v1's level 4 is 18.5% and is a collision rank.
+2. **The tie ceiling at every cut-off**: same section, plus `README.md` §2.3(d). 62.78% at `R@1`
+   and 95.96% at `R@10` for v2. It is a codebook property, not an arm property, so there is no
+   per-arm version of it to compute.
+3. **Items per level-0 code**: 583.88 for v2, 18,684.20 for v1, against the paper's 39-195. This
+   is the single figure that says how far the codebook is from the published setting.
+4. **The unrun cells, `2x16384` and `3x16384`: deliberately not run.** They existed to answer
+   the counting-versus-scoring question by widening, and section 4 answered it directly by
+   ranking the same tuple scores injectively (1.34x at `R@10`). A wider codebook would only
+   re-measure a question that already has a number.
+
+What the diagnosis cannot say is in [`sid.md`](sid.md) as well: lift, occupancy and bits
+quantify what a codebook can express and never what an item means. Sections 4 and 5 are where
+that changes into a behavioural claim.
+
+**Cost actually spent.** Minutes of CPU for the diagnosis, 1.7 minutes of GPU for the
+tie measurement.
 
 **The tie measurement: answered by reading the code, so nothing to run.**
 
@@ -99,7 +116,8 @@ catalogue index is arbitrary, so a third code carrying that index is unlearnable
 favourable-tie reading that made it look worth 2x does not hold. What remains is the
 counting-versus-scoring split, which moved to section 4 and to `Plan 3/`.
 
-**Cost.** Seconds to minutes, CPU. Deferred only because item 1 is what changes the claims.
+**Cost.** Seconds to minutes of CPU, and it was spent: the diagnosis on 2026-11-01, the tie
+measurement on 2026-11-02. This section is closed.
 
 ## 3. TIGER on SID v1, so the method comparison stops crossing two changes at once — done
 

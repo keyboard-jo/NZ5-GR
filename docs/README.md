@@ -19,6 +19,11 @@ same instrument, and it records what that instrument can and cannot establish: b
 items per code, the collision rate, the tie ceiling, and the fact that none of it is a
 claim about behaviour.
 
+[`terminology.md`](terminology.md) fixes the vocabulary. Several words in this project have
+more than one candidate and picking the wrong one changes the claim, most of all tuple, which
+the files otherwise call a cell, a bucket or a region, and recall, which does not mean the same
+thing on the item axis as on the tuple axis but is called recall on both.
+
 Two things are recorded below. The measured result of the matched-budget pass, which is
 the first comparison in this project where every arm was allowed the same number of items
 per row. And the direction, which survived that result and is now sharper for it.
