@@ -130,7 +130,7 @@ evidence.
 
 | SID | features | DiGR | TIGER |
 | --- | --- | --- | --- |
-| `4x256+731` | v1: no action token, 64 gap bins | 2.5940% `R@10` | beam 27.6 items/row, 10.0677% reach |
+| `4x256+731` | v1: no action token, 64 gap bins | 2.5940% `R@10` | beam 20 items/row, 10.0677% reach |
 | `2x8192` | v2: action token, 128 gap bins | 3.6570% `R@10` | beam 192.2 items/row |
 
 **What.** Two TIGER runs on the archived v1 data,
@@ -146,12 +146,13 @@ never been run at more than two levels.
 **Why (b) is the informative one.** Beam width is 20 in both vintages but the budget it buys
 is set entirely by the SID. At `2x8192` the beam named 192.2 items per row on average, because
 a two-code tuple holds 1.593 items and the beam concentrates on the fat cells. At
-`4x256+731` the 731-wide suffix level makes a full tuple near-unique: 3,459,854 distinct 5-tuples
-over 4,783,154 items, a mean of 1.3825 items per tuple, so 20 tuples name about 27.6 items.
-(The other two figures are easy to confuse. 27.67% of items are *excess*, beyond one per
-distinct tuple. 39.28% of items sit in a tuple that holds more than one, which is what
-1,878,898 means in the v1 log. Neither is the list length.) Same width, roughly
-ten times the list. This run is the second point on the budget curve, and it is what says
+`4x256+731` the 731-wide suffix level is a collision rank, so a full tuple is unique:
+4,783,154 distinct 5-tuples over 4,783,154 items, a mean of exactly 1.000 items per tuple, and
+20 tuples name exactly 20 items. (Four figures are easy to confuse here. 1.3825 is items per
+*four*-level prefix, of which there are 3,459,854. 27.67% of items are *excess*, beyond one per
+distinct four-prefix. 39.28% of items sit in a four-prefix that holds more than one, which is
+what 1,878,898 means in the v1 log. None of them is the list length.) Same width, 9.6 times
+the list. This run is the second point on the budget curve, and it is what says
 whether TIGER's advantage is a property of the factorisation or an artefact of being allowed
 to name 192 items.
 
@@ -206,15 +207,15 @@ archived v1 dir (`4x256+731`, v1 features, 3 epochs, `tiger_v1_sid4x256_e3_prefi
 
 | arm | items named | reach |
 | --- | --- | --- |
-| TIGER v1 prefix, beam 20 | **27.6** | **10.0677%** `R@20 tuples` |
-| coclick h20 | 27.6 | 6.9625% (interpolated) |
-| DiGR v1 | 27.6 | 4.7920% (interpolated, archive JSON) |
-| DiGR arm b | 27.6 | 4.5536% (interpolated) |
+| TIGER v1 prefix, beam 20 | **20** | **10.0677%** `R@20`, and `R@20` is its whole list |
+| coclick h20 | 20 | 5.2684% (measured) |
+| DiGR v1 | 20 | 3.5553% (measured) |
+| popularity | 20 | 1.9796% (measured) |
 
 So the **second branch** fired, and not the one this task anticipated: at equal budget TIGER
-is 2.10x DiGR v1, where the two-level arm in the v2 table was 1.11x behind DiGR. `R@1
-1.7558%` is the best in the project and, because a v1 tuple holds 1.3825 items, its item-level
-value lies in a narrow interval, 1.27% to 1.76%, so unlike the v2 row it can be compared at
+is 2.83x DiGR v1, where the two-level arm in the v2 table was 1.11x behind DiGR. `R@1
+1.7558%` is the best in the project, and because a v1 tuple holds exactly one item it is a
+plain item-level rank-1 number with no interval, so unlike the v2 row it can be compared at
 rank 1. `nDCG@10 0.04217`, `MRR@10 0.03223`, effective rank 4.69.
 
 The arm also loses somewhere, and badly: cold-target recall is one row in 15,715, against

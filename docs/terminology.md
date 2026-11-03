@@ -55,8 +55,9 @@ position in the sequence, level 0 first.
 _Avoid_: layer (reserved for the model), stage (reserved for the two-stage pipeline)
 
 **SID v1**:
-The 5-level codebook `4 x 256 + 731`. At full depth a tuple holds 1.3825 items on average, so
-it very nearly identifies an item.
+The 5-level codebook `4 x 256 + 731`. Level 4 is a collision rank, so a full tuple is unique
+and identifies exactly one item. Its four-level prefixes are what it shares: 3,459,854 of
+them, a mean of 1.3825 items per four-prefix.
 _Avoid_: the old SID, the fine SID
 
 **SID v2**:
@@ -71,7 +72,9 @@ _Avoid_: cell, bucket, region, cluster (these four words all mean tuple here, an
 interchangeably hides which level of the tree is being discussed)
 
 **Tuple multiplicity**:
-How many items share a tuple. The catalogue average is 1.593 for v2 and 1.3825 for v1.
+How many items share a tuple. The catalogue average is 1.593 for v2 and **1.000 for v1**,
+because v1's last level is a collision rank. The comparable v1 figure is items per *four*-level
+prefix, 1.3825.
 _Avoid_: group size (a tie group is a multiplicity class, not a tuple)
 
 **Collision / tie group**:
