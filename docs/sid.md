@@ -29,6 +29,25 @@ Everything here is measured on the same 98,304 val rows.
 The catalogue is 4,783,154 items in both cases. The last row is the only one that mixes
 two changes, and Section 5 treats it as such.
 
+### Why a collision happens at all
+
+The quantiser assigns codes by clustering. Level 0 partitions all 4,783,154 items into 8,192
+cells, and the next level partitions each of those cells again. An item's tuple is the list of
+cells it falls into, so two items collide when every level puts them in the same cell.
+
+Nothing is broken when that happens. Two levels give `8,192^2 = 67,108,864` possible tuples and
+the catalogue only occupies 3,002,708 of them, but the assignment is not spread evenly. Cells go
+where the items are, and the objective is to place each cell's own vector close to its members,
+not to keep members apart. Dense regions of the embedding get fat cells and sparse regions get
+thin ones. If those 3,002,708 cells had equal sizes, 7.13% of items would share one; the measured
+figure is 53.51%, 7.5 times higher, and the gap is that bias.
+
+The count is also forced before any question of how the cells were chosen. Fitting 4,783,154
+items into 3,002,708 occupied cells requires at least 1,780,446 of them to share a cell with
+something else. Only more cells removes that, which is why the fix is a third level rather than
+a better tie-break. What a tie-break does is recover the positions the collision costs inside
+the codebook that exists.
+
 ### Every level, measured
 
 The instrument reports one row per depth, and this is the full record for both vintages. It is
