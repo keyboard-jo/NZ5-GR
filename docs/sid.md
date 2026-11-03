@@ -22,7 +22,7 @@ Everything here is measured on the same 98,304 val rows.
 | peak lift | 8,257.6x at depth 3 | 7,880.6x at depth 2 |
 | depth-1 candidate bucket | 19,308 | 745 |
 | collision share | 1.38 items per full 5-code tuple; 39.28% of items share one (27.67% excess), largest 731 | 1.59 items per 2-code tuple; 53.51% share one (37.22% excess), largest 315 |
-| tie ceiling, R@1 / R@10 | none needed, injective at depth 5 (100.00% / 100.00%) | 62.78% / 95.96% |
+| tie ceiling, R@1 / R@10 | none needed, injective at depth 5 (100.00% / 100.00%) | 53.57% / 93.20% over val targets |
 | event stream | 9.11 feature tokens per row, no action token, 64 gap bins | 4 tokens per event, action token, 128 gap bins |
 | what it produced | DiGR v1 R@10 2.5940% | DiGR v2 R@10 3.6570% |
 
@@ -39,6 +39,10 @@ involves no preprocessing and no model, and it bounds every arm equally.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `2x8192` | 1 | 8,192 | 8,192 | 12.8110 | 0.9855 | 8,192 | 583.88 | 3,838 | 0.17% | 1.71% | 463.3x | 7.589 |
 | `2x8192` | 2 | 8,192 | 8,192 | 12.7668 | 0.9821 | 3,002,708 | 1.59 | 315 | 62.78% | 95.96% | 7,880.6x | 42.486 |
+
+Both ceilings in this table average over the **catalogue**. Averaged over the val targets, which
+is the population a row metric averages over, the `2x8192` depth-2 pair is `53.57%` / `93.20%`,
+with mean group 6.39 rather than 4.71. See section 4.
 | `4x256+731` | 1 | 256 | 256 | 7.9243 | 0.9905 | 256 | 18,684.20 | 39,883 | 0.01% | 0.05% | 46.9x | 0.949 |
 | `4x256+731` | 2 | 256 | 256 | 7.8739 | 0.9842 | 57,122 | 83.74 | 5,086 | 1.19% | 9.93% | 1,437.6x | 7.276 |
 | `4x256+731` | 3 | 256 | 256 | 7.9337 | 0.9917 | 1,506,041 | 3.18 | 1,405 | 31.49% | 76.14% | 8,257.6x | 19.946 |
@@ -126,9 +130,17 @@ are instead of spreading evenly.
 **The reading that collisions cost nothing is wrong, and it was mine.** Two items with the
 same codes get the same score from any scorer that reads the SID, so a tie group of size `g`
 caps recall at `1/g` at rank 1 and `min(1, k/g)` at rank `k`. Measured for 2 x 8,192 the mean
-tie group over val targets is 4.71 (median 2, p90 8, largest 315), so the ceilings are 62.78%
-and 95.96%. DiGR sits at 1.05% and 3.66%, and the old conclusion from that gap was that ties
+tie group over val targets is 6.39 (median 2, p90 14, largest 239), so the ceilings are 53.57%
+and 93.20%. DiGR sits at 1.05% and 3.66%, and the old conclusion from that gap was that ties
 cost nothing yet.
+
+The averaging base matters more than it looks. The table above averages over the **catalogue**,
+every item counting once, which gives mean group 4.71, p90 8, largest 315 and ceilings 62.78% /
+95.96%. Measured instead over the 98,304 **val targets**, the same codebook gives 6.39 / 2 / 14 /
+239 and 53.57% / 93.20%, because a row is more likely to land on a packed tuple than a random
+item is. The row base is the one that bounds a metric averaged over rows, so the row figures are
+the ones to quote, and the archived `53.57% / 93.20%` was never a different quantiser run: it
+was this file on the other base.
 
 Two things are wrong with it. A high ceiling is not health: a hash of the item id is
 injective and its ceiling is 100%, and `4x256+731` is already that case here, because depth 5

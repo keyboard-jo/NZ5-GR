@@ -271,8 +271,13 @@ DiGR is charged for and TIGER is not:
 | --- | --- |
 | items sharing a 2-code tuple with at least one other item | 2,559,616 (53.51%) |
 | largest tie group | 315 items |
-| implied $\mathrm{R@1}$ ceiling if ranks were assigned per tuple | 62.78% |
-| implied $\mathrm{R@10}$ ceiling | 95.96% |
+| implied $\mathrm{R@1}$ ceiling if ranks were assigned per tuple | 53.57% |
+| implied $\mathrm{R@10}$ ceiling | 93.20% |
+
+These are averaged over the 98,304 val targets, which is the population a row metric averages
+over. Averaged over the catalogue instead, every item counting once, the same codebook gives
+62.78% and 95.96%, and the mean group is 4.71 rather than 6.39. The row base is the one that
+bounds $\mathrm{R@k}$, so the row figures are the ones quoted.
 
 At the observed 3.66% these ceilings are not binding. That is not evidence that collisions are
 harmless: an injective code, such as a hash of the item id, has a ceiling of 100% and no

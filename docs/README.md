@@ -303,8 +303,7 @@ cannot express, so it bounds every arm equally.
 | SID | depth | buckets | items/bkt | largest group | `R@1` ceiling | `R@10` ceiling | lift | lift/1k |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 2x8192 | 1 | 8,192 | 583.88 | 3,838 | 0.17% | 1.71% | 463.3x | 7.589 |
-| 2x8192 | 2 | 3,002,708 | 1.59 | 315 | 62.78% | 95.96% | 7,880.6x | 42.486 |
-| 4x256+731 | 1 | 256 | 18,684.20 | 39,883 | 0.01% | 0.05% | 46.9x | 0.949 |
+| 2x8192 | 2 | 3,002,708 | 1.59 | 315 | 62.78% | 95.96% | 7,880.6x | 42.486 || 4x256+731 | 1 | 256 | 18,684.20 | 39,883 | 0.01% | 0.05% | 46.9x | 0.949 |
 | 4x256+731 | 2 | 57,122 | 83.74 | 5,086 | 1.19% | 9.93% | 1,437.6x | 7.276 |
 | 4x256+731 | 3 | 1,506,041 | 3.18 | 1,405 | 31.49% | 76.14% | 8,257.6x | 19.946 |
 | 4x256+731 | 4 | 3,459,854 | 1.38 | 731 | 72.33% | 96.42% | 4,505.0x | 29.389 |
@@ -337,18 +336,20 @@ level; both its levels are 98%+ dense codes.
 injective, so on this catalogue it is a partition whose last level is doing real work. That
 is the case for width here: not more bits, but a second level that has not run out.
 
-**The tie ceiling does not bind, and that is not the same as collisions being free.** 62.78%
-and 95.96% against measured 1.05% and 3.66%. Read on its own that says the codes are fine,
+**The tie ceiling does not bind, and that is not the same as collisions being free.** The
+ceilings are 53.57% at `R@1` and 93.20% at `R@10` when averaged over the val targets, which is
+the population `R@k` averages over, against measured 1.05% and 3.66%. Read on its own that says
+the codes are fine,
 which does not follow: a hash is injective with a 100% ceiling and carries no behaviour, and
 `4x256+731` at depth 5 is exactly that case, injective at 827.2x lift. The rows that settle it
 are the 36.64% whose target sits alone in its tuple, where no tie can be charged and `R@1` is
 still 2.43% against a ceiling of 100%. Collisions are not the binding constraint at 3.66%
 `R@10`; the ranking is. The size of the remainder is measured in [`sid.md`](sid.md) 4: holding
 the scores fixed and ranking the same tuples injectively gains 1.34x at `R@10`. `sid.md` 4
-states the joint test with lift. The archived figures of
-53.57% and 93.20% came from an earlier quantiser run with 2.56M distinct tuples rather than
-the 3.00M in this artefact; the collision share (53.51%) and the 315-item largest group that
-the earlier note also quotes do belong to this file, so only the ceiling moved.
+states the joint test with lift. The table above reports 62.78% and 95.96% for the same codebook
+because it averages over the **catalogue** instead, where every item counts once; that is a
+different and less useful base here, since a metric over rows cares about the groups the rows
+land in. Both are correct, and the row base is the one that bounds `R@k`.
 
 ---
 

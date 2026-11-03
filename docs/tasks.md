@@ -70,9 +70,10 @@ otherwise. Same rule for any further arm: dump at the first run or do the eval t
 it against v2 and add the collision check the supervisor asked for.
 
 **Known already, so do not re-measure from scratch.** 53.51% of items share a 2-code tuple,
-the largest group is 315 items, and the tie ceiling is R@1 62.78% / R@10 95.96% (re-derived
-from `SID Diagnostics/index_rqvae_2x8192.json`; the archived 53.57% / 93.20% came from an
-earlier quantiser run with 2.56M distinct tuples rather than 3.00M). Collisions
+the largest group is 315 items, and the tie ceiling is `R@1` 53.57% / `R@10` 93.20% when
+averaged over val targets (62.78% / 95.96% when averaged over the catalogue, which is the base
+the instrument prints). Both were derived from `SID Diagnostics/index_rqvae_2x8192.json`; the
+archived `53.57% / 93.20%` was never a different quantiser run, just the row base. Collisions
 are structural at two levels, not a defect, so the useful question is not whether they exist
 but how much of the achieved R@k the ceiling already explains.
 
@@ -81,8 +82,9 @@ but how much of the achieved R@k the ceiling already explains.
 1. **Full-tuple and per-level collision sizes**: [`sid.md`](sid.md) §1.9, *Every level,
    measured*, has all five v1 levels and both v2 levels with buckets, items per bucket, entropy
    and share of the level's own `log2 size`. v1's level 4 is 18.5% and is a collision rank.
-2. **The tie ceiling at every cut-off**: same section, plus `README.md` §2.3(d). 62.78% at `R@1`
-   and 95.96% at `R@10` for v2. It is a codebook property, not an arm property, so there is no
+2. **The tie ceiling at every cut-off**: same section, plus `README.md` §2.3(d). 53.57% at `R@1`
+   and 93.20% at `R@10` for v2 over the val targets, and 62.78% / 95.96% over the catalogue. It is
+   a codebook property, not an arm property, so there is no
    per-arm version of it to compute.
 3. **Items per level-0 code**: 583.88 for v2, 18,684.20 for v1, against the paper's 39-195. This
    is the single figure that says how far the codebook is from the published setting.
