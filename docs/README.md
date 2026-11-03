@@ -171,7 +171,7 @@ the reasons under the table.
 | arm | R@1 | R@5 | R@10 | MRR@10 | source |
 | --- | --- | --- | --- | --- | --- |
 | **TIGER prefix, beam 20** † | **2.0406%** | **6.0964%** | **8.8969%** | **0.03803** | dumps |
-| **TIGER prefix v1, beam 20** † | **1.7558%** | **5.0741%** | **7.4849%** | **0.03223** | dumps |
+| **TIGER prefix v1, beam 20** | **1.7558%** | **5.0741%** | **7.4849%** | **0.03223** | dumps |
 | DiGR v2 | 1.0549% | 2.6245% | 3.6570% | 0.01742 | dumps |
 | coclick h20 | 0.8057% | 2.4882% | 3.7069% | 0.01539 | dumps |
 | coclick h10 | 0.7985% | 2.4780% | 3.6794% | 0.01529 | dumps |
@@ -186,17 +186,19 @@ the reasons under the table.
 Two things are wrong with a short cut-off across these rows, and the table is here to be read
 with both in mind.
 
-**TIGER's columns are on the wrong axis** (†, same marker as above). Its `R@10` is the share
-of rows where the target sat in the first ten **tuples**, and ten tuples hold about 96 items on
-the v2 SID and about 10 on the v1 one, where a five-code tuple is unique and therefore holds
-exactly one item. So the v2 row's
-apparent 2.4x over DiGR at `R@10` is a 96-item list against a 10-item list, which is exactly
-the artefact the main table refuses to print. Measured honestly the v2 beam has no `R@10` at
-all, only an `R@~96`. The v1 row is much closer to an item axis, and §1.10 gives its interval.
+**TIGER's columns are on the wrong axis on the v2 SID** (†, same marker as above). Its `R@10`
+is the share of rows where the target sat in the first ten **tuples**, and ten v2 tuples hold
+about 96 items, so the v2 row's apparent 2.4x over DiGR at `R@10` is a 96-item list against a
+10-item list, which is exactly the artefact the main table refuses to print. Measured honestly
+the v2 beam has no `R@10` at all, only an `R@~96`.
 
-**A beam cannot return fewer than 192 items on v2, or about 28 on v1.** Its short cut-offs are not the same decision
-problem as a top-10 over 4.78M, because the list it draws its top 10 from was already 192
-long. Reading the column as each arm's own top-10 is the only correct reading. It is not a
+The v1 beam row carries no marker, because there a five-code tuple is unique and holds exactly
+one item, so its columns are ordinary item-level cut-offs and its `R@10` really is a top ten out
+of 4.78M. Its list is only 20 items long, though, which is the second caveat below.
+
+**A beam cannot return fewer than 192 items on v2, or 20 on v1.** Its short cut-offs are not
+the same decision problem as a top-10 over 4.78M, because the list it draws its top 10 from was
+already 192 long, or 20. Reading the column as each arm's own top-10 is the only correct reading. It is not a
 ranking of the arms, and the archive rows make the point by themselves: prefix-free TIGER has
 the best `R@1` of any full-catalogue arm (1.4400% against DiGR's 1.0549%) and the worst
 `R@10` of the three main candidates (2.4500%).
