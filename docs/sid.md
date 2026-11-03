@@ -243,6 +243,22 @@ the 2.3x to 3x the direction needs. It is a remainder to collect, not the big mo
 belongs to a third code from a finer quantiser rather than to a collision index, since an
 index in catalogue order is unlearnable and v1 carries that level already.
 
+**What it costs in training.** The measurement above is about positions in a list. There is a
+second cost, in the loss, and it does not appear as a ratio on any metric.
+
+If `g` items share a tuple they share a score, so the model cannot put probability on one of
+them. The best it can do is give the group some mass and let the target take `1/g` of it, which
+means its loss cannot fall below `log g` however good the ranking is. Averaged over the 98,304
+val targets that floor is **1.0450 nats**, so **9.9683 is the best these codes allow** against
+a measured 11.0133, and 23.9% of the 4.3677-nat margin is unreachable by construction.
+
+Two things follow. Losses are not comparable across SIDs: v2 at 11.0133 against v1 at 11.2431
+reads as 0.23 nats of improvement, and on equal footing it is 1.2748, because v1 pays no tax.
+And the gradient can only move whole tuples. Raising the target's score raises its tie-mates
+with it, so the model learns to rank blocks and cannot learn to rank inside one. On 17.8% of
+training rows a tie-mate appears among the 300,000 sampled negatives, and there the positive and
+that negative push the same code rows in opposite directions.
+
 The injective column is an upper bound on what any tie mechanism inside the existing codebook
 could recover, not an estimate of it. Injective ranking counts one position per tuple above
 the target, while a perfect intra-block tie break would still count every member of every
