@@ -345,7 +345,7 @@ which does not follow: a hash is injective with a 100% ceiling and carries no be
 are the 36.64% whose target sits alone in its tuple, where no tie can be charged and `R@1` is
 still 2.43% against a ceiling of 100%. Collisions are not the binding constraint at 3.66%
 `R@10`; the ranking is. The size of the remainder is measured in [`sid.md`](sid.md) 4: holding
-the scores fixed and ranking the same tuples injectively gains 1.34x at `R@10`. `sid.md` 4
+the scores fixed and ranking the same tuples injectively gains 1.37x at `R@10`. `sid.md` 4
 states the joint test with lift. The table above reports 62.78% and 95.96% for the same codebook
 because it averages over the **catalogue** instead, where every item counts once; that is a
 different and less useful base here, since a metric over rows cares about the groups the rows
@@ -540,9 +540,10 @@ retrained, and the cost is one extra dot product on the tied items only. It is t
 possible use of the clause section 2.6 leaves open.
 
 Ceiling, measured rather than derived: [`Plan 3/region_rank.py`](../Plan%203/region_rank.py)
-ranks the same scores over distinct tuples, and on arm a that is `R@1` 0.9705% to 1.1414%, a
-**1.18x** cap. A tie break that always put the target first inside its block would still be
-working inside that ceiling, so the 2.06% above is too high and is withdrawn. The one clean
+ranks the same scores over distinct tuples, and on DiGR v2 that is `R@1` 1.0549% to 1.2889%, a
+**1.22x** upper bound. A content tie break that always put the target first inside its block
+would still be working inside that bound, and strictly below it, so the 2.06% above is too high
+and is withdrawn. The one clean
 stratum comparison replaces it: on unique-tuple rows only, v2 reaches 2.427% `R@1` against arm
 a's 2.254%, which is the same 1.08x the arms show overall, so collisions have been spreading
 the gap out rather than hiding it. Nothing at `R@10` or beyond either way: this is a precision
@@ -575,7 +576,7 @@ belongs to DiGR's item representation, not to the items or the queries.
 
 That 9.3x is a description of the population, not a forecast of the fix: unique-tuple rows are
 also the easier rows, so it mixes "no tie" with "easier". The controlled figure, holding the
-scores fixed and ranking the same tuples injectively, is **1.18x at `R@1` and 1.34x at
+scores fixed and ranking the same tuples injectively, is **1.22x at `R@1` and 1.37x at
 `R@10`** (section 2.3(d) below and [`sid.md`](sid.md) 4).
 
 Against the `1/11.07` prediction, shared targets imply `0.262% x 11.26 = 2.95%` tuple-level
@@ -584,7 +585,7 @@ prediction, which is what an arbitrary break gives rather than what a favourable
 the evaluator places a tied target at its `topk` position, i.e. by catalogue index, so the
 model gets neither the best nor the average position inside a group as a matter of rule. So
 the measured `2.427%` is the figure to quote and the derived `2.06%` above is too high, with the
-`1.18x` injective cap as the limit on what any tie break can recover from it.
+`1.22x` injective bound as the limit on what any tie break can recover from it.
 
 **What this still does not say, and why it matters.** The loss is either *counting* -- the
 rank is the target's position in the sorted list, so every item inside every tuple ranked
@@ -594,9 +595,9 @@ opposite: a finer SID versus a better item vector. `Plan 3/region_rank.py` separ
 one GPU pass, because the region rank is exactly the item rank an *injective* codebook would
 produce from the same scores, measured under the same tie convention.
 
-The answer is **mixed, and mostly scoring.** On arm a, with the scores held fixed, ranking the
-same tuples injectively takes `R@10` from 3.2725% to 4.3742% and `R@1` from 0.9705% to 1.1414%,
-so **a quarter of what these scores can already reach at `R@10` and 15% at `R@1` is lost to
+The answer is **mixed, and mostly scoring.** On DiGR v2, with the scores held fixed, ranking the
+same tuples injectively takes `R@10` from 3.6570% to 5.0283% and `R@1` from 1.0549% to 1.2889,
+so **27% of what these scores can already reach at `R@10` and 18% at `R@1` is lost to
 counting** and the rest is the model's own ranking. Counting is therefore real and worth
 collecting through a finer codebook, and it is not the lever that turns 3.66% into 8-11%. The
 row-by-row version is in [`sid.md`](sid.md) section 4, and the run command in
@@ -643,10 +644,10 @@ the same run §2.5 item 4 asks for.
    `R@1` between unique-tuple and shared-tuple targets, and 1.1x for co-click on the same
    rows, which puts the gap on DiGR's representation rather than on the data. It opened
    `Plan 3/region_rank.py`, which has now also run (1.7 min, 100.00000% of the dumped ranks
-   reproduced): the same tuple scores ranked injectively reach **1.34x at `R@10`, 1.32x at
-   `R@100`, 1.24x at `R@1000`, 1.18x at `R@1`**. So a quarter of what these scores can already
-   reach at `R@10` is lost to counting and three quarters is the model's own ranking. Three
-   consequences: move (d), a content-side tie break, is capped at 1.18x at `R@1` and drops down
+   reproduced, on DiGR v2): the same tuple scores ranked injectively reach **1.37x at `R@10`,
+   1.32x at `R@100`, 1.23x at `R@1000`, 1.22x at `R@1`**. So 27% of what these scores can already
+   reach at `R@10` is lost to counting and 73% is the model's own ranking. Three
+   consequences: move (d), a content-side tie break, is bounded by 1.22x at `R@1` and drops down
    the list; a finer codebook keeps its place, because that quarter is real and a finer code is
    the only way to collect it; and none of this changes the 0.15 slope for item-side capacity,
    which is why concat-plus-MLP stays off the list.

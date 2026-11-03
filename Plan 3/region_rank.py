@@ -209,8 +209,11 @@ def count_above(S: torch.Tensor, tgt_score: torch.Tensor, counts: torch.Tensor,
     above. `rank = 1 + above_regions` is the same quantity for an injective
     codebook, which is the counterfactual this whole script exists to measure.
 
-    Strict `>` on both: the favourable tie convention every number in this
-    project is reported under, where a tie is never charged to the target.
+    Strict `>` on both, which is the permissive tie convention: a tie is never
+    charged to the target. `run()` no longer ranks the published columns this
+    way, because `train_digr.evaluate()` ranks by `topk` position and so does
+    charge it. These counts survive for the `fav_item_rank` diagnostic, which is
+    the rank a perfect intra-block tie break would reach from these same scores.
 
     Chunked over tuples so the largest live tensor is `row_batch * chunk` bools.
     """

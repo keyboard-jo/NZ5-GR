@@ -181,38 +181,41 @@ rather than re-derived.
 measurement rather than an implication. `Plan 3/region_rank.py` scores one checkpoint twice,
 once over the 4.78M items and once over the 3.00M distinct tuples, both through the model's
 own `item_logits`, so the two columns differ only in how many positions a fat tuple occupies.
-On arm a (the `2x8192` codes with v1 features) the item column reproduces the `--dump_ranks`
-file on 100.00000% of the 98,304 rows, so the left side of the table is the leaderboard measure
-itself and not an approximation of it.
+On **DiGR v2** (`digr_v2_sid2x8192_e3_sampled300k/best`, the arm whose 3.6570% is the
+leaderboard number) the item column reproduces the `--dump_ranks` file on 100.00000% of the
+98,304 rows, so the left side of the table is the leaderboard measure itself and not an
+approximation of it.
 
 | target's tuple size | rows | share | `g` | item `R@1` | item `R@10` | item `R@100` | injective `R@1` | injective `R@10` | injective `R@100` | inflation |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | 36,017 | 36.64% | 1.00 | 2.254% | 5.228% | 11.467% | 2.254% | 6.094% | 14.013% | 652.9 |
-| 2 | 17,275 | 17.57% | 2.00 | 0.463% | 3.294% | 9.777% | 0.822% | 4.185% | 12.544% | 687.6 |
-| 3-4 | 16,451 | 16.73% | 3.38 | 0.334% | 2.705% | 8.966% | 0.681% | 3.665% | 12.005% | 716.1 |
-| 5-8 | 12,441 | 12.66% | 6.17 | 0.024% | 1.825% | 9.332% | 0.193% | 3.271% | 13.005% | 769.4 |
-| 9-16 | 7,639 | 7.77% | 11.68 | 0.052% | 0.995% | 8.417% | 0.314% | 2.710% | 12.593% | 786.6 |
-| 17 and over | 8,481 | 8.63% | 39.66 | 0.000% | 0.200% | 7.098% | 0.094% | 1.946% | 12.109% | 857.0 |
-| all rows | 98,304 | 100% | 6.39 | 0.9705% | 3.2725% | 9.8674% | 1.1414% | 4.3742% | 13.0168% | |
+| 1 | 36,017 | 36.64% | 1.00 | 2.427% | 5.703% | 12.533% | 2.427% | 6.713% | 15.573% | 644.2 |
+| 2 | 17,275 | 17.57% | 2.00 | 0.590% | 3.757% | 10.790% | 1.065% | 4.758% | 13.893% | 689.0 |
+| 3-4 | 16,451 | 16.73% | 3.38 | 0.310% | 3.210% | 10.176% | 0.754% | 4.437% | 13.519% | 705.0 |
+| 5-8 | 12,441 | 12.66% | 6.17 | 0.040% | 1.953% | 10.345% | 0.338% | 3.657% | 14.267% | 767.2 |
+| 9-16 | 7,639 | 7.77% | 11.68 | 0.039% | 1.217% | 9.085% | 0.380% | 3.207% | 13.261% | 790.4 |
+| 17 and over | 8,481 | 8.63% | 39.66 | 0.024% | 0.330% | 8.254% | 0.165% | 3.219% | 13.595% | 848.6 |
+| all rows | 98,304 | 100% | 6.39 | 1.0549% | 3.6570% | 10.9182% | 1.2889% | 5.0283% | 14.4185% | |
 
 | metric | measured | same scores, injective | gain |
 | --- | --- | --- | --- |
-| `R@1` | 0.9705% | 1.1414% | 1.18x |
-| `R@10` | 3.2725% | 4.3742% | 1.34x |
-| `R@100` | 9.8674% | 13.0168% | 1.32x |
-| `R@1000` | 25.5239% | 31.5450% | 1.24x |
+| `R@1` | 1.0549% | 1.2889% | 1.22x |
+| `R@10` | 3.6570% | 5.0283% | 1.37x |
+| `R@100` | 10.9182% | 14.4185% | 1.32x |
+| `R@1000` | 27.6622% | 33.9783% | 1.23x |
 
 `inflation` is the mean of `item rank − region rank` within the band, with both capped at
 `kmax + 1`, so the cap censors it heavily and it should be read as an ordering hint rather
-than a count.
+than a count. Ten rows (0.010%) report a tuple rank larger than their item rank, which cannot
+happen if both count the tuples above; the cause is two distinct tuples scoring
+bit-identically, which the two `topk` calls order differently.
 
-Three things follow. The effect is real and it is **not** the 2.3x that the singleton
+Three things follow. The effect is real and it is **not** the 9.3x that the singleton
 subpopulation suggests, because that comparison confounds "no ties" with "those rows are
-easier"; the controlled question, holding the scores fixed, is 1.34x at `R@10`. It is also
-uneven: the 36.64% of rows with a unique tuple reach 2.254% `R@1` on merit, while the 8.63%
-in tuples of 17 or more reach 0.000%, and the 58.87% of rows with at least one tuple ranked
-above the target is where the whole loss lives. And it decays with depth, 1.34x at `R@10`
-down to 1.24x at `R@1000`, which is the signature of a positional penalty rather than a
+easier"; the controlled question, holding the scores fixed, is 1.37x at `R@10`. It is also
+uneven: the 36.64% of rows with a unique tuple reach 2.427% `R@1` on merit, while the 8.63%
+in tuples of 17 or more reach 0.024%, and the 60.98% of rows with at least one tuple ranked
+above the target is where the whole loss lives. And it decays with depth, 1.37x at `R@10`
+down to 1.23x at `R@1000`, which is the signature of a positional penalty rather than a
 missing signal.
 
 So "counting" is worth about 1.3x at the head, conditional on the extra resolution carrying
@@ -221,10 +224,12 @@ the 2.3x to 3x the direction needs. It is a remainder to collect, not the big mo
 belongs to a third code from a finer quantiser rather than to a collision index, since an
 index in catalogue order is unlearnable and v1 carries that level already.
 
-One detail worth recording because it looked like a bug: 6 rows (0.006%) report a tuple rank
-larger than their item rank, which cannot happen if both count the tuples above. The cause is
-that two distinct tuples can score bit-identically and the two `topk` calls break that tie
-differently.
+The injective column is an upper bound on what any tie mechanism inside the existing codebook
+could recover, not an estimate of it. Injective ranking counts one position per tuple above
+the target, while a perfect intra-block tie break would still count every member of every
+tuple above it, so the true tie-break ceiling sits below these numbers. On arm a the same
+measurement gave 1.18x at `R@1` and 1.34x at `R@10`, so the shape does not depend on which
+two-level checkpoint is used.
 
 **The flat-lift prediction failed twice, and the failure is instructive.** The original
 argument was geometric: 4.78M points of effective dimension about 17 have a bounded

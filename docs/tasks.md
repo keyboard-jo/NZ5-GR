@@ -90,7 +90,7 @@ but how much of the achieved R@k the ceiling already explains.
    is the single figure that says how far the codebook is from the published setting.
 4. **The unrun cells, `2x16384` and `3x16384`: deliberately not run.** They existed to answer
    the counting-versus-scoring question by widening, and section 4 answered it directly by
-   ranking the same tuple scores injectively (1.34x at `R@10`). A wider codebook would only
+   ranking the same tuple scores injectively (1.37x at `R@10`). A wider codebook would only
    re-measure a question that already has a number.
 
 What the diagnosis cannot say is in [`sid.md`](sid.md) as well: lift, occupancy and bits
@@ -242,26 +242,33 @@ that twenty v1 tuples name twenty items, not 27.6 (see the paragraph above on th
 distinct-tuple count).
 
 ## 4. Region multiplicity: counting or scoring (gate for any item-side move) — done
-**Result, 2026-11-02.** Run on arm a in 1.7 min, and the item column reproduces the
-`--dump_ranks` file on 100.00000% of 98,304 rows, so the left side is the leaderboard measure
-itself. Same tuple scores ranked injectively: `R@1` 0.9705% to 1.1414% (**1.18x**), `R@10`
-3.2725% to 4.3742% (**1.34x**), `R@100` 9.8674% to 13.0168% (1.32x), `R@1000` 25.5239% to
-31.5450% (1.24x). Full table in `sid.md` 4 and `README.md` 2.3(d).
+**Result, 2026-11-02, re-run on DiGR v2 (2026-11-03).** Run on the arm whose 3.6570% is the
+leaderboard number, `digr_v2_sid2x8192_e3_sampled300k/best`, in 2.0 min. The item column
+reproduces the `--dump_ranks` file on 100.00000% of 98,304 rows, so the left side is the
+leaderboard measure itself. Same tuple scores ranked injectively: `R@1` 1.0549% to 1.2889%
+(**1.22x**), `R@10` 3.6570% to 5.0283% (**1.37x**), `R@100` 10.9182% to 14.4185% (1.32x),
+`R@1000` 27.6622% to 33.9783% (1.23x). Full table in `sid.md` 4 and `README.md` 2.3(d). An
+earlier run on arm a gave 1.18x and 1.34x, so the shape does not depend on the checkpoint.
 
-So it is **mixed and mostly scoring**: a quarter of what these scores can already reach at
-`R@10` is lost to counting, three quarters is the model's own ranking. Consequences: move (d) in
-`README.md` 2.3 is capped at 1.18x at `R@1`, so it drops in priority; a finer codebook keeps its
-place, since that quarter is real and a finer code is the only way to collect it, but it is a
+So it is **mixed and mostly scoring**: 27% of what these scores can already reach at `R@10` is
+lost to counting, 73% is the model's own ranking. Consequences: move (d) in `README.md` 2.3 is
+bounded above by 1.22x at `R@1`, so it drops in priority; a finer codebook keeps its
+place, since that share is real and a finer code is the only way to collect it, but it is a
 remainder not a direction; and item-side capacity stays priced at the 0.15 slope, so
 concat-plus-MLP stays off the list. The earlier decision rule was right about the shape and
 wrong about the size: neither outcome near 2.43% nor near 1.06% occurred.
+
+The injective column is an upper bound on a tie mechanism, and strictly above it. Injective
+ranking counts one position per tuple ranked above the target; a perfect intra-block tie break
+would still count every member of those tuples, so it must land lower. That is why 1.22x bounds
+move (d) rather than forecasting it.
 
 **Why (kept as the record).** Measured 2026-11-02 on the v2 dump: `R@1` is 2.427% when the
 target is alone in its SID tuple and 0.262% when it shares one, a 9.3x gap that is monotone in
 group size and that survives popularity controls. Co-click, which has no codebook, shows 1.1x on
 the same rows, so the gap is DiGR's item representation rather than the items. `README.md`
 2.3(d) has the table. Note the 9.3x mixes "no tie" with "easier rows"; the controlled figure is
-the 1.34x above.
+the 1.37x above.
 
 **What.** ~~`Plan 3/region_rank.py`, one GPU pass, no training.~~ It scores the 3.0M *distinct
 tuples* instead of the 4.78M items and reports two ranks per row:
@@ -275,8 +282,8 @@ The gap between them is the whole counting effect. Everything else is scoring.
 **The decision.** ~~Injective `R@1` near 2.43% means the loss is arithmetic and a finer SID is
 justified. Near 1.06% means the scores are wrong on crowded rows and the lever is the item
 vector (per-level weights, non-linear composition), not the codebook.~~ Superseded by the
-result above: 1.18x at `R@1`, between the two bounds, and the proportion is a quarter counting
-to three quarters scoring at `R@10`.
+result above: 1.22x at `R@1`, between the two bounds, and the proportion is 27% counting
+to 73% scoring at `R@10`.
 
 **Cost.** A few minutes of one GPU. `DUMP_PATH` writes per-row ranks, so `--report_only`
 re-derives the table with no GPU afterwards.

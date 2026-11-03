@@ -138,6 +138,11 @@ and prints which of the two it did. The guard is `base >= 0` on every row: an ar
 are not one-value-per-tuple fails it, because reordering such an arm moves every row instead of
 resolving a tie. `Plan 3/tie_break.py` refuses co-click and popularity for exactly this reason.
 
+Numbers quoted above come from the first v2 run. The re-run on `digr_v2_sid2x8192_e3_sampled300k`
+gives measured `R@1` 1.0549% and `R@10` 3.6570%, with the injective column at 1.2889% and
+5.0283%. Re-run `tie_break.py` before quoting a tie-break ceiling from that dump, since the two
+numbers move together.
+
 Measured on the v2 dump, popularity inside the block takes `R@1` from 1.0549% to 1.2065% and
 `R@10` from 3.6570% to 3.9286%, which is about two thirds of the ceiling at `R@1` and three
 quarters at `R@10`. It also costs something: the target is the most clicked item in its block on
