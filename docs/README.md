@@ -36,15 +36,15 @@ separates the new SID from the new features, and it corrects two things this fil
 imply: the two effects are not additive, and the 1.41x is a popular-item gain rather than a
 cold-start one.
 
-The depth question now has an answer too. TIGER at full depth on the v1 SID, at the 27.6
-items its beam names, reaches 10.07% against DiGR's 4.35% on the same data, so it wins its
-own comparison where the two-level arm lost its own (§1.10). Read that with its caveats: the
+The depth question now has an answer too. TIGER at full depth on the v1 SID, at the 20 items
+its beam names, reaches 10.07% against DiGR's 3.56% on the same data, so it wins its own
+comparison where the two-level arm lost its own (§1.10). Read that with its caveats: the
 two vintages differ in more than depth, and the strata table says the win is heavily
 popularity-weighted.
 
-What to do next is in [`tasks.md`](tasks.md): four of the five items are closed, and what is
-left is one missing rank dump, which would make §1.10 fully measured instead of three parts
-measured and three interpolated, and then the bigger-backbone run that is deliberately last.
+What to do next is in [`tasks.md`](tasks.md): four of the five items are closed and every cell
+in §1.10 is a count rather than a bracket, so the only run left is the bigger backbone, which
+is deliberately last.
 
 ---
 

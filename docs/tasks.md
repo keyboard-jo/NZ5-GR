@@ -3,8 +3,9 @@
 Five things, in the order that changes what we can claim. Four are closed: the ablation is in
 [`ablation.md`](ablation.md); the SID diagnosis and the tie measurement are in [`sid.md`](sid.md),
 `README.md` §2.3 and `Plan 3/`; the TIGER-on-v1 comparison is in `README.md` §1.10; and the
-region multiplicity gate is §4 below. What remains is one missing dump and the bigger
-backbone.
+region multiplicity gate is §4 below. What remains is the bigger backbone. The dump this file
+used to list as missing arrived on 2026-11-02 and the join has been run on it, so every cell in
+`README.md` §1.10 is now a count rather than a bracket.
 
 ## 1. Ablation: the new SID versus the new features — **done**
 
@@ -226,14 +227,17 @@ visited, and the cells visited are the fat ones.
 **What this run does not establish.** Three things, each of which changes how the sentence
 above may be written. It does not isolate depth, because v1 differs from v2 in depth, width
 and injectivity at once, and its head is 9.3x smaller. It does not say TIGER's *lists* are
-popularity lists, because the strata measure whether cold targets are found, not what the 27.6
+popularity lists, because the strata measure whether cold targets are found, not what the twenty
 named items are, and the lists are in fact highly personalised (67,007 distinct cells over
 98,304 rows, mean pairwise Jaccard 0.004). And arm **(a)**, prefix-free at five levels, was
 never run, so the five-level SID as read by the plain oracle is still unmeasured.
 
-**Still missing for the matched-budget join:** DiGR v1's `--dump_ranks` pass, about 1.8 min of
-GPU. Its cells above come from the archive JSON with an interpolation in between, so the v1
-table in `README.md` §1.10 is one dump short of being fully measured.
+**Nothing is missing for the matched-budget join.** DiGR v1's `--dump_ranks` pass was taken on
+2026-11-02 (`local/2026-02-11-full-dumps/digr_v1.npz`, reproducing `REF_FROZEN_V1` to four
+decimals) and `budget_match.py` has been run on it, so the v1 table in `README.md` §1.10 is four
+measured cells at 20 items and contains no interpolation. The one correction that run forced is
+that twenty v1 tuples name twenty items, not 27.6 (see the paragraph above on the
+distinct-tuple count).
 
 ## 4. Region multiplicity: counting or scoring (gate for any item-side move) — done
 **Result, 2026-11-02.** Run on arm a in 1.7 min, and the item column reproduces the
