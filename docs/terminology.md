@@ -183,6 +183,14 @@ A row whose target is beyond the arm's cap. Stored as `cap + 1` so that it sorts
 hit without pretending to be a rank.
 _Avoid_: failure, not-found
 
+**Item rank / cell rank**:
+An item rank is a position among catalogue items. A cell rank is a position among the tuples an
+arm named. DiGR and the count baselines produce item ranks. A beam produces cell ranks, and an
+item rank only after a conversion that takes each cell's members in catalogue order, the same
+tie-break `topk` applies inside `train_digr.evaluate`. On the v1 SID a cell holds exactly one
+item, so there the two coincide.
+_Avoid_: reading a beam position as an item position
+
 **Cap / kmax**:
 The widest cut-off an arm can support: its beam width for a beam, the cut-off it was
 evaluated at otherwise. A cut-off wider than the cap is not a measurement.
@@ -216,8 +224,10 @@ _Avoid_: mean rank (arithmetic, dominated by outliers), median rank
 
 **Tuple recall / reach**:
 The share of rows whose target is anywhere in the tuples an arm named, which is the finest thing
-a beam can report because a beam cannot order items inside a tuple. TIGER's 12.5804% on v2 is
-its tuple recall at width 20; the same rows scores 0.21% to 2.04% as item recall.
+a beam reports *before any conversion*, because the model cannot order items inside a tuple.
+TIGER's 12.5804% on v2 is its tuple recall at width 20. Its item recall is 0.7741% once each
+cell's members are taken in catalogue order, and between 0.4873% and 2.0406% if the intra-cell
+order were free to choose.
 _Avoid_: using it as if it were item recall in a table that also holds item arms
 
 ## 5. Comparing arms
@@ -233,9 +243,10 @@ kept. It ranges from 25 to 1,439 on v2, so it is a budget per row, not a single 
 _Avoid_: budget, list length (both are what it measures)
 
 **Tuple axis / item axis**:
-TIGER's positions are tuple positions and DiGR's are item positions. A position on the tuple
-axis holds about 9.6 items on v2 and 1.38 on v1, so rank-aware metrics are only comparable when
-the axis is the same.
+TIGER's positions are tuple positions and DiGR's are item positions. A tuple position holds
+about 9.6 items on v2 and exactly 1 on v1, so rank-aware metrics are only comparable when the
+axis is the same, and a beam is comparable to an item arm only after the conversion in
+`README.md` §1.3.
 _Avoid_: rank level, granularity
 
 **Popularity stratum / quintile**:

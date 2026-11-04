@@ -182,8 +182,10 @@ axes fail on qualitatively different rows.
 
 ## 9. What it does not establish
 
-- Nothing about TIGER. This is DiGR's factorisation on four token streams. TIGER's
-  attribution needs its own arm, which is task 3 in [`tasks.md`](tasks.md).
+- Nothing about TIGER. This is DiGR's factorisation on four token streams, so the 1.41x says
+  what a codebook and a feature set are worth to a linear item scorer. TIGER's side has since
+  been run: task 3 in [`tasks.md`](tasks.md) puts it 2.83x ahead of DiGR v1 at the same budget
+  on the same codes (`README.md` §1.10), which is a depth result and not a re-run of this one.
 - Nothing about a wider codebook. The axis tested is `4x256+731` against `2x8192`, not
   `2x8192` against `2x16384`, so the curve's shape beyond 8,192 is unmeasured.
 - Nothing about why the feature step reverses. The popularity strata localise it, they do

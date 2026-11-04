@@ -147,10 +147,13 @@ ranks tuples, so a raw beam position is not an item position: its position 3 hol
 items while DiGR's holds one. Two conversions were applied instead of printing the log. Item
 ranks are taken with each tuple's members in catalogue order, which is what DiGR does with its
 own ties (§1.3), and from those `nDCG@N_r` is `0.03273` and `MRR@10` is `0.01238`, against
-DiGR's `0.04013` and `0.01742`. The `@k` columns stay blank because a cut-off inside a 192-item
-shortlist is not a cut-off over 4.78M items; the beam's own short cut-offs are in the table
-below, with the same conversion applied. The tuple axis would have read `nDCG 0.0592` and
-`MRR@10 0.03803`, both above DiGR, which is the comparison the conversion exists to prevent.
+DiGR's `0.04013` and `0.01742`. Those two cells come from `Dump Analysis/dump_metrics.py` with the
+catalogue loaded, which applies that conversion; `budget_match.py` refuses the tuple axis and
+still prints `n/a` for this arm. Both read the same dump. The `@k` columns stay blank because a
+cut-off inside a 192-item shortlist is not a cut-off over 4.78M items; the beam's own short
+cut-offs are in the table below, with the same conversion applied. The tuple axis would have read
+`nDCG 0.0592` and `MRR@10 0.03803`, both above DiGR, which is the comparison the conversion
+exists to prevent.
 
 Every cell above is measured from the four dumps. Earlier revisions carried `~est` cells for
 the co-click and popularity rows, derived by applying DiGR's uniform-$k$ to per-row-budget
@@ -265,9 +268,12 @@ Reach per item named is not a constant, so the ranking inverts with the budget:
 
 There is no single winner between DiGR and co-click. Co-click leads at 10 and at 100 items by
 0.3 percentage points and 0.07, DiGR leads from 192 upward, and the gap widens with depth to 19%
-at 10,000. TIGER is a different case: its reach curve exists only at the three budgets its own
-blocks happen to buy, about 17 items, about 96 and 192, and DiGR is ahead at all three, 4.75%
-against 2.04%, 10.7% against 8.90%, 13.9994% against 12.5804%.
+at 10,000. TIGER is a different case. After the conversion in §1.3 both arms are on the item
+axis, where the beam measures 0.7741% at `R@1` and 2.5696% at `R@10` against DiGR's 1.0549% and
+3.6570%, so DiGR leads at both; and at the widest budget the beam's twenty blocks buy, 192
+items, the matched comparison is 13.9994% against 12.5804%. The two narrower budgets its blocks
+also buy, about 17 and about 96 items, are **not measured**: they would need the beam dumped at
+width 1 and at width 10.
 
 An earlier version of this table put a crossover at 138 items. That row compared DiGR at 138
 against TIGER's completed 192-item reach, so it was a 54-item mismatch rather than a crossing, and
@@ -475,11 +481,15 @@ All six pairs are significant under McNemar at `k = 10`, including beam against 
 (`b = 5,355`, `c = 547`, chi-squared 3,915.2). The printed `p = 0` is `erfc` underflow, not a
 zero probability.
 
-**Where it loses, it loses badly.** `R@10` by target popularity quintile, coldest to hottest:
+**Where it loses, it loses badly.** `R@10` by target popularity quintile, coldest to hottest.
+Quintile boundaries come from `log1p` of the train target count in
+`local/2026-27-10-1-pre/digr_data`, the 1,719,430-row build; the v1 directory gives the same
+ordering with visibly different cells (tail recall 0.0064% here against 0.0075% there), so a
+reader reproducing these numbers needs that directory:
 
 | arm | tail | lower | middle | upper | head | head / tail |
 | --- | --- | --- | --- | --- | --- | --- |
-| TIGER v1 beam | 0.0064% | 0.0802% | 2.1296% | 7.2769% | 27.3696% | **4,276x** |
+| TIGER v1 beam | 0.0064% | 0.0802% | 2.1296% | 7.2769% | 27.3696% | **4,301x** |
 | coclick h20 | 0.1400% | 0.4719% | 1.4073% | 3.2165% | 12.9951% | 93x |
 | DiGR v1 | 0.1782% | 0.3964% | 0.6477% | 1.6083% | 9.9788% | 56x |
 | popularity | 0.0000% | 0.0000% | 0.0000% | 0.0000% | 6.6744% | n/a |
@@ -562,9 +572,10 @@ offline, over the same 98,304 rows:
 Those per-row figures are wall clock divided by rows, and they are **not** comparable. `run_beam`
 decodes one row at a time (`for row in range(ids.shape[0])` with `ids[row:row + 1]`, at
 `Model Training/train_tiger.py:1328`), so a beam row leaves the GPU almost idle while five
-sequential decoding steps run; DiGR scores 128 rows against the 4.78M-item matrix per call. The
-ratio below each pair mixes batch sizes of 128 and 1, so it is not a ratio of serving costs, and
-neither number is a request latency: both include checkpoint load, warmup and logging.
+sequential decoding steps run; DiGR scores 128 rows against the 4.78M-item matrix per call. A
+ratio between those rows therefore mixes batch sizes of 128 and 1, so it is not a ratio of
+serving costs, and neither number is a request latency: both include checkpoint load, warmup and
+logging.
 
 What survives the caveat is the structure, not the number. A beam is five sequential decoding
 steps through a 0.6B backbone, so its cost is latency-bound and scales with depth. DiGR is one
@@ -776,7 +787,7 @@ was 1.11x behind DiGR at its own 192-item budget (§1.10). So the factorisation 
 the tree is deep enough to localise, and the v2 shortfall was a property of a two-level code,
 not of the architecture. Two limits on that reading: v1 changes depth, width and injectivity
 together, so depth is implicated rather than isolated; and the arm is the most popularity-
-weighted in the file (4,276x coldest to hottest quintile), so the win is concentrated where
+weighted in the file (4,301x coldest to hottest quintile), so the win is concentrated where
 the data is dense. A three-level SID at 8,192 is the run that would separate them, and it is
 the same run §2.6 item 4 asks for, specified in §2.5.
 

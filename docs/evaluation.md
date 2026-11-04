@@ -289,7 +289,17 @@ close ceiling with high lift says the codes are.
 
 **(c) The beam's rank is a bucket rank.** All items in a bucket share a position. That is
 the method's own resolution limit, not an evaluation choice, and it is why the beam arm is
-reported against a budget rather than against $\mathrm{R@10}$.
+reported against a budget rather than against $\mathrm{R@10}$ in the main table.
+
+A bucket position can be turned into an item position, and where the project had to report a
+beam against $\mathrm{R@10}$ it did exactly that. The members of a bucket cannot be ordered by
+the model, so they are taken in **catalogue order**, which is the tie-break `topk` already
+applies inside `train_digr.evaluate`; an item's rank is then the summed size of every bucket
+ranked above it plus its position inside its own bucket, and a miss stays a miss. There is no
+best case and no worst case to choose between, which is the point. The conversion lives in
+`Dump Analysis/dump_metrics.py` (`as_is_item_rank`, on by default when `--data_dir` is given)
+and it reproduces a one-item-per-bucket arm exactly, which is its own check. What it cannot do
+is extend the list: a cut-off wider than $W$ buckets returns reach, not recall.
 
 **(d) The count baselines have a deterministic tie-break.** co-click accumulates into
 `np.unique`-sorted candidate ids and then does a stable sort, so equal totals are ordered by
@@ -391,9 +401,13 @@ $$
 
 nDCG needs the budget for the same reason recall does: which ranks exist depends on how long
 the list is. MRR does not, because its cut-off is the fixed $k = 10$, so it carries the same
-value in both columns. Both are **undefined for an arm whose ranks are tuple positions** and
-`budget_match.py` writes `n/a` rather than a number, since a tuple position holding about
-9.6 items is not a position on the item axis.
+value in both columns. Both are **undefined for a raw tuple position** and `budget_match.py`
+writes `n/a` rather than a number, since a tuple position holding about 9.6 items is not a
+position on the item axis. They become defined once the position is converted, which is why
+`docs/README.md` §1.3 can print `0.03273` and `0.01238` for the beam: those two cells come from
+`Dump Analysis/dump_metrics.py` with the catalogue loaded, applying the conversion in §5.3(c),
+not from `budget_match.py`. The distinction is worth keeping in mind when a table mixes the two
+sources.
 
 `match_all` is the primary column and the **only like-for-like one** in the project: every
 arm is asked the same question, "was the target inside the first $N_r$ items you would have
@@ -477,8 +491,9 @@ Stated plainly, because the tables are easy to over-read.
    settled until a paired test is run.
 4. **Ranks are not comparable across arms at a fixed $k$.** A tuple rank, an item rank and
    a popularity-padded rank are different objects. Only $\texttt{match\_all}$,
-   $\texttt{ndcg@N\_r}$ and $\texttt{mrr10}$ compare like with like, and the last two are
-   defined only for an arm that ranks items.
+   $\texttt{ndcg@N\_r}$ and $\texttt{mrr10}$ compare like with like, and the last two need an
+   item rank on both sides. A beam has one only after the conversion in §5.3(c); un\u00adconverted,
+   its $\mathrm{R@10}$ is reach at roughly 96 items and not a top ten.
 5. **The 67% of the catalogue that is never clicked** occupies rank positions for every arm.
    That is the standard convention, but it means these numbers are not comparable with
    papers that rank a candidate pool of a few hundred items.

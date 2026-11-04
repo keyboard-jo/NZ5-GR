@@ -225,10 +225,10 @@ is 2.83x DiGR v1, where the two-level arm in the v2 table was 1.11x behind DiGR.
 plain item-level rank-1 number with no interval, so unlike the v2 row it can be compared at
 rank 1. `nDCG@10 0.04217`, `MRR@10 0.03223`, effective rank 4.69.
 
-The arm also loses somewhere, and badly: cold-target recall is one row in 15,715, against
-0.1400% for co-click and 0.1973% for DiGR, a 4,276x coldest-to-hottest ratio against 93x and
-46x. Twenty named cells out of 4,783,154 make a target unreachable when its cell is never
-visited, and the cells visited are the fat ones.
+The arm also loses somewhere, and badly: cold-target recall is one row in 15,577, against
+0.1400% for co-click and 0.1782% for DiGR v1 on the same quintile boundaries, a 4,301x
+coldest-to-hottest ratio against 93x and 56x. Twenty named cells out of 4,783,154 make a target
+unreachable when its cell is never visited, and the cells visited are the fat ones.
 
 **What this run does not establish.** Three things, each of which changes how the sentence
 above may be written. It does not isolate depth, because v1 differs from v2 in depth, width

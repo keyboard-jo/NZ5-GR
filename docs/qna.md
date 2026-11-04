@@ -57,7 +57,7 @@ so there is no tie ambiguity anywhere in the table. TIGER is 2.2x DiGR at `R@1` 
 The limits are equally clear. A beam of 20 can never name more than 20 items, so `R@20` is its
 hard ceiling at 10.0677%, and it has nothing to say at `k = 100` or beyond, where DiGR reaches
 7.51% and 49.77% at `k = 10,000`. It is also the most popularity-weighted arm in the file, at
-4,276x from the coldest to the hottest popularity quintile, against 93x for co-click and 46x for
+4,301x from the coldest to the hottest popularity quintile, against 93x for co-click and 56x for
 DiGR, so most of the win lives where the data is dense.
 
 ---
@@ -75,9 +75,10 @@ field but not by a comfortable margin.
 
 Below that budget the question is not answerable. A beam of 20 asks "is the target in my 20",
 while DiGR asks "is the target in my top 20 out of 4.78M", and TIGER's position-1 number on v2 is
-a tuple rank whose item-level value lies somewhere in 0.49% to 2.04%, which overlaps DiGR's
-1.05% to 1.29% entirely. On v1 that ambiguity disappears, which is why Q2 has a clean answer and
-Q3 does not.
+a tuple rank. Converted to items by taking each cell's members in catalogue order (§1.3) it is
+**0.7741%**, and if the tie could be broken perfectly it is somewhere between 0.4873% and
+2.0406%; either way it overlaps DiGR's 1.05% to 1.29% entirely. On v1 that ambiguity disappears,
+which is why Q2 has a clean answer and Q3 does not.
 
 ---
 

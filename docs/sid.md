@@ -21,7 +21,7 @@ Everything here is measured on the same 98,304 val rows.
 | depth-1 lift | 46.9x | 463.3x |
 | peak lift | 8,257.6x at depth 3 | 7,880.6x at depth 2 |
 | depth-1 candidate bucket | 19,308 | 745 |
-| collision share | 1.38 items per full 5-code tuple; 39.28% of items share one (27.67% excess), largest 731 | 1.59 items per 2-code tuple; 53.51% share one (37.22% excess), largest 315 |
+| collision share | **none**: 1.000 items per full 5-code tuple, injective. The 1.38 figure is per 4-code **prefix**, of which 39.28% of items share one (27.67% excess), largest 731 | 1.59 items per 2-code tuple; 53.51% share one (37.22% excess), largest 315 |
 | tie ceiling, R@1 / R@10 | none needed, injective at depth 5 (100.00% / 100.00%) | 53.57% / 93.20% over val targets |
 | event stream | 9.11 feature tokens per row, no action token, 64 gap bins | 4 tokens per event, action token, 128 gap bins |
 | what it produced | DiGR v1 R@10 2.5940% | DiGR v2 R@10 3.6570% |
