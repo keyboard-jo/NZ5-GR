@@ -314,12 +314,23 @@ replaced it.
 - **Items per code is the number to quote, not bits.** Ours is 584 at v2. The DiGR paper's
   catalogues sit at 39 to 195 items per level-0 code, and that gap, not the vocabulary
   bits, is the scale difference between its numbers and ours.
+
+  **Provenance of that band.** It is derived, not quoted. The paper (`arXiv:2602.07847`)
+  says the SIDs come from RQ-VAE and never states the codebook width or the number of
+  levels: a full-text search for "256", "codebook" and "levels" returns nothing, and its
+  Table 1 is statistics only. The 39 to 195 figures come from dividing its three catalogue
+  sizes by 256, the width TIGER's RQ-VAE uses. The arithmetic fits exactly (Musical
+  Instruments about 10k items gives 39, Arts and Crafts about 28k gives 109, Video Games
+  about 50k gives 195), so 256 is almost certainly right, but anybody checking the paper
+  will not find it there. Quote the band as "derived from their catalogue sizes assuming
+  256-wide codebooks", and lean on the catalogue size for the scale argument, which needs
+  no assumption: their catalogues are 10k to 50k items against our 4,783,154.
 - **The tie ceiling is half a check, and lift is the other half.** A ceiling cannot separate a
 good representation from a hash, because a hash is injective. Read the two together: high
 lift with a distant ceiling means the scorer is the constraint, and high lift with a close
 ceiling means the codes are. The rows where no tie can operate are the cleanest single test,
 because they remove the tie mechanism instead of arguing about it.
 - **The width axis is closed by decision.** The next SID question is not wider codes but
-  behaviour-aware codes, and that work is bounded by the rules in `README.md` 2.6: the
+  behaviour-aware codes, and that work is bounded by the rules in `README.md` 2.7: the
   representation stays a function of content at serving time, so a co-occurrence vector
   cannot be the code space while a content encoder that ranks better can.

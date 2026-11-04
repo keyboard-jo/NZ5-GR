@@ -86,8 +86,12 @@ but how much of the achieved R@k the ceiling already explains.
    and 93.20% at `R@10` for v2 over the val targets, and 62.78% / 95.96% over the catalogue. It is
    a codebook property, not an arm property, so there is no
    per-arm version of it to compute.
-3. **Items per level-0 code**: 583.88 for v2, 18,684.20 for v1, against the paper's 39-195. This
-   is the single figure that says how far the codebook is from the published setting.
+3. **Items per level-0 code**: 583.88 for v2, 18,684.20 for v1, against 39-195 for the paper's
+   catalogues. This is the single figure that says how far the codebook is from the published
+   setting. Note that 39-195 is **derived**, not quoted: the paper names RQ-VAE but never states
+   its codebook shape, so the band comes from dividing its three catalogue sizes by 256, the
+   width TIGER's RQ-VAE uses. See `sid.md` §6 for the provenance. The catalogue sizes themselves
+   (10k to 50k against our 4,783,154) need no assumption.
 4. **The unrun cells, `2x16384` and `3x16384`: deliberately not run.** They existed to answer
    the counting-versus-scoring question by widening, and section 4 answered it directly by
    ranking the same tuple scores injectively (1.37x at `R@10`). A wider codebook would only
