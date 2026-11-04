@@ -173,31 +173,35 @@ than its recall alone already showed.
 People ask for these, so here they are in a separate table. They are **not** comparable, for
 the reasons under the table.
 
-| arm | R@1 | R@5 | R@10 | MRR@10 | source |
-| --- | --- | --- | --- | --- | --- |
-| **TIGER prefix, beam 20** † | **0.7741%** | **1.8453%** | **2.5696%** | **0.01238** | dumps |
-| **TIGER prefix v1, beam 20** | **1.7558%** | **5.0741%** | **7.4849%** | **0.03223** | dumps |
-| DiGR v2 | 1.0549% | 2.6245% | 3.6570% | 0.01742 | dumps |
-| coclick h20 | 0.8057% | 2.4882% | 3.7069% | 0.01539 | dumps |
-| coclick h10 | 0.7985% | 2.4780% | 3.6794% | 0.01529 | dumps |
-| coclick h5 | 0.7853% | 2.4241% | 3.6011% | 0.01499 | dumps |
-| popularity | 0.4395% | 0.9074% | 1.3438% | 0.00648 | dumps |
-| TIGER prefix-free v2 | 1.4400% | — | 2.4500% | 0.01700 | archive |
-| DiGR v1 (4x256 + 731) | 0.7924% | 1.8514% | 2.5940% | 0.01258 | dumps |
-| item-embedding kNN, last 1 | 0.0173% | — | 0.5636% | 0.00151 | archive |
-| HSTU tower probe | 0.0458% | — | 0.4354% | 0.00131 | archive |
-| B3 SID transition | 0.0244% | — | 0.1801% | 0.00060 | archive |
+| arm | R@1 | R@5 | R@10 | nDCG@10 | MRR@10 | candidates | source |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **TIGER prefix, beam 20** † | **0.7741%** | **1.8453%** | **2.5696%** | **0.01549** | **0.01238** | **192** | dumps |
+| **TIGER prefix v1, beam 20** | **1.7558%** | **5.0741%** | **7.4849%** | **0.04217** | **0.03223** | **20** | dumps |
+| DiGR v2 | 1.0549% | 2.6245% | 3.6570% | 0.02190 | 0.01742 | 4,783,154 | dumps |
+| coclick h20 | 0.8057% | 2.4882% | 3.7069% | 0.02044 | 0.01539 | 10,000 | dumps |
+| coclick h10 | 0.7985% | 2.4780% | 3.6794% | 0.02030 | 0.01529 | 10,000 | dumps |
+| coclick h5 | 0.7853% | 2.4241% | 3.6011% | 0.01989 | 0.01499 | 10,000 | dumps |
+| popularity | 0.4395% | 0.9074% | 1.3438% | 0.00809 | 0.00648 | 10,000 | dumps |
+| TIGER prefix-free v2 | 1.4400% | — | 2.4500% | 0.01870 | 0.01700 | 4,783,154 | archive |
+| DiGR v1 (4x256 + 731) | 0.7924% | 1.8514% | 2.5940% | 0.01570 | 0.01258 | 4,783,154 | dumps |
+| item-embedding kNN, last 1 | 0.0173% | — | 0.5636% | — | 0.00151 | 4,783,154 | archive |
+| HSTU tower probe | 0.0458% | — | 0.4354% | 0.00201 | 0.00131 | 4,783,154 | archive |
+| B3 SID transition | 0.0244% | — | 0.1801% | 0.00087 | 0.00060 | 4,783,154 | archive |
 
-Two things are wrong with a short cut-off across these rows, and the table is here to be read
-with both in mind.
+**`candidates` is the column that says why these rows are not comparable.** An arm ranking 20
+items and an arm ranking 4,783,154 are answering different questions, and a bare cut-off hides
+which one. It also predicts the shape of every other column: the v1 beam ranks 20 items and
+leads the table at `R@1`, while the v2 beam ranks 192 and does not. `candidates` is measured for
+the beams, the summed size of the cells they named, and stated for the rest, because a rank dump
+cannot tell a 10,000-item list from the whole catalogue. `Dump Analysis/dump_metrics.py` prints it
+as the `list` column and takes `--candidates NAME=N` to override it.
 
-**The v2 beam's columns are item ranks on a shortlist** (†, same marker as above). Its tuples are
-fat, so a raw beam position is not an item position and the log cannot be printed as `R@k`. It
-can be converted, and the conversion is stated here once and used everywhere: a tuple's members
-are arbitrary and the model cannot order them, so they are taken in catalogue order, which is
-exactly what DiGR's `topk` does with its own ties. An item's rank is then the summed size of every
-tuple ranked above it, plus its position inside its own tuple in that order. No best case, no
-worst case, just the ranking as it stands.
+**Every row now has `nDCG@10` and `MRR@10` because every row has item ranks.** The v2 beam needed
+a conversion to get there, and it is the only row that did (§1.3).
+
+**The v2 beam's cell-axis figures, kept beside the item ranks** (†). The members of a cell are
+arbitrary, so §1.3 converts a cell position to an item position by taking them in catalogue
+order, which is DiGR's own tie-break. What the log printed, for the record:
 
 | v2 beam, ranked as-is | value | tuple axis, as the log printed it |
 | --- | --- | --- |
@@ -208,25 +212,19 @@ worst case, just the ranking as it stands.
 | `nDCG@10` | 0.01549 | 0.04993 |
 | `MRR@10` | 0.01238 | 0.03803 |
 
-The same code reproduces the v1 row exactly (1.7558% / 5.0741% / 7.4849% / 10.0677%, `nDCG@10`
-0.04217, `MRR@10` 0.03223), which is the check that the convention is implemented correctly,
-since a v1 tuple holds one item. On this convention the v2 beam is behind DiGR v2 on every
-column, 2.5696% against 3.6570% at `R@10`, and half the hits it does get land beyond item 50 of
-its own list. The 2.4x the raw log appeared to show was the tuple axis, ten tuples holding about
-96 items, which is why the main table above refuses to print those columns directly.
+The same code reproduces the v1 row exactly (1.7558% / 5.0741% / 7.4849%, `nDCG@10` 0.04217,
+`MRR@10` 0.03223), which is the check that the conversion is implemented correctly, since a v1
+cell holds one item. On the item axis the v2 beam is behind DiGR v2 on every column, 2.5696%
+against 3.6570% at `R@10`, and half the hits it does get land beyond item 50 of its own list.
 
 **The v1 beam needs none of this.** Every five-code tuple is unique, 4,783,154 distinct tuples
-over 4,783,154 items with all of them of size 1, so a tuple position is already an item position
-and no conversion is required: `R@1` 1.7558%, `R@5` 5.0741%, `R@10` 7.4849%. What it does not
-have is a catalogue-wide universe. It ranks twenty items, so 7.4849%
-means the target was inside the top ten of a twenty-item list, and 74.3% of the targets it reaches
-at all land in that top ten (7.4849 over 10.0677). Its honest reach is **10.0677% at twenty
-items**, against DiGR v1's 3.5553% at the same budget.
-
-The v1 beam row carries no marker, because there a five-code tuple is unique and holds exactly
-one item, so its columns are ordinary item-level cut-offs and its `R@10` really is a top ten of
-the twenty items it names. Its list is only 20 items long, though, which is the second caveat
-below.
+over 4,783,154 items all of size 1, so a cell position is already an item position and the
+conversion is the identity: `R@1` 1.7558%, `R@5` 5.0741%, `R@10` 7.4849%, `nDCG@10` 0.04217,
+`MRR@10` 0.03223. What it does not have is a catalogue-wide universe. It ranks twenty items, so
+7.4849% means the target was inside the top ten of a twenty-item list, and 74.3% of the targets
+it reaches at all land in that top ten (7.4849 over 10.0677). Its honest reach is **10.0677% at
+twenty items**, against DiGR v1's 3.5553% at the same budget. That is why its row carries no
+marker here, and why its `candidates` cell says 20.
 
 **A beam cannot return fewer than 192 items on v2, or 20 on v1.** Its short cut-offs are not
 the same decision problem as a top-10 over 4.78M, because the list it draws its top 10 from was

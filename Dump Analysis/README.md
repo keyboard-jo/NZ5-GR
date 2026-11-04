@@ -33,6 +33,7 @@ exit rather than a silent pairing.
 | section | why it exists |
 |---|---|
 | curve | `R@k`, `nDCG@k`, `MRR@k` for any cut-offs you pass, from one rank array |
+| `list` | how many candidates the arm ranked per row. For a beam it is the summed size of the cells it named, counted from the catalogue; for the rest it is `--candidates` or the cap |
 | `nDCG@k / R@k` | the mean weight of a hit, so it says where inside the top k hits land. DiGR 0.5988 against co-click 0.5513 while `R@10` is a tie, which is the whole point of reporting nDCG |
 | effective rank | `2 ** mean(log2(rank))`, uses the entire list instead of one cut-off |
 | pair union | `|hit_A ∪ hit_B| / n` for every pair, the only view that shows how differently two arms fail |
@@ -54,6 +55,18 @@ is the single most common way to inflate a beam, and there is a test for it.
 The cap is `beam_width` when the dump has one, otherwise `rank.max() - 1` when
 `rank.max()` looks like a sentinel, otherwise `rank.max()`. Override with
 `--cap NAME=N` when you know better. A clamped cut-off prints a note to stderr.
+
+**A beam's cell positions are converted to item ranks.** A beam orders cells and
+cannot order the items inside one, so a raw cell position is not an item position
+and `R@1`, `nDCG@10` and `MRR@10` mean something different from what they mean for
+an arm that ranks items. When `--data_dir` is given, any arm whose dump carries
+`tuples` is converted: the members of a cell are taken in **catalogue order**,
+which is the tie-break `topk` already applies inside `train_digr.evaluate`, and an
+item's rank becomes the summed size of every cell above it plus its position
+inside its own cell. No best case, no worst case. The same code reproduces the v1
+beam's cut-offs exactly (1.7558% / 5.0741% / 7.4849%), because a v1 cell holds one
+item, which is the check that the conversion is implemented correctly. `--item_axis
+off` keeps the cell axis instead, and then the cap is the beam width again.
 
 **A miss is charged as a miss.** Whether the arm could have reached the item
 given a wider list is a different question, answered by
@@ -80,11 +93,15 @@ python "Dump Analysis/dump_metrics.py" \
   --arm "coclick_h20=dumps/baselines/h20/coclick_*.npz" \
   --arm "popularity=dumps/baselines/h20/popularity_*.npz" \
   --data_dir ~/NZ5/plan2/digr_data \
-  --ks 1,10,100,1000 --out_dir analysis
+  --candidates DiGR_v2=4783154 --candidates coclick_h20=10000 \
+  --ks 1,5,10,20,100,1000 --out_dir analysis
 ```
 
-`--data_dir` is only needed for the popularity strata, and only needs
-`train/targets.npy` plus `catalog_item_ids.npy`. Everything else runs without it.
+`--data_dir` does two jobs: it supplies `train/targets.npy` for the popularity
+strata, and it supplies `catalog_sid_codes.npy`, which is what converts the beam's
+cell positions to item ranks. Without it the beam keeps the cell axis and its cap
+stays at the beam width. `--candidates` is only needed for arms whose list length
+the dump cannot reveal, which is every arm that ranks items directly.
 
 Two things this prints that the headline table does not:
 

@@ -326,3 +326,72 @@ def test_main_with_popularity_strata_needs_a_data_dir(tmp_path):
     ])
     md = (out / "dump_metrics.md").read_text(encoding="utf-8")
     assert "by target popularity" in md
+
+
+# --------------------------------------------------------------------------- #
+# the item axis: a beam orders cells, so its positions are converted
+# --------------------------------------------------------------------------- #
+# A 3x3 SID over 8 items, cells of size 3, 1, 2 and 2.
+CATALOG = np.array(
+    [[0, 0], [0, 0], [0, 0], [0, 1], [1, 0], [1, 0], [2, 2], [2, 2]], dtype=np.int64
+)
+
+
+def _write_catalog(tmp_path):
+    np.save(tmp_path / "catalog_sid_codes.npy", CATALOG)
+
+
+def test_asin_item_rank_counts_the_cells_above_and_the_position_inside_its_own():
+    # row 0: target item 2 sits in cell (0,0) at position 3, nothing above -> rank 3
+    # row 1: target item 5 sits in cell (1,0) at position 2, cell (0,0) above -> 3 + 2
+    # row 2: a miss, stored at beam_width + 1 = 3 -> the catalogue size + 1
+    tuples = np.array(
+        [
+            [[0, 0], [1, 0]],
+            [[0, 0], [1, 0]],
+            [[2, 2], [-1, -1]],
+        ],
+        dtype=np.int64,
+    )
+    rank = np.array([1, 2, 3], dtype=np.int64)
+    targets = np.array([2, 5, 7], dtype=np.int64)
+    tmp = pytest.importorskip("pathlib").Path(_tmpdir())
+    _write_catalog(tmp)
+    item, named = dm.as_is_item_rank(tuples, rank, targets, str(tmp))
+    assert item.tolist() == [3, 5, 9]
+    assert named.tolist() == [5, 5, 2]
+
+
+def test_asin_item_rank_is_the_identity_when_every_cell_holds_one_item():
+    # an injective codebook: 8 items in 8 distinct cells, so no conversion happens
+    unique = np.array([[i, 0] for i in range(8)], dtype=np.int64)
+    tmp = pytest.importorskip("pathlib").Path(_tmpdir())
+    np.save(tmp / "catalog_sid_codes.npy", unique)
+    tuples = np.array([[[3, 0], [5, 0]], [[0, 0], [-1, -1]]], dtype=np.int64)
+    rank = np.array([2, 1], dtype=np.int64)
+    targets = np.array([5, 0], dtype=np.int64)
+    item, named = dm.as_is_item_rank(tuples, rank, targets, str(tmp))
+    assert item.tolist() == [2, 1]
+    assert named.tolist() == [2, 1]
+
+
+def test_asin_item_rank_refuses_a_catalogue_from_another_sid():
+    tuples = np.array([[[0, 0, 0], [1, 0, 0]]], dtype=np.int64)
+    tmp = pytest.importorskip("pathlib").Path(_tmpdir())
+    _write_catalog(tmp)
+    with pytest.raises(SystemExit) as exc:
+        dm.as_is_item_rank(tuples, np.array([1]), np.array([0]), str(tmp))
+    assert "different SIDs" in str(exc.value)
+
+
+def test_asin_item_rank_refuses_a_missing_catalogue():
+    tmp = pytest.importorskip("pathlib").Path(_tmpdir())
+    with pytest.raises(SystemExit) as exc:
+        dm.as_is_item_rank(np.zeros((1, 1, 2), dtype=np.int64), np.array([1]),
+                           np.array([0]), str(tmp))
+    assert "no catalogue codes" in str(exc.value)
+
+
+def _tmpdir():
+    import tempfile
+    return tempfile.mkdtemp()

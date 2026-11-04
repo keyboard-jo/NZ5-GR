@@ -129,6 +129,66 @@ def clamp(k, cap):
     return int(min(k, cap))
 
 
+def pack_keys(codes, sizes):
+    """Mixed radix, the same map `budget_match.pack` and `train_tiger.pack_prefix` use."""
+    key = np.zeros(len(codes), dtype=np.int64)
+    for level in range(codes.shape[1]):
+        key = key * int(sizes[level]) + codes[:, level]
+    return key
+
+
+def load_catalogue(data_dir):
+    path = os.path.join(data_dir, "catalog_sid_codes.npy")
+    if not os.path.exists(path):
+        raise SystemExit(f"no catalogue codes for the item axis at {path}")
+    codes = np.asarray(np.load(path, mmap_mode="r"), dtype=np.int64)
+    return codes, codes.max(axis=0).astype(np.int64) + 1
+
+
+def as_is_item_rank(tuples, rank, targets, data_dir):
+    """Tuple positions to item positions, members of a cell in catalogue order.
+
+    A beam orders cells and cannot order the items inside one, so the members are
+    taken in catalogue order, which is the tie-break `topk` already applies inside
+    `train_digr.evaluate`. An item's rank is then the summed size of every cell
+    ranked above it, plus its own position inside its cell. There is no best case
+    and no worst case to choose between: this is the ranking as it stands.
+
+    Returns ``(item_rank, named)`` where ``named`` is how many items the row's
+    cells actually hold, i.e. the arm's own candidate list length per row.
+    """
+    codes, sizes = load_catalogue(data_dir)
+    key = pack_keys(codes, sizes)
+    order = np.argsort(key, kind="stable")
+    uniq, start, counts = np.unique(key[order], return_index=True, return_counts=True)
+    within = np.empty(len(codes), dtype=np.int64)
+    within[order] = np.arange(len(codes)) - np.repeat(start, counts) + 1
+
+    n, width, levels = tuples.shape
+    if levels != sizes.size:
+        raise SystemExit(
+            f"the dump's tuples have {levels} levels, {data_dir} has {sizes.size}; "
+            "these are different SIDs and the item axis would be wrong"
+        )
+    per_cell = np.zeros((n, width), dtype=np.int64)
+    for j in range(width):
+        k = np.zeros(n, dtype=np.int64)
+        for level in range(levels):
+            k = k * int(sizes[level]) + np.clip(tuples[:, j, level], 0, None)
+        pos = np.clip(np.searchsorted(uniq, k), 0, uniq.size - 1)
+        owned = (tuples[:, j, 0] >= 0) & (uniq[pos] == k)
+        per_cell[:, j] = np.where(owned, counts[pos], 0)
+
+    named = per_cell.sum(axis=1)
+    cum = np.cumsum(per_cell, axis=1)
+    rows = np.arange(n)
+    hit = rank <= width
+    slot = np.where(hit, rank - 1, 0)
+    above = np.concatenate([np.zeros((n, 1), dtype=np.int64), cum[:, :-1]], axis=1)[rows, slot]
+    item_rank = np.where(hit, above + within[targets], len(codes) + 1)
+    return item_rank, named
+
+
 # --------------------------------------------------------------------------- #
 # metrics
 # --------------------------------------------------------------------------- #
@@ -320,8 +380,9 @@ def pct(x, digits=4):
     return "n/a" if x != x else f"{100.0 * x:.{digits}f}%"
 
 
-def report(arms, caps, ks, pair_k, freq, groups, boot):
+def report(arms, caps, ks, pair_k, freq, groups, boot, cands=None):
     n = arms[0]["n"]
+    cands = cands or {}
     lines = []
     add = lines.append
 
@@ -329,17 +390,30 @@ def report(arms, caps, ks, pair_k, freq, groups, boot):
     add("")
     add(f"{n:,} rows, {len(arms)} arm(s), same row set and same targets for every arm.")
     add("")
-    add("| arm | cap | misses | effective rank |")
-    add("|---|---|---|---|")
+    add("| arm | cap | list | misses | effective rank |")
+    add("|---|---|---|---|---|")
     for a in arms:
         cap = caps[a["name"]]
+        listed = cands.get(a["name"], float(cap))
         add(
-            f"| {a['name']} | {cap:,} | {pct(miss_share(a['rank'], cap))} | "
+            f"| {a['name']} | {cap:,} | {listed:,.1f} | {pct(miss_share(a['rank'], cap))} | "
             f"{effective_rank(a['rank'], cap):.2f} |"
         )
     add("")
     add("`cap` is the deepest position the dump can express. A miss is stored at `cap + 1`,")
     add("so `effective rank` is computed over hits only and is not flattered by sentinels.")
+    add("")
+    add("`list` is how many candidates the arm ranked on an average row. For a beam that is")
+    add("the summed size of the cells it named, counted from the catalogue; for a")
+    add("full-catalogue arm it is the catalogue. A rank dump cannot tell 10,000 from")
+    add("4,783,154, so pass `--candidates NAME=N` when the difference matters. A cut-off wider")
+    add("than `list` reports the arm's reach, because nothing can be found past the end of a list.")
+    if any(a.get("axis") == "item" for a in arms):
+        add("")
+        add("Arms marked below were converted to **item** ranks: a beam orders cells and")
+        add("cannot order the items inside one, so the members are taken in catalogue order,")
+        add("which is the tie-break `topk` applies inside `train_digr.evaluate`. No best case,")
+        add("no worst case. That conversion is what lets a beam report `R@1` and `nDCG@10` at all.")
     add("")
 
     add("## The curve")
@@ -447,7 +521,8 @@ def report(arms, caps, ks, pair_k, freq, groups, boot):
         s = cell_stats(a["tuples"])
         add(f"## Cells named by {a['name']}")
         add("")
-        add("A beam ranks cells of the catalogue, not items. These are cell counts.")
+        add("These are cell counts, kept because the cell structure is what makes a beam")
+        add("different from an item ranking. The metrics above are on the item axis.")
         add("")
         add("| quantity | value |")
         add("|---|---|")
@@ -458,7 +533,7 @@ def report(arms, caps, ks, pair_k, freq, groups, boot):
         add(f"| distinct cells overall | {s['distinct_cells']:,} |")
         add(f"| mean pairwise Jaccard between two rows | {s['pairwise_jaccard_mean']:.3f} |")
         add("")
-        add("Item-level catalogue coverage is not recoverable from a rank dump. It needs the")
+        add("Item-level catalogue coverage is not recoverable from a cell dump. It needs the")
         add("bucket sizes, which `budget_match.py` reads from `catalog_sid_codes.npy`.")
         add("")
 
@@ -490,11 +565,18 @@ def main(argv=None):
                     help="a rank dump: one npz, a glob, or a directory of chunks")
     ap.add_argument("--cap", action="append", default=[], metavar="NAME=N",
                     help="override the inferred cap for one arm")
+    ap.add_argument("--candidates", action="append", default=[], metavar="NAME=N",
+                    help="override how many candidates one arm ranked per row; a rank "
+                         "dump cannot tell a 10,000-item list from the whole catalogue")
+    ap.add_argument("--item_axis", choices=("auto", "off"), default="auto",
+                    help="convert a beam's tuple ranks to item ranks using the catalogue "
+                         "(default auto: needs --data_dir); off keeps the tuple axis")
     ap.add_argument("--ks", default=",".join(str(k) for k in EVAL_KS),
                     help="cut-offs to report, default %(default)s")
     ap.add_argument("--pair_k", type=int, default=PAIR_K)
     ap.add_argument("--data_dir", default=None,
-                    help="for popularity strata; needs train/targets.npy")
+                    help="popularity strata (train/targets.npy) and, with it, the "
+                         "catalogue the item-axis conversion needs")
     ap.add_argument("--groups", default=None,
                     help="npy of per-row group ids, one per row of the dump")
     ap.add_argument("--bootstrap", type=int, default=BOOTSTRAP,
@@ -532,6 +614,34 @@ def main(argv=None):
     caps = {}
     for a in arms:
         caps[a["name"]] = infer_cap(a, overrides.get(a["name"]))
+
+    cands = {}
+    for raw in args.candidates:
+        name, val = raw.split("=", 1)
+        cands[name.strip()] = float(val)
+
+    if args.item_axis == "auto":
+        for a in arms:
+            if "tuples" not in a:
+                continue
+            if not args.data_dir:
+                a["axis"] = "tuple"
+                continue
+            beam_width = int(np.asarray(a["tuples"]).shape[1])
+            item_rank, named = as_is_item_rank(
+                np.asarray(a["tuples"], dtype=np.int64), a["rank"], a["targets"], args.data_dir
+            )
+            n_items = int(np.load(os.path.join(args.data_dir, "catalog_sid_codes.npy"),
+                                  mmap_mode="r").shape[0])
+            a["tuple_rank"], a["rank"] = a["rank"], item_rank
+            a["axis"] = "item"
+            caps[a["name"]] = n_items
+            cands.setdefault(a["name"], float(named.mean()))
+            print(
+                f"note: {a['name']} converted from {beam_width} cell positions to item "
+                f"ranks over {named.mean():,.1f} named items per row",
+                file=sys.stderr,
+            )
     for k in ks:
         for a in arms:
             if k > caps[a["name"]]:
@@ -551,7 +661,7 @@ def main(argv=None):
         if groups.size != n:
             raise SystemExit(f"--groups has {groups.size} entries, the dump has {n}")
 
-    text = report(arms, caps, ks, args.pair_k, freq, groups, args.bootstrap)
+    text = report(arms, caps, ks, args.pair_k, freq, groups, args.bootstrap, cands)
 
     os.makedirs(args.out_dir, exist_ok=True)
     md = os.path.join(args.out_dir, f"dump_metrics{args.tag}.md")
@@ -572,6 +682,10 @@ def main(argv=None):
                 "mrr": {str(k): mrr(a["rank"], k, caps[a["name"]]) for k in ks},
                 "effective_rank": effective_rank(a["rank"], caps[a["name"]]),
                 "miss_share": miss_share(a["rank"], caps[a["name"]]),
+                "axis": a.get("axis", "item") if "tuples" not in a else a.get("axis", "tuple"),
+                "candidates": cands.get(a["name"], float(caps[a["name"]])),
+                **({"tuple_rank": {str(k): recall(a["tuple_rank"], k, int(np.asarray(a["tuples"]).shape[1]))
+                                    for k in ks}} if "tuple_rank" in a else {}),
             }
             for a in arms
         },
