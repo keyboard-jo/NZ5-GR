@@ -791,35 +791,52 @@ weighted in the file (4,301x coldest to hottest quintile), so the win is concent
 the data is dense. A three-level SID at 8,192 is the run that would separate them, and it is
 the same run §2.6 item 4 asks for, specified in §2.5.
 
-## 2.5 The v3 SID: 8,192 x 3
+## 2.5 The v3 SID: 8,192 x 8,192 x **512**
 
-**The proposal.** A third level at 8,192, on top of the same first two levels as v2, so `24,576`
-code rows against v2's `16,384` and a head of `25,165,824` parameters against `16,777,216`.
-That is v2 plus one level, which is the smallest change that gives the tree two conditioning
-steps instead of one.
+**The proposal, with a size.** Two semantic levels identical to v2, plus a third level of
+**512** codes. That is `16,896` code rows against v2's `16,384`, and a head of
+`17,301,504` parameters against `16,777,216`, so the third level costs **3% more head and 25%
+more tokens** and nothing else.
+
+**Why 512 and not another 8,192.** The 2-level cells measure 3,002,708 cells with a mean of
+1.593 items, a median of 2 and a **maximum of 315**. A third level only has to give every item
+inside its own cell a different code, so it needs to be wider than the largest cell and no
+wider. **512 is wider than 315, so the result is injective by construction**, not by an
+occupancy estimate, and the quantiser run only has to confirm it. An 8,192-wide third level
+would sit inside cells holding 0.57 items, so 99.9% of its alphabet could never be used, and the
+beam would score `20 x 8,192 = 163,840` (prefix, code) pairs per row of which at most 20 exist.
+The 512 version scores `20 x 512 = 10,240` to find the same 20, and saves 7.7M head parameters.
+
+The same arithmetic says v2's own second level is over-provisioned: the largest level-0 cell
+holds **3,838** items, so 8,192 is 2.1x wider than anything it has to split, and 93% of the
+beam's level-1 matmul multiplies codes that are empty by construction. Narrowing level 1 to
+4,096 is therefore a real saving, and it is **deliberately not folded into this run**, because it
+is a width change and this run is the depth test.
 
 **Why this is the run that settles the depth question.** §1.10 measured TIGER at 2.83x DiGR on
 the five-level SID and 0.87x on the two-level one, but v1 changes depth, width and injectivity
-in the same step. Three levels at 8,192 changes depth alone, and it does so in three ways at
-once, all of them wanted:
+in the same step. Three levels change depth and the last level's width, which is the resolver,
+and nothing else that is measured. It does so in three ways at once, all of them wanted:
 
 - **Depth.** Two conditioning steps, so `p(c_3 | h, c_1, c_2)` has something to condition on. The
 38.7%-of-level-2-entropy figure in §2.4 says a level that knows its prefix is worth far more
 than a level that does not.
-- **Injective in practice.** A third 8,192 field over 3,002,708 two-tuples puts about 1.00 items
-in each three-tuple; the uniform occupancy formula predicts roughly 20 collisions across the
-whole catalogue, and only the quantiser run confirms it. So the 53.51% collision share, the
-1.22x to 1.37x it costs, and the whole tie-order asymmetry of `evaluation.md` §6 should drop out
-of the comparison, which is the cleanest property of the run.
-- **Budget parity.** Twenty tuples then name about **21 items**, so `R@10` is a top-10 from a
-21-item list and `R@20` is the whole list. Both arms are asked the same question and no
-matched-budget interpolation appears anywhere in the table.
+- **Injective, by construction rather than by estimate.** 512 is wider than the largest 2-level
+cell, 315, so no two items can share a three-tuple once the quantiser fills it. The 53.51%
+collision share, the 1.22x to 1.37x it costs, and the whole tie-order asymmetry of
+`evaluation.md` §6 should drop out of the comparison, which is the cleanest property of the run.
+- **Budget parity.** Twenty tuples then name exactly **20 items**, and `R@20` is the whole list,
+so `R@10` is a top-10 from a 20-item list for the same reason v1's is. Both arms are asked the
+same question and no matched-budget interpolation appears in the table. Note what this costs the
+beam: 20 items instead of 192, so **TIGER's reach falls about 6x on the same beam width.** That
+is the codebook getting sharper, not the arm getting worse, but it has to be said before the
+numbers land.
 
 **Cost.** Five tokens per event instead of four, so 191.8M train tokens per epoch against
-153.5M; the quantiser about 1.5 GPU-h for 24,576 rows; DiGR and TIGER about 4 GPU-h each for two
-epochs; the beam about 2 h, because three levels means `1 + 20x2 = 41` row copies per row
-against 21. Call it **11 to 12 GPU-h for both arms plus the beam**, the same order as the
-ablation and a third of what the five-level arm cost.
+153.5M; the quantiser about 1.5 GPU-h for 16,896 rows rather than 24,576; DiGR and TIGER about 4
+GPU-h each for two epochs; the beam about 1.5 h, because three levels means `1 + 20x2 = 41` row
+copies per row against 21, against 46.6 min for v2. Call it **about 11 GPU-h for both arms plus
+the beam**, the same order as the ablation and a third of what the five-level arm cost.
 
 **One confound to kill first.** Re-running the quantiser can refit levels 0 and 1 instead of
 extending them, which would make this v1-versus-v2 again. Compare
@@ -829,16 +846,18 @@ shift in them means the attribution is gone. The same output also reports whethe
 actually injective, which is the other claim above that a measurement rather than an argument
 settles.
 
-**What it would show.** If depth is the driver, TIGER at 3x8192 beats DiGR at 3x8192 at 21 items
-by something close to the 2x the five-level pair showed. If the five-level win actually came from
-width or injectivity, the two arms land within 1.1x and §2.4 needs rewriting. Both answers are
-useful, which is not true of most of what is left to run.
+**What it would show.** If depth is the driver, TIGER and DiGR on the three-level SID separate at
+20 items by something close to the 2x the five-level pair showed. If the five-level win actually
+came from width or injectivity, the two arms land within 1.1x and §2.4 needs rewriting. Both
+answers are useful, which is not true of most of what is left to run.
 
-**What it does not fix.** Level 0 stays at 584 items per code, three times the coarsest catalogue
-in the DiGR paper (195 items per code, a band that is **derived**, not quoted: the paper names
-RQ-VAE and never states its codebook shape, so it comes from dividing their catalogue sizes
-by 256, TIGER's width. See `sid.md` §6). Depth and granularity are independent, so the run that attacks granularity is
-`2 x 32,768` at 146 items per code, or `32,768 x 8,192 x 8,192`, and that is a separate decision.
+**What it does not fix.** Granularity. Level 0 stays at 584 items per code, three times the
+coarsest catalogue in the DiGR paper (195 items per code, a band that is **derived**, not quoted:
+the paper names RQ-VAE and never states its codebook shape, so it comes from dividing their
+catalogue sizes by 256, TIGER's width. See `sid.md` §6). Depth and granularity are independent, so
+the run that attacks granularity is `2 x 32,768` at 146 items per code, or
+`32,768 x 8,192 x 512`, and that is a separate decision. Nor does it fix level 1's
+over-provisioning; that is the 4,096 variant, and it belongs after this one, not inside it.
 
 ## 2.6 The next five runs, in order
 
@@ -865,11 +884,12 @@ by 256, TIGER's width. See `sid.md` §6). Depth and granularity are independent,
    question on the v1 arm, where TIGER is 2.83x DiGR at its own budget, so these two runs are
    now about whether the *two-level* arm can be rescued rather than about whether depth works.
    Worth doing only if a 2-level SID stays in the plan.
-4. **v3, three levels at 8,192** (specified in §2.5). This is now the run that settles the
-   caveat in §1.10, because it changes depth alone and holds width and injectivity fixed. It
-   also attacks the 29% level-1 gate, since a third level makes each decision 8x cheaper to
-   hit inside a 20-wide beam. About 11 of the 12 GPU-h are the two training runs; the quantiser
-   is 1.5.
+4. **v3, `8,192 x 8,192 x 512`** (specified in §2.5). This is now the run that settles the
+   caveat in §1.10, because it changes depth alone and holds level 0 and level 1 fixed while
+   making the tree injective by construction. The third level is 512 rather than 8,192 because
+   the largest 2-level cell holds 315 items, so a wider level could never be filled; the narrow
+   one costs 3% more head and 25% more tokens instead of 50% and 8.4M parameters. About 9.5 of
+   the 11 GPU-h are the two training runs; the quantiser is 1.5.
 5. **The SASRec bound that was never run** (`archive/tasks.md` 3.5, about 15 min): a tiny
    sequence model over raw item ids bounds what any SID method can hope for on this data.
    Without it there is no way to say whether 14% is the data or the factorisation.
