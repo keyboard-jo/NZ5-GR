@@ -272,8 +272,9 @@ at 10,000. TIGER is a different case. After the conversion in §1.3 both arms ar
 axis, where the beam measures 0.7741% at `R@1` and 2.5696% at `R@10` against DiGR's 1.0549% and
 3.6570%, so DiGR leads at both; and at the widest budget the beam's twenty blocks buy, 192
 items, the matched comparison is 13.9994% against 12.5804%. The two narrower budgets its blocks
-also buy, about 17 and about 96 items, are **not measured**: they would need the beam dumped at
-width 1 and at width 10.
+also buy are now measured off the same dump: **13.9 items at width 1** (reach 2.0406%) and
+**106.3 at width 10** (reach 8.8969%). Neither is a clean 17 or 96, because the fattest cells
+rank highest and a wider beam is not a linear extension of a narrow one.
 
 An earlier version of this table put a crossover at 138 items. That row compared DiGR at 138
 against TIGER's completed 192-item reach, so it was a 54-item mismatch rather than a crossing, and
@@ -314,6 +315,14 @@ The union is +31% over DiGR alone and +50% over TIGER alone. Explicit prefix con
 and implicit vector superposition are complementary, not redundant. Note this is evidence,
 not a proposed arm: `archive/problems.md` section 1 excludes re-ranking, and a two-arm
 fusion would be a new method rather than a comparison.
+
+**The complementarity is a property of the shallow code, not of the two methods.** On v1 at 20
+items the same test collapses: beam 10.0677%, DiGR v1 3.5553%, **union 10.8114%**, which is
++7.4% over the beam alone. Of DiGR v1's 3,495 hits the beam already has 2,764 (79%), the beam
+alone finds 7,133 that DiGR misses, and DiGR alone finds 731. On v2 the beam could only name
+192 items out of 4,783,154, so it left rows on the table that DiGR was scoring anyway; on v1 a
+20-item list from a deep tree covers what a full-catalogue linear scorer finds. Reading the v2
+union as "these methods are complementary" without the v1 row over-claims fusion.
 
 ## 1.7 What this invalidates
 
@@ -441,17 +450,21 @@ own twenty tuples on each row and asks each arm whether its rank fits. Because a
 one item, `N_r` is 20 on every row and this is a straight top-20, which is the one case where the
 matched calculation and a fixed cut-off agree exactly.
 
-| arm | matched | nDCG@N_r | MRR@10 |
-| --- | --- | --- | --- |
-| **TIGER prefix, beam 20** | **10.0677%** | **0.04217** | **0.03223** |
-| coclick h20 | 5.2684% | 0.02437 | 0.01539 |
-| DiGR v1 | 3.5553% | 0.01811 | 0.01258 |
-| popularity | 1.9796% | 0.00968 | 0.00648 |
+| arm | matched | nDCG@N_r | MRR@10 | sequence cost |
+| --- | --- | --- | --- | --- |
+| **TIGER prefix, beam 20** | **10.0677%** | **0.04217** | **0.03223** | 6 tokens per event, 221.5M per epoch |
+| coclick h20 | 5.2684% | 0.02437 | 0.01539 | none, no model |
+| DiGR v1 | 3.5553% | 0.01811 | 0.01258 | 6 tokens per event, 221.5M per epoch |
+| popularity | 1.9796% | 0.00968 | 0.00648 | none, no model |
 
 So TIGER is **2.83x DiGR v1**, 1.91x co-click h20 and 5.09x popularity, where the same arm at
 two levels was 1.11x **behind** DiGR at its own 192-item budget. Its `nDCG@N_r` and `MRR@10` are
 reportable here, unlike the v2 row, for the same reason the budget is simple: tuple position and
 item position are the same position when a tuple holds one item.
+
+The same pair at a 20-item cut-off, counted rather than paired: beam 10.0677%, DiGR v1 3.5553%,
+`b = 7,133` and `c = 731`, McNemar chi-squared 5,210.2. Both `k = 10` (chi-squared 3,915.2) and
+`k = 20` are far past any doubt, which is the point of quoting the counts rather than a star.
 
 **Where the hits sit.** `nDCG@10 / R@10` is the mean weight of a hit, so it says how deep
 inside the top ten the hits land: TIGER **0.5633** (deepest), DiGR v1 0.6053 (shallowest),
@@ -494,11 +507,26 @@ reader reproducing these numbers needs that directory:
 | DiGR v1 | 0.1782% | 0.3964% | 0.6477% | 1.6083% | 9.9788% | 56x |
 | popularity | 0.0000% | 0.0000% | 0.0000% | 0.0000% | 6.6744% | n/a |
 
+The boundaries, in train-target count: **0, 1, 5, 18, 71 and 6,822**, at `log1p` quantiles
+`0, 0.693, 1.792, 2.944, 4.277, 8.828`. So `tail` is items that never appear as a train target at
+all (15,715 rows, 15.99% of the split, 100% of the bin), `lower` is 1 to 4 targets, `middle` 5 to
+17, `upper` 18 to 70, and `head` 71 or more with a mean of 449 and a maximum of 6,822. That is the
+working definition of "cold" throughout this file, and it is deliberately the hard one: not
+"rarely clicked" but "never the target of any of the 1,719,430 training rows".
+
 On the coldest fifth the beam finds one target in 15,715 rows. Co-click, with the same number
 of slots, finds 22x more, so this is not arithmetic. Naming twenty cells out of 4,783,154 means
 a target whose cell the beam never visits is unreachable, and the cells it visits carry the
 next-item mass. DiGR scores every item, so it cannot have a coverage hole, and its 56x spread
 is the flattest of the four arms that can rank at all.
+
+**The 4,301x rests on one hit, so read it as a shape and not a size.** The tail cell is a single
+row out of 15,715. At `k = 20` the same tail cell holds 7 hits and the spread is **741x**, and the
+whole ladder moves (0.0445 / 0.3917 / 4.3944 / 11.5556 / 33.0234%). What is stable across
+cut-offs is the ordering and how far ahead the beam's spread is, not the ratio itself: against
+DiGR's 56x at `k = 10` and 30.3x at `k = 20`, the beam is **77x** and **24x** as
+popularity-dependent; against co-click's 93x and 68.6x it is **46x** and **11x**. The ranking of
+the arms never changes, and the beam is always an order of magnitude or more worse.
 
 **Two caveats that belong beside the number.**
 
@@ -781,6 +809,34 @@ The measured prize per extra level, from the prefix run: knowing the true `c1` r
 of 7.6731 nats of level-2 entropy, **38.7%**. That is what a third level is worth, and it is
 larger than anything width has bought.
 
+**What each axis is worth, on one scale.** The only budget all four cells share is a 20-item list,
+because that is what the v1 beam forces on everything. This table is the one place the codebook
+and the tree can be read against each other:
+
+| arm | SID | R@10 at 20 items | how |
+| --- | --- | --- | --- |
+| DiGR v1 | `4x256+731` | 3.5553% | counted |
+| DiGR v2 | `2x8192` | 5.1463% | counted |
+| TIGER v2 | `2x8192` | 2.04% to 6.10% | bracketed, its list steps 13.9 items then 58.2 |
+| TIGER v1 | `4x256+731` | 10.0677% | counted |
+
+So the codebook is worth **1.45x** to DiGR and depth is worth **at least 1.6x and at most 4.9x**
+to TIGER at the same budget, the bracket coming from the shallow beam having no measured point at
+20 items. Taking the midpoint of its two measured neighbours puts it near 3.7x. Two things follow.
+
+First, the claim "the tree is worth more than the codebook" holds **only on a deep code**. At the
+beam's own budget on v2 the tree is worth 0.70x. The difference is not the factorisation, it is
+whether the code localises: at two levels the beam's 192 items are most of the catalogue already,
+so there is little for prefix conditioning to condition on. Second, depth buys precision rather
+than recall. Per item named it is worth a multiple; per query the deep beam reaches 10.0677% and
+the shallow one 12.5804%, because the shallow beam is allowed to name 192 items. The honest
+sentence is that the tree is worth more per item named and less per query, and that the deep code
+is also 50% more expensive in sequence length (6 tokens per event against 4).
+
+The number that is still missing is a counted 20-item point for the v2 beam, which needs a dump
+at width 1 and 2, about five minutes. Until then this table carries a bracket, and the bracket is
+wide enough that the 3.7x midpoint should be labelled as a midpoint wherever it is quoted.
+
 **Measured, 2026-11-03.** The five-level arm settles the direction of this section: at its own
 20-item budget it reaches 10.0677% against DiGR v1's 3.5553%, 2.83x, where the two-level arm
 was 1.11x behind DiGR at its own 192-item budget (§1.10). So the factorisation does work once
@@ -878,12 +934,14 @@ over-provisioning; that is the 4,096 variant, and it belongs after this one, not
    the list; a finer codebook keeps its place, because that quarter is real and a finer code is
    the only way to collect it; and none of this changes the 0.15 slope for item-side capacity,
    which is why concat-plus-MLP stays off the list.
-3. **Beam 10 and beam 12** (~25 min each, about 96 and 115 items named), on the **v2** arm.
-   This was the frontier test on the v2 budget: TIGER had to beat DiGR at 96 items (10.6%) or
-   115, not at 192. Beam 60 would push the wrong way. §1.10 has since answered the depth
-   question on the v1 arm, where TIGER is 2.83x DiGR at its own budget, so these two runs are
-   now about whether the *two-level* arm can be rescued rather than about whether depth works.
-   Worth doing only if a 2-level SID stays in the plan.
+3. **Beam 10** needs no run. The top ten tuples of the width-20 dump already name **106.3 items**
+   and reach **8.8969%**, against DiGR interpolating to about 11.2% at the same 106 items, so the
+   frontier test on the v2 budget is answered at a budget the arm already paid for. A dedicated
+   width-10 beam would differ slightly, since a narrower beam prunes differently and may keep
+   different pairs, but not enough to change the sign. Beam 12 would name about 115 items and
+   adds nothing to a test that has already failed. §1.10 has separately answered the depth
+   question on the v1 arm, where TIGER is 2.83x DiGR at its own budget, so this line is closed
+   unless a two-level SID stays in the plan.
 4. **v3, `8,192 x 8,192 x 512`** (specified in §2.5). This is now the run that settles the
    caveat in §1.10, because it changes depth alone and holds level 0 and level 1 fixed while
    making the tree injective by construction. The third level is 512 rather than 8,192 because

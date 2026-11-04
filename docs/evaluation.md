@@ -18,7 +18,7 @@ than better. Where a convention is favourable to an arm, it is named as such in
 | $N$ | evaluation rows. $N = 98{,}304$ for the validation split |
 | $r \in \{1, \dots, N\}$ | a row: one user history and one true next item |
 | $t_r$ | the target item id of row $r$, an index into the catalogue |
-| $\mathcal{C}$ | the catalogue, $|\mathcal{C}| = 4{,}783{,}154$ |
+| $\mathcal{C}$ | the catalogue, $\lvert\mathcal{C}\rvert = 4{,}783{,}154$ |
 | $\rho_r$ | the rank the arm under test gives $t_r$, $1$-based |
 | $k_{\max}$ | the widest reported cut-off, $k_{\max} = \max(\texttt{EVAL\_KS}) = 10{,}000$ |
 | $\mathcal{B}(t)$ | the set of items sharing $t$'s SID tuple, the *bucket* of $t$ |
@@ -493,7 +493,8 @@ Stated plainly, because the tables are easy to over-read.
    a popularity-padded rank are different objects. Only $\texttt{match\_all}$,
    $\texttt{ndcg@N\_r}$ and $\texttt{mrr10}$ compare like with like, and the last two need an
    item rank on both sides. A beam has one only after the conversion in §5.3(c); un\u00adconverted,
-   its $\mathrm{R@10}$ is reach at roughly 96 items and not a top ten.
+   its $\mathrm{R@10}$ is reach at 106 items on average and not a top ten. The average is 106.3,
+   not the 96 that a linear $192.2/2$ suggests, because the fattest cells rank highest.
 5. **The 67% of the catalogue that is never clicked** occupies rank positions for every arm.
    That is the standard convention, but it means these numbers are not comparable with
    papers that rank a candidate pool of a few hundred items.
