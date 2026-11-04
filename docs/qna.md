@@ -111,8 +111,11 @@ being the only difference, and `2.885 / 1.410 = 2.047`, which is the observed 7.
 The mechanism is conditional probability. DiGR computes `s_i = (1/L) sum_l h·E_l[c_il]`, which is
 additive with fixed weights, so it cannot say "given this first code, the second one should count
 for more". TIGER computes `p(c_l | h, c_<l)`, which can. That advantage grows with depth, and it
-is measurable: at two levels the beam **loses** to DiGR, 0.87x, because there is only one
-conditioning step and the level-0 code is already informative. The claim is therefore "the tree
+is measurable: at two levels the beam **loses** to DiGR, **0.90x** (`12.5804 / 13.9994`, both at
+the beam's own per-row budget), because there is only one conditioning step and the level-0 code
+is already informative. Quoted against a flat 192-item cut-off the same pair reads 0.87x; the
+per-row figure is the one to use, because a flat cut-off hands DiGR 192 slots on every row while
+the beam had a median of 171. The claim is therefore "the tree
 wins where the codebook is deep", not "the tree wins".
 
 Two things stop this from being a fair headline. The beam's `R@10` is capped at its own reach of

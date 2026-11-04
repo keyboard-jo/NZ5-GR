@@ -820,22 +820,59 @@ and the tree can be read against each other:
 | TIGER v2 | `2x8192` | 2.04% to 6.10% | bracketed, its list steps 13.9 items then 58.2 |
 | TIGER v1 | `4x256+731` | 10.0677% | counted |
 
-So the codebook is worth **1.45x** to DiGR and depth is worth **at least 1.6x and at most 4.9x**
-to TIGER at the same budget, the bracket coming from the shallow beam having no measured point at
-20 items. Taking the midpoint of its two measured neighbours puts it near 3.7x. Two things follow.
+So on this single scale the codebook is worth **1.45x** to DiGR and depth is worth **at least 1.6x
+and at most 4.9x** to TIGER, the bracket coming from the shallow beam having no measured point at
+20 items. Taking the midpoint of its two measured neighbours puts it near 3.7x. The number that
+would remove the bracket is a counted 20-item point for the v2 beam, which needs a dump at width
+1 and 2, about five minutes; until then call 3.7x a midpoint.
 
-First, the claim "the tree is worth more than the codebook" holds **only on a deep code**. At the
-beam's own budget on v2 the tree is worth 0.70x. The difference is not the factorisation, it is
-whether the code localises: at two levels the beam's 192 items are most of the catalogue already,
-so there is little for prefix conditioning to condition on. Second, depth buys precision rather
-than recall. Per item named it is worth a multiple; per query the deep beam reaches 10.0677% and
-the shallow one 12.5804%, because the shallow beam is allowed to name 192 items. The honest
-sentence is that the tree is worth more per item named and less per query, and that the deep code
-is also 50% more expensive in sequence length (6 tokens per event against 4).
+**The multiplier ledger: every pair, and what it holds fixed.** A multiplier is only a statement
+about one axis if everything else is held constant, so each row names what is fixed. Only rows 1
+and 3 isolate the method; every other row isolates the codebook, the features, or nothing.
 
-The number that is still missing is a counted 20-item point for the v2 beam, which needs a dump
-at width 1 and 2, about five minutes. Until then this table carries a bracket, and the bracket is
-wide enough that the 3.7x midpoint should be labelled as a midpoint wherever it is quoted.
+| # | contrast | held fixed | multiplier | where |
+| --- | --- | --- | --- | --- |
+| 1 | TIGER v1 vs DiGR v1 | codes, rows, features | **2.83x** | §1.10 |
+| 2 | DiGR v1 vs DiGR v2 | method, features | **1.41x** | [`ablation.md`](ablation.md) 3 |
+| 2a | codebook alone | method, features | 1.26x at v1 features, **1.57x** at v2 | [`ablation.md`](ablation.md) 3 |
+| 2b | features alone | method, codebook | 1.12x at wide, **0.90x** at narrow | [`ablation.md`](ablation.md) 3 |
+| 3 | TIGER v2 vs DiGR v2 | codes | **0.90x** | §1.4 |
+| 4 | DiGR v2 with perfect ties | its own scores | **1.37x** at `R@10` | 2.3(d), [`sid.md`](sid.md) 4 |
+| 5 | TIGER v2 with a perfect level 1 | its own level-0 ranking | **3.44x** | §1.5 |
+| 6 | DiGR v2 vs co-click h20 | nothing, this is the baseline | **0.99x** | §1.3 |
+
+Three readings of that table matter more than the individual cells.
+
+**Row 2 is two axes at once.** v2 changed the codebook and the feature set together, so `1.41x`
+is not "the codebook": it is `1.26x` codebook times `1.12x` features. Quote the product only when
+quoting v1 against v2.
+
+**Row 3 is the counterexample that has to travel with row 1.** Two-level TIGER is 0.90x, so the
+tree does not beat the codebook in general. It beats it when the code is deep enough for prefix
+conditioning to have something to prune. On two levels the tree is nearly the whole catalogue,
+so there is nothing to prune. Row 1 alone reads as a property of the architecture; rows 1 and 3
+together read as a property of the architecture *given* a localising code.
+
+**Rows 4 and 5 say how much of each method's remaining gap is defect rather than design**, and
+they are the only two rows that hold the code and the method fixed on both sides. DiGR already
+computes its scores and loses **27% of what it reaches at `R@10`** to items sharing a tag, with a
+ceiling of 1.37x. TIGER converts only 12.58% of the 43.31% of rows whose first code it got right,
+so seven of every ten rows it was in position to win are lost at level two, with a ceiling of
+3.44x. The tree therefore has about two and a half times as much headroom as the linear scorer,
+and that comparison is not confounded with the codebook at all.
+
+**Nothing in this table isolates depth.** Every row either changes the code, the method or the
+scores; no row adds a level while holding width and injectivity fixed. That is what v3 is for, and
+until it runs, "depth is worth more than width" is an association through row 1 rather than a
+measured effect.
+
+Two consequences of the axis table stand on their own. First, the claim "the tree is worth more
+than the codebook" holds **only on a deep code**: on the two-level code it is worth 0.90x per query
+at its own budget. Second, depth buys precision rather than recall. Per item named it is worth a
+multiple; per query the deep beam reaches 10.0677% and the shallow one 12.5804%, because the
+shallow beam is allowed to name 192 items. The honest sentence is that the tree is worth more per
+item named and less per query, and that the deep code is also 50% more expensive in sequence
+length, 6 tokens per event against 4.
 
 **Measured, 2026-11-03.** The five-level arm settles the direction of this section: at its own
 20-item budget it reaches 10.0677% against DiGR v1's 3.5553%, 2.83x, where the two-level arm
@@ -870,9 +907,10 @@ beam's level-1 matmul multiplies codes that are empty by construction. Narrowing
 is a width change and this run is the depth test.
 
 **Why this is the run that settles the depth question.** §1.10 measured TIGER at 2.83x DiGR on
-the five-level SID and 0.87x on the two-level one, but v1 changes depth, width and injectivity
-in the same step. Three levels change depth and the last level's width, which is the resolver,
-and nothing else that is measured. It does so in three ways at once, all of them wanted:
+the five-level SID and **0.90x** on the two-level one (12.5804% against DiGR's per-row 13.9994%),
+but v1 changes depth, width and injectivity in the same step. Three levels change depth and the
+last level's width, which is the resolver, and nothing else that is measured. It does so in three
+ways at once, all of them wanted:
 
 - **Depth.** Two conditioning steps, so `p(c_3 | h, c_1, c_2)` has something to condition on. The
 38.7%-of-level-2-entropy figure in §2.4 says a level that knows its prefix is worth far more
