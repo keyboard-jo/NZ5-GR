@@ -136,6 +136,7 @@ the exact number of items the beam named on that row.
 | coclick h10 | ~192 | 13.5518% | 0.03797 | 0.01529 | 13.4369% | 14.0371% | 24.8311% | — | 43 s CPU |
 | coclick h5 | ~192 | 12.9985% | 0.03673 | 0.01499 | 12.8621% | 13.4145% | 23.6176% | — | 43 s CPU |
 | **TIGER prefix, beam 20** | **192.2** | **12.5804%** | **0.03273** | **0.01238** | n/a † | n/a † | n/a | n/a | 46.6 min GPU |
+| **DiGR v1** (`4x256+731`) | full catalogue | **9.9284%** | **0.02840** | **0.01258** | 9.7636% | 10.2753% | 21.6003% | 49.7691% | 1.8 min GPU |
 | popularity | ~192 | 6.3070% | 0.01673 | 0.00648 | 6.2083% | 6.6060% | 14.7288% | 36.8215% | < 1 s CPU |
 
 `matched @ N_r`, `nDCG@N_r` and `MRR@10` are the three like-for-like columns. The `R@k`
@@ -160,6 +161,15 @@ and all three estimates are retired.
 **Reading.** At the budget the beam actually uses, DiGR is 1.11x TIGER, and co-click sits
 between them. TIGER is **10.1% behind DiGR** and 8.2% behind plain co-click h20. The earlier
 claim that TIGER was 1.77x ahead was an artefact of assuming a 30-item budget.
+
+**DiGR v1 is in the table for the SID question, not the arm question.** It ranks the same
+4,783,154 items on the same rows with the same targets, so the beam's per-row budget applies to
+it unchanged, and it lands at 9.9284%, below all three co-click windows and below the beam
+(12.5804% against 9.9284%, 1.27x). That
+is a rendering of the codebook, not of DiGR: the same method on the same data with a different
+SID loses **29%** of its matched recall (13.9994% to 9.9284%) at the same budget. Worth reading
+alongside §1.9, where v1's first code leaves 18,684 candidates and its last two levels are a
+collision counter and a near-identity.
 
 The two rank-aware columns sharpen one ordering and leave the rest alone. DiGR's edge over
 co-click h20 widens from +2.2% on matched recall to +4.7% on `nDCG@N_r`, so DiGR's hits sit
@@ -533,6 +543,59 @@ side. The four notes under it are the price of the convenience.
 Sources: DiGR and the two baselines are `Dump Analysis/dump_metrics_v1.md` and its v2 counterpart;
 the TIGER rows are the beam reports under `analysis_dump/`, with the v1 cells re-counted against
 the 20-item budget in §1.10.
+
+
+## 1.12 If any of this were deployed
+
+A natural reading of the short cut-offs is that the v1 beam wins outright and a small candidate
+list is a bonus. Both halves need correcting before anyone plans a service on them.
+
+**The candidate column is not a cost, and offline wall clock is not a serving cost.** Measured
+offline, over the same 98,304 rows:
+
+| arm | offline wall clock | rows per forward | per row |
+| --- | --- | --- | --- |
+| DiGR v2, full catalogue | 1.8 min | 128 | 1.1 ms |
+| TIGER beam 20, v2 SID | 46.6 min | 1 | 28.4 ms |
+| TIGER beam 20, v1 SID | about 4.4 h, estimated | 1 | about 161 ms |
+
+Those per-row figures are wall clock divided by rows, and they are **not** comparable. `run_beam`
+decodes one row at a time (`for row in range(ids.shape[0])` with `ids[row:row + 1]`, at
+`Model Training/train_tiger.py:1328`), so a beam row leaves the GPU almost idle while five
+sequential decoding steps run; DiGR scores 128 rows against the 4.78M-item matrix per call. The
+ratio below each pair mixes batch sizes of 128 and 1, so it is not a ratio of serving costs, and
+neither number is a request latency: both include checkpoint load, warmup and logging.
+
+What survives the caveat is the structure, not the number. A beam is five sequential decoding
+steps through a 0.6B backbone, so its cost is latency-bound and scales with depth. DiGR is one
+forward pass plus one matmul against a precomputed matrix, so its cost is bandwidth-bound and
+scales with the catalogue. Batching users fixes much of the beam's disadvantage and none of its
+sequence. Nothing in this repository measures a batched beam, so no serving ratio is claimed.
+
+**What the table does not show, and a deployment cares about.**
+
+- **The cold tail.** On the coldest fifth of targets the v1 beam scores 0.0064% against DiGR v1's
+  0.1782%, 28x against it. In a product that reads as "we only recommend what is already popular".
+- **Filtering headroom.** Twenty slots and no more. Remove already-purchased, out-of-stock and
+  disallowed items and the top ten is being cut from a much shorter list. DiGR hands a reranker
+  every item in the catalogue.
+- **Catalogue churn.** A new item needs its cell to be reachable by the beam. DiGR scores it as
+  soon as it has codes.
+- **They fail on different rows.** On v2 at 192 items the union of DiGR and co-click is 22.3582%
+  against DiGR's own 13.9994%, so half of what the other arm finds is invisible to the first. On
+  v1 at ten items the union of the beam and DiGR v1 is 8.0414% against the beam's 7.4849%.
+
+**So what would a deployment pick.** If the surface is a fixed top-N rail, users are batched and
+popularity bias is acceptable, the beam on a deep SID is the better component, because it wins
+every measured item-level cut-off and the latency is amortisable. If the surface needs filtering,
+fresh items, an arbitrary k, or a second stage, DiGR is the better component: one matmul, every
+item scored, and the shortlist is whatever gets cut from it. For a two-stage system, which is the
+usual production shape, the second choice is the one that matters, because the generator's job is
+to hand the reranker a good wide list cheaply.
+
+Before believing any ratio here, measure three things: a batched beam at the batch size a service
+would use, the resident memory of the 4.78M x 1024 item matrix (9.8 GB in bf16) against the beam's
+tree index, and how many of the twenty slots survive real filtering.
 
 
 # 2. The direction
