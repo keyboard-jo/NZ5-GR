@@ -28,6 +28,12 @@ thing on the item axis as on the tuple axis but is called recall on both.
 than the method: which SID is better, which model wins on each vintage, what collisions cost and
 what the ablation found, two or three paragraphs each.
 
+[`data_prep.md`](data_prep.md) is the runbook for the stage that produces everything above: the
+three input files, every output array, the token layout and its offsets, how a gap becomes a bucket,
+how many rows one user record yields, and the invariants a finished build has to satisfy (row counts,
+`sid_sizes`, `event_width`, token totals and the collision block). Read it before touching
+`preprocess_digr_v2.py` or building a new SID.
+
 Two things are recorded below. The measured result of the matched-budget pass, which is
 the first comparison in this project where every arm was allowed the same number of items
 per row. And the direction, which survived that result and is now sharper for it.
@@ -825,6 +831,13 @@ and at most 4.9x** to TIGER, the bracket coming from the shallow beam having no 
 20 items. Taking the midpoint of its two measured neighbours puts it near 3.7x. The number that
 would remove the bracket is a counted 20-item point for the v2 beam, which needs a dump at width
 1 and 2, about five minutes; until then call 3.7x a midpoint.
+
+Both codebook cells are counted, not interpolated (`5.1463%` and `3.5553%`), and both are at 20
+items. **The ablation's headline 1.41x is the same pair at a 10-item cut-off**, `3.6570 / 2.5940`,
+which is why two numbers describe one change. The multiplier is not constant in `k`: 1.33 at `R@1`,
+1.41 at `R@10`, **1.45 at `R@20`**, 1.45 at `R@100`, 1.28 at `R@1000`, 1.12 at `R@10,000`. It peaks
+around 20 to 100 and fades at both ends, because at the top one slot can hold only one item and at
+the bottom a 10,000-item list is already 0.21% of the catalogue. Quote it with its cut-off.
 
 **The multiplier ledger: every pair, and what it holds fixed.** A multiplier is only a statement
 about one axis if everything else is held constant, so each row names what is fixed. Only rows 1
