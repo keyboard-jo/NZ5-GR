@@ -267,7 +267,7 @@ Reach per item named is not a constant, so the ranking inverts with the budget:
 | named items | who leads |
 | --- | --- |
 | 10 | co-click h20 (3.7069%) over DiGR (3.6570%) |
-| ~100 | co-click h20 (10.9873%) over DiGR (10.9182%), a tie |
+| 100 | co-click h20 (10.9873%) over DiGR (10.9182%), 0.069 pp apart |
 | 192 | DiGR (14.4989%) over co-click (14.1825%) over TIGER (12.5804%) |
 | 1,000 | DiGR (27.6622%) over co-click (25.3021%), +9% |
 | 10,000 | DiGR (55.7058%) over co-click (46.8882%), +19% |
